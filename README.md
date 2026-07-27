@@ -1,124 +1,220 @@
-# ClamAV Scheduled Scan Container
+# ClamAV TimeDock
 
-这个目录提供了一个基于 ClamAV 的定时扫描容器。容器启动后会初始化 ClamAV，生成或加载定时扫描配置，并通过 Debian cron 执行扫描任务。
+ClamAV TimeDock 是一个面向 ClamAV 的 Web 管理应用，以 Docker 镜像形式运行。通过浏览器即可执行手动或定时扫描、查看任务状态与历史结果、管理信任区和处理隔离文件，无需在日常使用中操作命令行。
 
-## 文件说明
+> 本项目提供管理界面和任务调度能力，病毒检测与病毒库更新由容器内的 ClamAV 完成。
 
-- `Dockerfile`: 构建镜像，安装 `cron`，复制入口脚本、示例配置和 `clamd.conf`。
-- `startup.sh`: 容器入口，准备配置文件、启动 ClamAV 和 cron。
-- `cron.sh`: 校验定时扫描配置，生成 `/etc/cron.d/clamav-scheduled-scan`，启动 cron。
-- `config.sh`: 解析并校验 cron 扫描规则。
-- `scan_once.sh`: 执行单次扫描，写入任务状态、扫描日志和检出日志。
-- `exclude.sh`: 根据排除配置生成 ClamAV SHA256 allow-list 数据库。
-- `log.sh`: 统一日志写入和日志轮转。
-- `cron_scan_example.conf`: 首次启动时释放到配置目录的示例定时扫描配置。
+## 主要功能
 
-## 构建镜像
+- 实时查看 ClamAV 状态、最近扫描时间和结果
+- 在网页中浏览文件，选择一个或多个目标发起扫描
+- 查看手动扫描队列，调整等待顺序或取消等待任务
+- 创建、编辑、启停和删除定时扫描规则
+- 查看手动及定时扫描的历史记录、任务日志与检出详情
+- 将可信文件或目录加入信任区
+- 查看、恢复、删除或清空隔离文件
+- 支持仅告警、移入隔离区和直接删除三种处理方式
+- 所有页面和 API 均使用账号密码验证
+
+扫描任务会串行执行，避免多个扫描同时占用 ClamAV。
+
+## 快速开始
+
+### 构建镜像
 
 ```sh
-docker build -t clamav-scheduled-scan .
+docker build -t clamav-timedock .
 ```
 
-## 推荐目录挂载
+### 启动容器
+
+先创建用于持久化数据的目录：
 
 ```sh
-docker run -d --name clamav-scan \
-  -v /host/config:/config \
-  -v /host/scan:/scan \
-  -v /host/quarantine:/quarantine \
-  -v /host/log:/log \
-  -v /host/state:/state \
-  -e SCANNER_ACCOUNTS="admin:asdewq,leo:zxcdsa" \
-  clamav-scheduled-scan
+mkdir -p config scan quarantine log state
 ```
 
-真实示例：
+然后启动：
 
+```sh
+docker run -d \
+  --name clamav-timedock \
+  --restart unless-stopped \
+  -p 8080:8080 \
+  -e TZ=Asia/Shanghai \
+  -e SCANNER_ACCOUNTS='admin:请替换为强密码' \
+  -v "$(pwd)/config:/config" \
+  -v "$(pwd)/scan:/scan" \
+  -v "$(pwd)/quarantine:/quarantine" \
+  -v "$(pwd)/log:/log" \
+  -v "$(pwd)/state:/state" \
+  clamav-timedock
 ```
-docker run -d --name clamav-scan -p 8080:8080 -v ./config:/config -v ./scan:/scan -v ./quarantine:/quarantine -v ./log:/log -v ./state:/state -e SCANNER_ACCOUNTS="admin:asdewq,leo:zxcdsa" clamav-scheduled-scan
-```
 
-首次启动如果 `/config/cron_scan.conf` 不存在，容器会复制 `cron_scan_example.conf` 到该路径后退出。请编辑配置文件后重新启动容器。
-
-## 定时扫描配置
-
-默认配置文件路径为 `/config/cron_scan.conf`，每条有效规则一行:
+启动后访问：
 
 ```text
-分钟 小时 日期 月份 星期 扫描目标 检出后行为
+http://主机地址:8080
 ```
 
-示例:
+使用 `SCANNER_ACCOUNTS` 设置的账号登录。该变量为必填项，多个账号（虽然现在尚未实际使用到）可以用逗号、分号或换行分隔：
 
 ```text
-30 3 * * * /scan warn
-0 */6 * * * /scan move
-15 2 * * 0 "/scan/My Folder" remove
+admin:password1,operator:password2
 ```
 
-检出后行为:
+首次启动会自动生成所需配置。默认没有启用的定时扫描任务，可在 WebUI 中自行添加。
 
-- `warn`: 只记录告警，不修改文件。
-- `move`: 将检出的文件移动到 `/quarantine`。
-- `remove`: 直接删除检出的文件，请谨慎使用。
+## WebUI 使用指南
 
-路径包含空格时必须使用英文双引号。配置文件支持空行和以 `#` 开头的注释行。
+### 首页状态
 
-## 排除配置
+登录后，首页会显示：
 
-默认排除配置文件路径为 `/config/exclude.conf`。每行填写一个可信文件或目录:
+- ClamAV 当前是否准备就绪
+- 当前是否有扫描正在运行
+- 最近一次扫描时间
+- 最近一次扫描结果
 
-```text
-/scan/trusted-file.zip
-"/scan/Trusted Folder"
-```
+右上角的刷新按钮可立即更新状态。
 
-容器启动时会为这些文件生成 SHA256 allow-list 数据库。目录会被递归展开。不存在、不可读或格式错误的条目会被跳过并写入启动日志。
+在“设置”中可以调整状态轮询间隔。开启调试模式后，首页还会显示后端返回的原始状态数据，便于排查问题。以上界面偏好保存在当前浏览器中。
 
-## 日志和状态
+### 手动扫描
 
-- `/log/startup.log`: 启动、配置释放、排除数据库生成等日志。
-- `/log/cron.log`: cron 规则加载和 cron 启动日志。
-- `/log/<job_id>.log`: 单次扫描任务日志。
-- `/log/clamav_detection_<job_id>.log`: 检出详情日志。
-- `/state/status.json`: 当前 ClamAV 和扫描状态。
-- `/state/jobs/<job_id>.json`: 每个扫描任务的状态文件。
+1. 打开“手动扫描”。
+2. 在文件浏览器中进入目标目录。
+3. 勾选一个或多个文件、目录。
+4. 选择检出后的处理方式。
+5. 点击“开始扫描”。
 
-日志默认超过 `5242880` 字节会轮转，可通过 `SCAN_LOG_MAX_BYTES` 调整。
+可选的处理方式：
+
+| 方式 | 行为 |
+| --- | --- |
+| 仅告警 | 记录威胁，不修改原文件 |
+| 移动到隔离区 | 将检出文件移入隔离区，以便后续恢复或删除 |
+| 直接删除 | 立即删除检出文件，无法从隔离区恢复 |
+
+建议首次使用时选择“仅告警”。“移动到隔离区”和“直接删除”都会修改 `/scan` 中的数据。
+
+WebUI 只能浏览和扫描挂载到 `/scan` 下的内容。即使 `/scan` 内存在符号链接，也不能通过它访问该目录之外的文件。
+
+### 定时扫描
+
+打开“定时扫描”后，可以在页面中：
+
+- 新建或编辑周期规则
+- 从文件浏览器选择扫描目标
+- 设置分钟、小时、日期、月份和星期
+- 选择检出处理方式
+- 启用或停用规则
+- 删除已有规则
+- 重新加载定时任务
+
+时间字段采用标准的五段 cron 表达式。常见示例：
+
+| 执行时间 | 分钟 | 小时 | 日期 | 月份 | 星期 |
+| --- | --- | --- | --- | --- | --- |
+| 每天 03:30 | `30` | `3` | `*` | `*` | `*` |
+| 每 6 小时 | `0` | `*/6` | `*` | `*` | `*` |
+| 每周日 02:15 | `15` | `2` | `*` | `*` | `0` |
+
+表达式支持单值、范围、步长和逗号列表，例如 `3`、`1-5`、`*/6`、`1-10/2`、`1,3,5`。星期取值为 `0-7`，其中 `0` 和 `7` 通常都表示星期日。
+
+保存、启停、编辑或删除规则后，WebUI 会校验配置并重新加载定时任务。定时扫描遇到其他任务正在运行时会等待，之后再继续执行。
+
+### 任务队列
+
+“任务队列”显示当前正在执行和等待中的手动扫描批次：
+
+- 序号 `0` 表示正在运行
+- 序号 `1` 起表示等待顺序
+- 等待中的任务可以调整序号
+- 等待中的任务可以取消
+- 已经开始的任务不能从该页面取消或重新排序
+
+队列保存在 Web 服务内存中。容器重启后，尚未开始的排队任务不会恢复；已经完成的扫描仍可在“历史任务”中查看。
+
+### 信任区
+
+打开“信任区”，从文件浏览器中选择一个文件或目录，然后点击“添加到信任区”。已有条目可以在列表中删除。
+
+信任区适合加入确认安全、但会被误报或不希望重复告警的内容。它依据文件的 SHA256 内容哈希生成 ClamAV allow-list：
+
+- 添加目录时，会递归处理目录内的文件
+- 文件内容变化后，原有哈希不再匹配，需要重新添加或刷新信任条目
+- 扫描进行期间不能修改信任区
+- 信任区同样只能选择 `/scan` 下已存在的文件或目录
+
+WebUI 在增删信任条目后会自动更新 allow-list 并让 ClamAV 重新加载数据库。
+
+### 历史任务
+
+“历史任务”按页显示已执行的手动和定时扫描。打开某条记录后可以查看：
+
+- 任务类型与执行结果
+- 威胁文件及检出原因
+- ClamAV 检出日志
+- 完整任务日志
+
+页面上的清理按钮会删除全部历史任务状态及对应日志，此操作不可恢复。
+
+### 隔离区
+
+使用“移动到隔离区”扫描出威胁后，可以在“隔离区”中查看文件及其原始路径，并进行：
+
+- **恢复**：将文件放回原路径
+- **删除**：永久删除单个隔离文件
+- **清空**：永久删除隔离区中的所有内容
+
+如果原路径已经存在同名文件，恢复会被拒绝，不会覆盖现有数据。恢复出的文件仍可能包含威胁，请在确认安全后操作。
+
+“直接删除”模式不会把文件放入隔离区，因此无法在此恢复。
+
+## 数据目录
+
+| 容器路径 | 用途 |
+| --- | --- |
+| `/scan` | WebUI 可浏览和扫描的数据 |
+| `/quarantine` | 被隔离的文件及原路径记录 |
+| `/state` | 任务历史和运行状态 |
+| `/log` | 扫描日志与检出详情 |
+| `/config` | WebUI 管理的定时任务和信任区数据 |
+
+建议持久化挂载以上五个目录。请确保容器对 `/scan` 有读取权限；使用隔离、删除和恢复功能时还需要写入权限。
 
 ## 常用环境变量
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `CRON_CONFIG_FILE` | `/config/cron_scan.conf` | 定时扫描配置文件 |
-| `EXCLUDE_CONFIG_FILE` | `/config/exclude.conf` | 排除配置文件 |
-| `SCANNER_ACCOUNTS` | 无 | WebUI 账号，格式为 `user:password`，多个账号用逗号、分号或换行分隔 |
-| `SCANNER_ADDR` | `:8080` | WebUI 监听地址 |
-| `SCAN_LOG_DIR` | `/log` | 日志目录 |
-| `QUARANTINE_DIR` | `/quarantine` | 隔离目录 |
-| `STATUS_DIR` | `/state` | 状态目录 |
-| `SCAN_WAIT_INTERVAL` | `30` | 扫描锁等待间隔秒数 |
-| `SCAN_WAIT_MAX_SECONDS` | `0` | 等待扫描锁的最大秒数，`0` 表示不限 |
-| `CLAMD_WAIT_RETRIES` | `180` | 等待 ClamAV 就绪的重试次数 |
-| `CLAMD_WAIT_INTERVAL` | `2` | 等待 ClamAV 就绪的重试间隔秒数 |
+| `SCANNER_ACCOUNTS` | 无 | **必填**；WebUI 账号，格式为 `user:password` |
+| `SCANNER_ADDR` | `:8080` | Web 服务监听地址 |
+| `TZ` | 镜像默认值 | 页面时间和定时任务使用的时区 |
+| `SCAN_LOG_MAX_BYTES` | `5242880` | 单个日志的轮转阈值，单位为字节 |
+| `SCAN_WAIT_INTERVAL` | `30` | 定时任务等待扫描锁的重试间隔，单位为秒 |
+| `SCAN_WAIT_MAX_SECONDS` | `0` | 最长等待时间；`0` 表示不限制 |
 
-## 手动执行一次扫描
+通常只需设置账号、时区和端口，其余值保持默认即可。
 
-进入容器后可直接调用:
+## 部署与安全建议
+
+- Web 服务自身不提供 HTTPS。部署到非可信网络时，请使用 HTTPS 反向代理并限制访问来源。
+- “直接删除”、清空历史和清空隔离区均为不可逆操作。
+- 建议先用测试目录和 EICAR 等安全测试样本验证权限、隔离及恢复流程。
+- 病毒库更新行为继承自上游 `clamav/clamav` 镜像，容器需要相应的网络访问能力。
+
+## API 与开发
+
+WebUI 使用的接口、请求参数和响应示例见 [server/api.md](server/api.md)。
+
+Web 服务使用 Go 编写，前端资源会编译进服务程序。运行测试：
 
 ```sh
-/scan_once.sh --type manual --target /scan --action warn
+cd server
+go test ./...
 ```
 
-如果希望已有扫描运行时等待锁释放:
+## License
 
-```sh
-/scan_once.sh --type manual --target /scan --action move --wait
-```
-
-## 注意事项
-
-- `move` 和 `remove` 会修改被扫描目录中的文件，请先在测试目录验证规则。
-- WebUI 文件浏览和手动扫描都固定限制在 `/scan` 下。
-- cron 任务会串行等待扫描锁，避免多个扫描同时运行。
-- Dockerfile 会把当前目录中的 `clamd.conf` 安装到 `/etc/clamav/clamd.conf`，脚本中的 `clamdscan` 也默认使用该配置。
+本项目采用 [MIT License](LICENSE)。
