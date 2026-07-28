@@ -1,23 +1,24 @@
-FROM node:24-bookworm-slim AS web-builder
+FROM --platform=$BUILDPLATFORM node:lts-bookworm-slim AS web-builder
 
-WORKDIR /src
-COPY frontend/package.json frontend/package-lock.json ./frontend/
-RUN cd frontend && npm ci
-COPY frontend ./frontend
-COPY server/web ./server/web
-RUN cd frontend && npm run build
+WORKDIR /src/ClamAV-Web
+COPY ClamAV-Web/package.json ClamAV-Web/package-lock.json ./
+RUN npm ci
+COPY ClamAV-Web/ ./
+RUN npm run build
 
-FROM golang:1.26.5-bookworm AS scanner-builder
+FROM --platform=$BUILDPLATFORM golang:bookworm AS scanner-builder
 
 WORKDIR /src/server
+ARG TARGETOS
+ARG TARGETARCH
 COPY server/go.mod ./
 COPY server/*.go ./
-COPY --from=web-builder /src/server/web/dist ./web/dist
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -o /out/server .
+COPY --from=web-builder /src/ClamAV-Web/dist ./web/dist
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/server .
 
 FROM clamav/clamav:stable_base-debian
 
-USER root
+USER 0
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends cron ca-certificates \
