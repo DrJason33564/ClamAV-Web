@@ -18,6 +18,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
 import { Separator } from "@/components/ui/separator"
 import { toast } from "@/components/ui/toast"
 import { api, jsonRequest, sleep } from "@/lib/api"
@@ -41,6 +42,7 @@ export function HistoryPage() {
   const [items, setItems] = React.useState<HistoryItem[]>([])
   const [total, setTotal] = React.useState(0)
   const [page, setPage] = React.useState(1)
+  const [pageInput, setPageInput] = React.useState("1")
   const [loading, setLoading] = React.useState(false)
   const [detail, setDetail] = React.useState<DetectionDetail | null>(null)
   const mounted = React.useRef(true)
@@ -92,6 +94,10 @@ export function HistoryPage() {
     void load(1)
   }, [load])
 
+  React.useEffect(() => {
+    setPageInput(String(page))
+  }, [page])
+
   async function openDetail(jobId: string) {
     try {
       setDetail(
@@ -132,6 +138,20 @@ export function HistoryPage() {
   }
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
+
+  function jumpToPage(event: React.KeyboardEvent<HTMLInputElement>) {
+    if (event.key !== "Enter") return
+    event.preventDefault()
+
+    const requestedPage = Number(pageInput)
+    const integerPage = Number.isFinite(requestedPage)
+      ? Math.trunc(requestedPage)
+      : 1
+    const targetPage = Math.min(totalPages, Math.max(1, integerPage))
+
+    setPageInput(String(targetPage))
+    if (targetPage !== page) void load(targetPage)
+  }
 
   return (
     <PageLayout
@@ -248,9 +268,26 @@ export function HistoryPage() {
             >
               <ChevronLeftIcon data-icon="inline-start" />
             </Button>
-            <span className="text-sm text-muted-foreground">
-              第 {page} / {totalPages} 页，共 {total} 项
-            </span>
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <span>第</span>
+              <Input
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]*"
+                aria-label="当前页码"
+                className="w-16 text-center"
+                value={pageInput}
+                disabled={loading}
+                onChange={(event) =>
+                  setPageInput(event.target.value.replace(/\D/g, ""))
+                }
+                onFocus={(event) => event.currentTarget.select()}
+                onKeyDown={jumpToPage}
+              />
+              <span>
+                / {totalPages} 页，共 {total} 项
+              </span>
+            </div>
             <Button
               variant="outline"
               size="icon-sm"

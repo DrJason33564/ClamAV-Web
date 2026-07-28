@@ -136,13 +136,15 @@ export function QueuePage() {
                       </FieldLabel>
                       <Input
                         id={`queue-${item.id}`}
-                        type="number"
-                        min={1}
+                        type="text"
+                        inputMode="numeric"
+                        pattern="[0-9]*"
+                        className="w-10 text-center"
                         value={positions[item.id] ?? ""}
                         onChange={(event) =>
                           setPositions((current) => ({
                             ...current,
-                            [item.id]: event.target.value,
+                            [item.id]: event.target.value.replace(/\D/g, ""),
                           }))
                         }
                       />

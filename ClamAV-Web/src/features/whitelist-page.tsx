@@ -94,7 +94,6 @@ export function WhitelistPage() {
             <Card key={entry.path} size="sm">
               <CardHeader>
                 <CardTitle className="truncate">{entry.path}</CardTitle>
-                <CardDescription>配置文件第 {entry.line} 行</CardDescription>
                 <CardAction>
                   <Button
                     variant="destructive"
