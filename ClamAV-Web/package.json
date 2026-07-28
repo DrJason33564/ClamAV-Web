@@ -1,11 +1,12 @@
 {
   "name": "ClamAV-Web",
   "private": true,
-  "version": "0.0.1",
+  "version": "1.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "release": "npm run build",
     "lint": "eslint .",
     "format": "prettier --write \"**/*.{ts,tsx}\"",
     "typecheck": "tsc --noEmit",
