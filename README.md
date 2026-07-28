@@ -240,6 +240,11 @@ cd server
 go test ./...
 ```
 
+前端 JavaScript 位于 `server/web/src`，按功能划分为文件浏览器、手动扫描、
+定时任务、任务队列、信任区、历史任务、隔离区、设置面板和状态首页模块。
+`main.js` 只负责模块初始化与抽屉导航，公共 API、DOM 和格式化工具位于
+`shared.js`。样式暂时统一保留在 `style.css`。
+
 ## License
 
 本项目采用 [MIT License](LICENSE)。
