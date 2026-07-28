@@ -1,9 +1,18 @@
+FROM node:24-bookworm-slim AS web-builder
+
+WORKDIR /src
+COPY frontend/package.json frontend/package-lock.json ./frontend/
+RUN cd frontend && npm ci
+COPY frontend ./frontend
+COPY server/web ./server/web
+RUN cd frontend && npm run build
+
 FROM golang:1.26.5-bookworm AS scanner-builder
 
 WORKDIR /src/server
 COPY server/go.mod ./
 COPY server/*.go ./
-COPY server/web ./web
+COPY --from=web-builder /src/server/web/dist ./web/dist
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -o /out/server .
 
 FROM clamav/clamav:stable_base-debian

@@ -1,0 +1,11 @@
+.git
+.gitignore
+frontend/node_modules
+server/web/dist
+scan
+quarantine
+log
+state
+test_runtime
+test-tmp
+*.log

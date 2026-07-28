@@ -28,6 +28,7 @@ code_sandbox/config/codex.auth.json
 dist/
 build/
 node_modules/
+.vite/
 scan/
 quarantine/
 log/

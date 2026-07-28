@@ -29,8 +29,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleIndex)
-	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticAssets))))
+	mux.Handle("/", frontendHandler())
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/browse", s.handleBrowse)
 	mux.HandleFunc("/api/scans", s.handleScans)

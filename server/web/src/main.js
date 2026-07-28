@@ -1,3 +1,5 @@
+import "./style.css";
+
 const browsers = {
   manual: {
     selected: new Map(),

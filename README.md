@@ -208,7 +208,32 @@ WebUI 在增删信任条目后会自动更新 allow-list 并让 ClamAV 重新加
 
 WebUI 使用的接口、请求参数和响应示例见 [server/api.md](server/api.md)。
 
-Web 服务使用 Go 编写，前端资源会编译进服务程序。运行测试：
+Web 服务使用 Go 编写，前端使用 Vite 构建。生产镜像会先构建前端，
+再将构建结果编译进 Go 服务程序。
+
+前端开发服务器默认监听 `http://localhost:5173`，并将 `/api` 请求代理到
+`http://127.0.0.1:8080`。启动前端开发环境：
+
+```sh
+cd frontend
+npm ci
+npm run dev
+```
+
+如果 Go 服务不在默认地址，可以在启动 Vite 时设置代理目标：
+
+```sh
+VITE_API_PROXY_TARGET=http://127.0.0.1:9000 npm run dev
+```
+
+构建前端：
+
+```sh
+cd frontend
+npm run build
+```
+
+构建结果位于 `server/web/dist`。运行 Go 测试：
 
 ```sh
 cd server
