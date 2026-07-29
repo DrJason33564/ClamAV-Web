@@ -104,12 +104,20 @@ curl -u admin:secret -X POST http://localhost:8080/api/clamav/sleep
 }
 ```
 
+返回字段：
+
+| 字段 | 类型 | 可能值 | 对应情况 |
+| --- | --- | --- | --- |
+| `status` | `string` | `sleeping` | SHUTDOWN 命令成功且 `/state/sleep.lock` 已存在；也包括接口调用前 ClamAV 已休眠的幂等成功情况。 |
+| `message` | `string` | 状态说明 | 首次成功休眠时为 `ClamAV entered sleep mode.`；已经处于休眠状态时为 `ClamAV is already sleeping.`。 |
+
 说明：
 
 - 接口具有幂等性；ClamAV 已休眠时仍返回 `200 OK` 和 `sleeping`。
 - `/state/scan.lock` 表示扫描正在执行时，接口返回 `409 Conflict`，不会关闭 ClamAV。
 - socket 连接、写入、响应或休眠锁创建失败时返回 `500 Internal Server Error`。
 - socket 操作超时时返回 `504 Gateway Timeout`。
+- `409`、`500` 和 `504` 错误响应使用通用 `{"error":"error message"}` 结构，不包含 `status` 字段；当前接口不会返回 `status: "failed"`。
 - 本接口当前不会改变手动或 cron 扫描流程；休眠状态下触发扫描的行为将在后续功能中处理。
 
 ## `POST /api/clamav/wake`
@@ -131,11 +139,19 @@ curl -u admin:secret -X POST http://localhost:8080/api/clamav/wake
 }
 ```
 
+返回字段：
+
+| 字段 | 类型 | 可能值 | 对应情况 |
+| --- | --- | --- | --- |
+| `status` | `string` | `awake` | `/startup.sh --wake` 执行成功、ClamAV 已通过 PONG 检查且 `/state/sleep.lock` 已删除；也包括接口调用前 ClamAV 已就绪的幂等成功情况。 |
+| `message` | `string` | 状态说明 | 实际执行唤醒并成功时为 `ClamAV woke successfully.`；调用前已经处于工作状态时为 `ClamAV is already awake.`。 |
+
 说明：
 
 - 接口具有幂等性；ClamAV 已可正常 PONG 时会删除可能存在的陈旧 sleep lock，并返回 `200 OK` 和 `awake`。
 - 唤醒失败时保留 `/state/sleep.lock`，返回 `500 Internal Server Error`。
 - 唤醒超时时返回 `504 Gateway Timeout`。
+- `500` 和 `504` 错误响应使用通用 `{"error":"error message"}` 结构，不包含 `status` 字段；当前接口不会返回 `status: "failed"`。
 - `/startup.sh --wake` 会原子更新 `/state/clamav-init.pid`，使容器 PID 1 能继续监督并在容器退出时优雅停止最新的 `/init` 进程。
 
 ## `GET /api/browse`
