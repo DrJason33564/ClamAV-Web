@@ -11,3 +11,9 @@ state
 test_runtime
 test-tmp
 *.log
+*.tar
+skills-lock.jon
+.agents
+.codex
+frontend
+server/web
