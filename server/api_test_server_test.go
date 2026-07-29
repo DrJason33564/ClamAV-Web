@@ -8,15 +8,88 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-const (
-	templateResultLookupID     = "result-test-20260728070000"
-	templateQuarantineLookupID = "quarantine-test-20260728070000"
-	templateLastJobID          = "manual-20260728070000"
-)
+const templateLastJobID = "manual-20260728070000"
+
+var templateLookupSequence atomic.Uint64
+
+type templateLookupState struct {
+	StartedAt time.Time
+	ReadyAt   time.Time
+}
+
+type templateAPI struct {
+	mu                sync.RWMutex
+	resultLookups     map[string]templateLookupState
+	quarantineLookups map[string]templateLookupState
+	lookupDelay       func() time.Duration
+}
+
+type templateHTTPResponse struct {
+	StatusCode int
+	Body       map[string]any
+}
+
+var templateSleepSuccessResponses = []templateHTTPResponse{
+	{
+		StatusCode: http.StatusOK,
+		Body: map[string]any{
+			"status": "sleeping", "message": "ClamAV entered sleep mode.",
+		},
+	},
+	{
+		StatusCode: http.StatusOK,
+		Body: map[string]any{
+			"status": "sleeping", "message": "ClamAV is already sleeping.",
+		},
+	},
+}
+
+var templateSleepFailureResponses = []templateHTTPResponse{
+	{
+		StatusCode: http.StatusConflict,
+		Body:       map[string]any{"error": "ClamAV cannot sleep while a scan is active"},
+	},
+	{
+		StatusCode: http.StatusInternalServerError,
+		Body:       map[string]any{"error": "put ClamAV to sleep: example socket error"},
+	},
+	{
+		StatusCode: http.StatusGatewayTimeout,
+		Body:       map[string]any{"error": "put ClamAV to sleep: example operation timed out"},
+	},
+}
+
+var templateWakeSuccessResponses = []templateHTTPResponse{
+	{
+		StatusCode: http.StatusOK,
+		Body: map[string]any{
+			"status": "awake", "message": "ClamAV woke successfully.",
+		},
+	},
+	{
+		StatusCode: http.StatusOK,
+		Body: map[string]any{
+			"status": "awake", "message": "ClamAV is already awake.",
+		},
+	},
+}
+
+var templateWakeFailureResponses = []templateHTTPResponse{
+	{
+		StatusCode: http.StatusInternalServerError,
+		Body:       map[string]any{"error": "wake ClamAV: example startup failure"},
+	},
+	{
+		StatusCode: http.StatusGatewayTimeout,
+		Body:       map[string]any{"error": "ClamAV wake timed out"},
+	},
+}
 
 var templateCronRules = []map[string]any{
 	{
@@ -105,6 +178,15 @@ func TestTemplateAPIServer(t *testing.T) {
 }
 
 func newTemplateAPIHandler() http.Handler {
+	return newTemplateAPIHandlerWithDelay(randomTemplateLookupDelay)
+}
+
+func newTemplateAPIHandlerWithDelay(lookupDelay func() time.Duration) http.Handler {
+	api := &templateAPI{
+		resultLookups:     make(map[string]templateLookupState),
+		quarantineLookups: make(map[string]templateLookupState),
+		lookupDelay:       lookupDelay,
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", templateRoot)
 	mux.HandleFunc("/api/status", templateStatus)
@@ -118,12 +200,12 @@ func newTemplateAPIHandler() http.Handler {
 	mux.HandleFunc("/api/cron/rules/", templateCronRuleHandler)
 	mux.HandleFunc("/api/cron/reload", templateCronReload)
 	mux.HandleFunc("/api/whitelist", templateWhitelist)
-	mux.HandleFunc("/api/results/lookups", templateResultLookupStart)
-	mux.HandleFunc("/api/results/lookups/", templateResultLookup)
+	mux.HandleFunc("/api/results/lookups", api.templateResultLookupStart)
+	mux.HandleFunc("/api/results/lookups/", api.templateResultLookup)
 	mux.HandleFunc("/api/results/detection", templateDetection)
 	mux.HandleFunc("/api/results/clean", templateResultsClean)
-	mux.HandleFunc("/api/quarantine/lookups", templateQuarantineLookupStart)
-	mux.HandleFunc("/api/quarantine/lookups/", templateQuarantineLookup)
+	mux.HandleFunc("/api/quarantine/lookups", api.templateQuarantineLookupStart)
+	mux.HandleFunc("/api/quarantine/lookups/", api.templateQuarantineLookup)
 	mux.HandleFunc("/api/quarantine/delete/", templateQuarantineAction)
 	mux.HandleFunc("/api/quarantine/recover/", templateQuarantineAction)
 	mux.HandleFunc("/api/quarantine/clean", templateQuarantineClean)
@@ -194,18 +276,27 @@ func templateClamAVSleep(w http.ResponseWriter, r *http.Request) {
 	if !templateMethod(w, r, http.MethodPost) {
 		return
 	}
-	writeTemplateJSON(w, http.StatusOK, map[string]any{
-		"status": "sleeping", "message": "ClamAV entered sleep mode (test only)",
-	})
+	writeRandomTemplatePowerResponse(w, templateSleepSuccessResponses, templateSleepFailureResponses)
 }
 
 func templateClamAVWake(w http.ResponseWriter, r *http.Request) {
 	if !templateMethod(w, r, http.MethodPost) {
 		return
 	}
-	writeTemplateJSON(w, http.StatusOK, map[string]any{
-		"status": "awake", "message": "ClamAV woke successfully (test only)",
-	})
+	writeRandomTemplatePowerResponse(w, templateWakeSuccessResponses, templateWakeFailureResponses)
+}
+
+func writeRandomTemplatePowerResponse(
+	w http.ResponseWriter,
+	successResponses []templateHTTPResponse,
+	failureResponses []templateHTTPResponse,
+) {
+	responses := successResponses
+	if rand.Intn(2) == 0 {
+		responses = failureResponses
+	}
+	response := responses[rand.Intn(len(responses))]
+	writeTemplateJSON(w, response.StatusCode, response.Body)
 }
 
 func templateBrowse(w http.ResponseWriter, r *http.Request) {
@@ -242,9 +333,19 @@ func templateScans(w http.ResponseWriter, r *http.Request) {
 				"action": "warn", "started_at": "2026-07-28T07:00:00+08:00", "queue_number": 0,
 			},
 			{
-				"id": "web-test-queued", "status": "queued",
+				"id": "web-test-queued-01", "status": "queued",
 				"job_ids": []string{}, "targets": []string{"/scan/uploads"},
 				"action": "move", "started_at": nil, "queue_number": 1,
+			},
+			{
+				"id": "web-test-queued-02", "status": "queued",
+				"job_ids": []string{}, "targets": []string{"/scan/documents/reports"},
+				"action": "warn", "started_at": nil, "queue_number": 2,
+			},
+			{
+				"id": "web-test-queued-03", "status": "queued",
+				"job_ids": []string{}, "targets": []string{"/scan/uploads/incoming"},
+				"action": "remove", "started_at": nil, "queue_number": 3,
 			},
 		})
 	default:
@@ -318,28 +419,52 @@ func templateWhitelist(w http.ResponseWriter, r *http.Request) {
 	writeTemplateJSON(w, http.StatusOK, response)
 }
 
-func templateResultLookupStart(w http.ResponseWriter, r *http.Request) {
-	if templateMethod(w, r, http.MethodPost) {
-		writeTemplateJSON(w, http.StatusAccepted, map[string]any{
-			"status": "success", "lookup_id": templateResultLookupID,
-			"message": "result list is ready; fetch /api/results/lookups/" + templateResultLookupID,
-		})
+func (api *templateAPI) templateResultLookupStart(w http.ResponseWriter, r *http.Request) {
+	if !templateMethod(w, r, http.MethodPost) {
+		return
 	}
+	id, state := api.createLookup("result")
+	api.mu.Lock()
+	api.resultLookups[id] = state
+	api.cleanupLookupsLocked(time.Now().Add(-15 * time.Minute))
+	api.mu.Unlock()
+	writeTemplateJSON(w, http.StatusAccepted, map[string]any{
+		"status":    "pending",
+		"lookup_id": id,
+		"message":   "result list is loading; poll /api/results/lookups/" + id,
+	})
 }
 
-func templateResultLookup(w http.ResponseWriter, r *http.Request) {
+func (api *templateAPI) templateResultLookup(w http.ResponseWriter, r *http.Request) {
 	if !templateMethod(w, r, http.MethodGet) {
 		return
 	}
 	id := strings.TrimPrefix(r.URL.Path, "/api/results/lookups/")
-	if id == "" {
+	if id == "" || strings.Contains(id, "/") {
 		http.NotFound(w, r)
 		return
 	}
-	now := time.Now().Format(time.RFC3339)
+
+	api.mu.RLock()
+	state, ok := api.resultLookups[id]
+	api.mu.RUnlock()
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if time.Now().Before(state.ReadyAt) {
+		writeTemplateJSON(w, http.StatusAccepted, map[string]any{
+			"lookup_id":  id,
+			"status":     "pending",
+			"total":      0,
+			"started_at": state.StartedAt,
+			"updated_at": state.StartedAt,
+		})
+		return
+	}
 	writeTemplateJSON(w, http.StatusOK, map[string]any{
 		"lookup_id": id, "status": "success", "total": 20,
-		"results": templateResultItems(), "started_at": now, "updated_at": now,
+		"results": templateResultItems(), "started_at": state.StartedAt, "updated_at": state.ReadyAt,
 	})
 }
 
@@ -382,22 +507,46 @@ func templateResultsClean(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func templateQuarantineLookupStart(w http.ResponseWriter, r *http.Request) {
-	if templateMethod(w, r, http.MethodPost) {
-		writeTemplateJSON(w, http.StatusAccepted, map[string]any{
-			"status": "success", "lookup_id": templateQuarantineLookupID,
-			"message": "quarantine list is ready; fetch /api/quarantine/lookups/" + templateQuarantineLookupID,
-		})
+func (api *templateAPI) templateQuarantineLookupStart(w http.ResponseWriter, r *http.Request) {
+	if !templateMethod(w, r, http.MethodPost) {
+		return
 	}
+	id, state := api.createLookup("quarantine")
+	api.mu.Lock()
+	api.quarantineLookups[id] = state
+	api.cleanupLookupsLocked(time.Now().Add(-15 * time.Minute))
+	api.mu.Unlock()
+	writeTemplateJSON(w, http.StatusAccepted, map[string]any{
+		"status":    "pending",
+		"lookup_id": id,
+		"message":   "quarantine list is loading; poll /api/quarantine/lookups/" + id,
+	})
 }
 
-func templateQuarantineLookup(w http.ResponseWriter, r *http.Request) {
+func (api *templateAPI) templateQuarantineLookup(w http.ResponseWriter, r *http.Request) {
 	if !templateMethod(w, r, http.MethodGet) {
 		return
 	}
 	id := strings.TrimPrefix(r.URL.Path, "/api/quarantine/lookups/")
-	if id == "" {
+	if id == "" || strings.Contains(id, "/") {
 		http.NotFound(w, r)
+		return
+	}
+
+	api.mu.RLock()
+	state, ok := api.quarantineLookups[id]
+	api.mu.RUnlock()
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if time.Now().Before(state.ReadyAt) {
+		writeTemplateJSON(w, http.StatusAccepted, map[string]any{
+			"lookup_id":  id,
+			"status":     "pending",
+			"started_at": state.StartedAt,
+			"updated_at": state.StartedAt,
+		})
 		return
 	}
 	subjects := make([]map[string]any, 0, 20)
@@ -407,11 +556,36 @@ func templateQuarantineLookup(w http.ResponseWriter, r *http.Request) {
 			"source_file": fmt.Sprintf("/scan/uploads/example-%02d.dat", i),
 		})
 	}
-	now := time.Now().Format(time.RFC3339)
 	writeTemplateJSON(w, http.StatusOK, map[string]any{
 		"lookup_id": id, "status": "success", "subjects": subjects,
-		"started_at": now, "updated_at": now,
+		"started_at": state.StartedAt, "updated_at": state.ReadyAt,
 	})
+}
+
+func (api *templateAPI) createLookup(prefix string) (string, templateLookupState) {
+	now := time.Now()
+	delay := api.lookupDelay()
+	return fmt.Sprintf("%s-%016x", prefix, templateLookupSequence.Add(1)), templateLookupState{
+		StartedAt: now,
+		ReadyAt:   now.Add(delay),
+	}
+}
+
+func (api *templateAPI) cleanupLookupsLocked(before time.Time) {
+	for id, state := range api.resultLookups {
+		if state.StartedAt.Before(before) {
+			delete(api.resultLookups, id)
+		}
+	}
+	for id, state := range api.quarantineLookups {
+		if state.StartedAt.Before(before) {
+			delete(api.quarantineLookups, id)
+		}
+	}
+}
+
+func randomTemplateLookupDelay() time.Duration {
+	return time.Duration(rand.Intn(5)+1) * time.Second
 }
 
 func templateQuarantineAction(w http.ResponseWriter, r *http.Request) {
@@ -451,7 +625,7 @@ func writeTemplateJSON(w http.ResponseWriter, status int, value any) {
 }
 
 func TestTemplateAPIResponses(t *testing.T) {
-	handler := newTemplateAPIHandler()
+	handler := newTemplateAPIHandlerWithDelay(func() time.Duration { return 0 })
 
 	request := func(method, path string) (*httptest.ResponseRecorder, map[string]any) {
 		t.Helper()
@@ -490,14 +664,43 @@ func TestTemplateAPIResponses(t *testing.T) {
 		}
 	})
 
-	t.Run("clamav power endpoints return state", func(t *testing.T) {
-		response, body := request(http.MethodPost, "/api/clamav/sleep")
-		if response.Code != http.StatusOK || body["status"] != "sleeping" {
-			t.Fatalf("unexpected sleep response: %d %#v", response.Code, body)
+	t.Run("clamav power endpoints use real success and failure shapes", func(t *testing.T) {
+		cases := []struct {
+			path            string
+			successStatus   string
+			failureStatuses map[int]bool
+		}{
+			{
+				path:          "/api/clamav/sleep",
+				successStatus: "sleeping",
+				failureStatuses: map[int]bool{
+					http.StatusConflict:            true,
+					http.StatusInternalServerError: true,
+					http.StatusGatewayTimeout:      true,
+				},
+			},
+			{
+				path:          "/api/clamav/wake",
+				successStatus: "awake",
+				failureStatuses: map[int]bool{
+					http.StatusInternalServerError: true,
+					http.StatusGatewayTimeout:      true,
+				},
+			},
 		}
-		response, body = request(http.MethodPost, "/api/clamav/wake")
-		if response.Code != http.StatusOK || body["status"] != "awake" {
-			t.Fatalf("unexpected wake response: %d %#v", response.Code, body)
+		for _, test := range cases {
+			for i := 0; i < 100; i++ {
+				response, body := request(http.MethodPost, test.path)
+				if response.Code == http.StatusOK {
+					if body["status"] != test.successStatus || body["message"] == "" || body["error"] != nil {
+						t.Fatalf("unexpected success response for %s: %d %#v", test.path, response.Code, body)
+					}
+					continue
+				}
+				if !test.failureStatuses[response.Code] || body["error"] == "" || body["status"] != nil {
+					t.Fatalf("unexpected failure response for %s: %d %#v", test.path, response.Code, body)
+				}
+			}
 		}
 	})
 
@@ -511,14 +714,90 @@ func TestTemplateAPIResponses(t *testing.T) {
 		}
 	})
 
-	t.Run("lookups return twenty items immediately", func(t *testing.T) {
+	t.Run("scan queue contains one running and three queued items", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/scans", nil)
+		req.SetBasicAuth("any-user", "any-password")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		var items []map[string]any
+		if err := json.NewDecoder(response.Body).Decode(&items); err != nil {
+			t.Fatal(err)
+		}
+		if response.Code != http.StatusOK || len(items) != 4 {
+			t.Fatalf("expected four scan items, got %d %#v", response.Code, items)
+		}
+		for i, item := range items {
+			if item["queue_number"] != float64(i) {
+				t.Fatalf("expected queue number %d, got %#v", i, item["queue_number"])
+			}
+		}
+		if items[0]["status"] != "running" {
+			t.Fatalf("expected queue item zero to be running, got %#v", items[0])
+		}
+	})
+
+	t.Run("lookups start pending and return twenty items when ready", func(t *testing.T) {
 		response, start := request(http.MethodPost, "/api/results/lookups")
-		if response.Code != http.StatusAccepted || start["status"] != "success" {
+		if response.Code != http.StatusAccepted || start["status"] != "pending" {
 			t.Fatalf("unexpected lookup start: %d %#v", response.Code, start)
+		}
+		_, secondStart := request(http.MethodPost, "/api/results/lookups")
+		if start["lookup_id"] == secondStart["lookup_id"] {
+			t.Fatalf("expected each lookup to have a new id, got %q", start["lookup_id"])
 		}
 		response, lookup := request(http.MethodGet, "/api/results/lookups/"+start["lookup_id"].(string))
 		if response.Code != http.StatusOK || len(lookup["results"].([]any)) != 20 {
 			t.Fatalf("unexpected lookup result: %d %#v", response.Code, lookup)
+		}
+
+		response, quarantineStart := request(http.MethodPost, "/api/quarantine/lookups")
+		if response.Code != http.StatusAccepted || quarantineStart["status"] != "pending" {
+			t.Fatalf("unexpected quarantine lookup start: %d %#v", response.Code, quarantineStart)
+		}
+		response, quarantineLookup := request(
+			http.MethodGet,
+			"/api/quarantine/lookups/"+quarantineStart["lookup_id"].(string),
+		)
+		if response.Code != http.StatusOK || len(quarantineLookup["subjects"].([]any)) != 20 {
+			t.Fatalf("unexpected quarantine lookup result: %d %#v", response.Code, quarantineLookup)
+		}
+	})
+
+	t.Run("lookups remain pending until their delay expires", func(t *testing.T) {
+		slowHandler := newTemplateAPIHandlerWithDelay(func() time.Duration { return time.Hour })
+		for _, lookupPath := range []string{"/api/results/lookups", "/api/quarantine/lookups"} {
+			startRequest := httptest.NewRequest(http.MethodPost, lookupPath, nil)
+			startRequest.SetBasicAuth("any-user", "any-password")
+			startResponse := httptest.NewRecorder()
+			slowHandler.ServeHTTP(startResponse, startRequest)
+			var start map[string]any
+			if err := json.NewDecoder(startResponse.Body).Decode(&start); err != nil {
+				t.Fatal(err)
+			}
+			if startResponse.Code != http.StatusAccepted || start["status"] != "pending" {
+				t.Fatalf("unexpected lookup start for %s: %d %#v", lookupPath, startResponse.Code, start)
+			}
+
+			pollRequest := httptest.NewRequest(http.MethodGet, lookupPath+"/"+start["lookup_id"].(string), nil)
+			pollRequest.SetBasicAuth("any-user", "any-password")
+			pollResponse := httptest.NewRecorder()
+			slowHandler.ServeHTTP(pollResponse, pollRequest)
+			var poll map[string]any
+			if err := json.NewDecoder(pollResponse.Body).Decode(&poll); err != nil {
+				t.Fatal(err)
+			}
+			if pollResponse.Code != http.StatusAccepted || poll["status"] != "pending" {
+				t.Fatalf("unexpected pending poll for %s: %d %#v", lookupPath, pollResponse.Code, poll)
+			}
+		}
+	})
+
+	t.Run("lookup delay is between one and five seconds", func(t *testing.T) {
+		for i := 0; i < 100; i++ {
+			delay := randomTemplateLookupDelay()
+			if delay < time.Second || delay > 5*time.Second {
+				t.Fatalf("lookup delay is outside the expected range: %s", delay)
+			}
 		}
 	})
 
@@ -530,12 +809,16 @@ func TestTemplateAPIResponses(t *testing.T) {
 	})
 
 	t.Run("every documented API route responds", func(t *testing.T) {
+		_, resultStart := request(http.MethodPost, "/api/results/lookups")
+		_, quarantineStart := request(http.MethodPost, "/api/quarantine/lookups")
 		routes := []struct {
 			method string
 			path   string
 			status int
 		}{
 			{http.MethodGet, "/api/status", http.StatusOK},
+			{http.MethodPost, "/api/clamav/sleep", 0},
+			{http.MethodPost, "/api/clamav/wake", 0},
 			{http.MethodGet, "/api/browse", http.StatusOK},
 			{http.MethodPost, "/api/scans", http.StatusAccepted},
 			{http.MethodGet, "/api/scans", http.StatusOK},
@@ -551,12 +834,12 @@ func TestTemplateAPIResponses(t *testing.T) {
 			{http.MethodPost, "/api/whitelist", http.StatusOK},
 			{http.MethodDelete, "/api/whitelist", http.StatusOK},
 			{http.MethodPost, "/api/results/lookups", http.StatusAccepted},
-			{http.MethodGet, "/api/results/lookups/" + templateResultLookupID, http.StatusOK},
+			{http.MethodGet, "/api/results/lookups/" + resultStart["lookup_id"].(string), http.StatusOK},
 			{http.MethodPost, "/api/results/detection", http.StatusOK},
 			{http.MethodPost, "/api/results/clean", http.StatusOK},
 			{http.MethodPost, "/api/quarantine/clean", http.StatusOK},
 			{http.MethodPost, "/api/quarantine/lookups", http.StatusAccepted},
-			{http.MethodGet, "/api/quarantine/lookups/" + templateQuarantineLookupID, http.StatusOK},
+			{http.MethodGet, "/api/quarantine/lookups/" + quarantineStart["lookup_id"].(string), http.StatusOK},
 			{http.MethodPost, "/api/quarantine/delete/example.dat", http.StatusOK},
 			{http.MethodPost, "/api/quarantine/recover/example.dat", http.StatusOK},
 		}
@@ -567,7 +850,7 @@ func TestTemplateAPIResponses(t *testing.T) {
 				req.SetBasicAuth("ignored-user", "ignored-password")
 				response := httptest.NewRecorder()
 				handler.ServeHTTP(response, req)
-				if response.Code != route.status {
+				if route.status != 0 && response.Code != route.status {
 					t.Fatalf("expected %d, got %d", route.status, response.Code)
 				}
 				if !strings.HasPrefix(response.Header().Get("Content-Type"), "application/json") {
