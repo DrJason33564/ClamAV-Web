@@ -79,6 +79,8 @@ curl -u admin:secret http://localhost:8080/api/status
 字段说明：
 
 - `source`：状态文件内容。如果状态文件不存在，会返回说明信息。
+- `source.clamd.status`：ClamAV 状态；休眠成功后为 `sleep`。
+- `source.clamd.message`：ClamAV 状态说明；`status` 为 `sleep` 时固定为 `clamd is sleeping.`。
 - `source.scan.last_job_status`：后端根据 `source.scan.last_job_id` 读取 `/state/jobs/<last_job_id>.json` 后补充，可能为 `running`、`finished`、`failed` 或 `null`。
 - `source.scan.last_job_result`：后端根据同一 job 状态文件中的 `result` 字段补充；如果状态文件不存在或字段不存在则为 `null`。
 - `ping`：实时 clamd ping 结果，可能为 `ready`、`error`、`timeout`。
@@ -114,6 +116,7 @@ curl -u admin:secret -X POST http://localhost:8080/api/clamav/sleep
 说明：
 
 - 接口具有幂等性；ClamAV 已休眠时仍返回 `200 OK` 和 `sleeping`。
+- 休眠成功后会原子更新 `/state/status.json`，将 `clamd.status` 写为 `sleep`、`clamd.message` 写为 `clamd is sleeping.`，并保留其他状态字段。
 - `/state/scan.lock` 表示扫描正在执行时，接口返回 `409 Conflict`，不会关闭 ClamAV。
 - socket 连接、写入、响应或休眠锁创建失败时返回 `500 Internal Server Error`。
 - socket 操作超时时返回 `504 Gateway Timeout`。

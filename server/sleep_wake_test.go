@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -91,6 +92,62 @@ func TestSleepClamAVRejectsActiveScan(t *testing.T) {
 	_, _, statusCode, err := s.sleepClamAV(context.Background())
 	if statusCode != http.StatusConflict || err == nil {
 		t.Fatalf("expected active scan conflict, code=%d err=%v", statusCode, err)
+	}
+}
+
+func TestSleepClamAVWritesCompleteStatusWhenAlreadySleeping(t *testing.T) {
+	tmp := t.TempDir()
+	statusFile := filepath.Join(tmp, "status.json")
+	sleepLock := filepath.Join(tmp, "sleep.lock")
+	if err := os.Mkdir(sleepLock, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statusFile, []byte(`{
+  "version": 1,
+  "updated_at": "2026-07-29T12:00:00+0800",
+  "clamd": {
+    "status": "ready",
+    "last_checked_at": "2026-07-29T12:00:00+0800",
+    "message": "clamd is ready."
+  },
+  "scan": {
+    "active_job_id": null,
+    "last_job_id": "manual-20260729115900"
+  }
+}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withFakeClamdscan(t, false)
+
+	s := &server{cfg: config{
+		StatusFile:    statusFile,
+		SleepLockDir:  sleepLock,
+		ClamdConf:     filepath.Join(tmp, "clamd.conf"),
+		CommandTimout: time.Second,
+	}}
+	status, _, statusCode, err := s.sleepClamAV(context.Background())
+	if err != nil || statusCode != http.StatusOK || status != "sleeping" {
+		t.Fatalf("unexpected sleep result: status=%q code=%d err=%v", status, statusCode, err)
+	}
+
+	data, err := os.ReadFile(statusFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatal(err)
+	}
+	clamd := root["clamd"].(map[string]any)
+	if clamd["status"] != "sleep" || clamd["message"] != "clamd is sleeping." {
+		t.Fatalf("unexpected clamd status: %#v", clamd)
+	}
+	if clamd["last_checked_at"] != "2026-07-29T12:00:00+0800" {
+		t.Fatalf("clamd fields were not preserved: %#v", clamd)
+	}
+	scan := root["scan"].(map[string]any)
+	if scan["last_job_id"] != "manual-20260729115900" {
+		t.Fatalf("scan state was not preserved: %#v", scan)
 	}
 }
 

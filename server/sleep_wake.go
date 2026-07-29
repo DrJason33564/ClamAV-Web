@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"time"
 )
 
@@ -59,6 +61,9 @@ func (s *server) sleepClamAV(ctx context.Context) (string, string, int, error) {
 
 	ping, _ := s.pingClamd(ctx)
 	if sleeping && ping != "ready" {
+		if err := writeClamdSleepStatus(s.cfg.StatusFile); err != nil {
+			return "failed", "", http.StatusInternalServerError, fmt.Errorf("write ClamAV sleep status: %w", err)
+		}
 		return "sleeping", "ClamAV is already sleeping.", http.StatusOK, nil
 	}
 
@@ -79,6 +84,9 @@ func (s *server) sleepClamAV(ctx context.Context) (string, string, int, error) {
 	// stale sleep marker was found next to a still-running clamd instance.
 	if err := createDirectoryLock(s.cfg.SleepLockDir); err != nil {
 		return "failed", "", http.StatusInternalServerError, fmt.Errorf("create sleep lock: %w", err)
+	}
+	if err := writeClamdSleepStatus(s.cfg.StatusFile); err != nil {
+		return "failed", "", http.StatusInternalServerError, fmt.Errorf("write ClamAV sleep status: %w", err)
 	}
 	return "sleeping", "ClamAV entered sleep mode.", http.StatusOK, nil
 }
@@ -178,6 +186,64 @@ func createDirectoryLock(path string) error {
 		}
 	}
 	return err
+}
+
+func writeClamdSleepStatus(path string) error {
+	root := make(map[string]any)
+	data, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		if err := json.Unmarshal(data, &root); err != nil {
+			return fmt.Errorf("decode status file: %w", err)
+		}
+		if root == nil {
+			return errors.New("decode status file: root must be an object")
+		}
+	case errors.Is(err, os.ErrNotExist):
+		root["version"] = 1
+		root["scan"] = map[string]any{
+			"active_job_id": nil,
+			"last_job_id":   nil,
+		}
+	default:
+		return err
+	}
+
+	clamd, ok := root["clamd"].(map[string]any)
+	if !ok {
+		clamd = make(map[string]any)
+		root["clamd"] = clamd
+	}
+	clamd["status"] = "sleep"
+	clamd["message"] = "clamd is sleeping."
+
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".status.*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	encoder := json.NewEncoder(tmp)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(root); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
 }
 
 func powerErrorStatus(ctx context.Context, err error) int {
