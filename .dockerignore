@@ -17,3 +17,4 @@ skills-lock.jon
 .codex
 frontend
 server/web
+*_test.go
