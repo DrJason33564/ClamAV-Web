@@ -108,6 +108,8 @@ func newTemplateAPIHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", templateRoot)
 	mux.HandleFunc("/api/status", templateStatus)
+	mux.HandleFunc("/api/clamav/sleep", templateClamAVSleep)
+	mux.HandleFunc("/api/clamav/wake", templateClamAVWake)
 	mux.HandleFunc("/api/browse", templateBrowse)
 	mux.HandleFunc("/api/scans", templateScans)
 	mux.HandleFunc("/api/scans/reorder", templateScanReorder)
@@ -185,6 +187,24 @@ func templateStatus(w http.ResponseWriter, r *http.Request) {
 		"ping":         state.status,
 		"ping_message": state.message,
 		"checked_at":   timestamp,
+	})
+}
+
+func templateClamAVSleep(w http.ResponseWriter, r *http.Request) {
+	if !templateMethod(w, r, http.MethodPost) {
+		return
+	}
+	writeTemplateJSON(w, http.StatusOK, map[string]any{
+		"status": "sleeping", "message": "ClamAV entered sleep mode (test only)",
+	})
+}
+
+func templateClamAVWake(w http.ResponseWriter, r *http.Request) {
+	if !templateMethod(w, r, http.MethodPost) {
+		return
+	}
+	writeTemplateJSON(w, http.StatusOK, map[string]any{
+		"status": "awake", "message": "ClamAV woke successfully (test only)",
 	})
 }
 
@@ -467,6 +487,17 @@ func TestTemplateAPIResponses(t *testing.T) {
 		scan := source["scan"].(map[string]any)
 		if scan["last_job_id"] != templateLastJobID {
 			t.Fatalf("unexpected last job id: %#v", scan["last_job_id"])
+		}
+	})
+
+	t.Run("clamav power endpoints return state", func(t *testing.T) {
+		response, body := request(http.MethodPost, "/api/clamav/sleep")
+		if response.Code != http.StatusOK || body["status"] != "sleeping" {
+			t.Fatalf("unexpected sleep response: %d %#v", response.Code, body)
+		}
+		response, body = request(http.MethodPost, "/api/clamav/wake")
+		if response.Code != http.StatusOK || body["status"] != "awake" {
+			t.Fatalf("unexpected wake response: %d %#v", response.Code, body)
 		}
 	})
 

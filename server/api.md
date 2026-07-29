@@ -85,6 +85,59 @@ curl -u admin:secret http://localhost:8080/api/status
 - `ping_message`：ping 结果说明。
 - `checked_at`：本次 API 检查时间。
 
+## `POST /api/clamav/sleep`
+
+用途：让 ClamAV 进入休眠。后端通过 `/tmp/clamd.sock` 发送 `SHUTDOWN`；命令无响应并正常关闭连接后，原子创建 `/state/sleep.lock` 空目录作为休眠状态标记。Go Web 服务和 cron 保持运行。
+
+调用：
+
+```sh
+curl -u admin:secret -X POST http://localhost:8080/api/clamav/sleep
+```
+
+成功响应：
+
+```json
+{
+  "status": "sleeping",
+  "message": "ClamAV entered sleep mode."
+}
+```
+
+说明：
+
+- 接口具有幂等性；ClamAV 已休眠时仍返回 `200 OK` 和 `sleeping`。
+- `/state/scan.lock` 表示扫描正在执行时，接口返回 `409 Conflict`，不会关闭 ClamAV。
+- socket 连接、写入、响应或休眠锁创建失败时返回 `500 Internal Server Error`。
+- socket 操作超时时返回 `504 Gateway Timeout`。
+- 本接口当前不会改变手动或 cron 扫描流程；休眠状态下触发扫描的行为将在后续功能中处理。
+
+## `POST /api/clamav/wake`
+
+用途：唤醒 ClamAV。后端执行 `/startup.sh --wake`；该模式只启动官方 `/init` 并等待 ClamAV 返回 PONG，不创建目录、不校验应用配置，也不启动 cron 或 Go Web 服务。唤醒成功后删除 `/state/sleep.lock`。
+
+调用：
+
+```sh
+curl -u admin:secret -X POST http://localhost:8080/api/clamav/wake
+```
+
+成功响应：
+
+```json
+{
+  "status": "awake",
+  "message": "ClamAV woke successfully."
+}
+```
+
+说明：
+
+- 接口具有幂等性；ClamAV 已可正常 PONG 时会删除可能存在的陈旧 sleep lock，并返回 `200 OK` 和 `awake`。
+- 唤醒失败时保留 `/state/sleep.lock`，返回 `500 Internal Server Error`。
+- 唤醒超时时返回 `504 Gateway Timeout`。
+- `/startup.sh --wake` 会原子更新 `/state/clamav-init.pid`，使容器 PID 1 能继续监督并在容器退出时优雅停止最新的 `/init` 进程。
+
 ## `GET /api/browse`
 
 用途：浏览 `/scan` 下的文件和目录，用于前端选择手动扫描目标。
