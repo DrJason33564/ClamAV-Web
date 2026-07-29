@@ -65,7 +65,7 @@ func TestDirectoryLockLifecycle(t *testing.T) {
 	if info, err := os.Stat(sleepLock); err != nil || !info.IsDir() {
 		t.Fatalf("expected sleep lock directory, info=%v err=%v", info, err)
 	}
-	if err := removeDirectoryLock(sleepLock); err != nil {
+	if err := os.Remove(sleepLock); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(sleepLock); !os.IsNotExist(err) {
@@ -94,16 +94,22 @@ func TestSleepClamAVRejectsActiveScan(t *testing.T) {
 	}
 }
 
-func TestWakeClamAVRemovesStaleLockWhenAlreadyReady(t *testing.T) {
+func TestWakeClamAVDelegatesStaleLockCleanupToStartupScript(t *testing.T) {
 	tmp := t.TempDir()
 	sleepLock := filepath.Join(tmp, "sleep.lock")
 	if err := os.Mkdir(sleepLock, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	withFakeClamdscan(t, true)
+	startupScript := filepath.Join(tmp, "startup.sh")
+	if err := os.WriteFile(startupScript, []byte("#!/bin/sh\nrmdir \"$SLEEP_LOCK_DIR\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SLEEP_LOCK_DIR", sleepLock)
 
 	s := &server{cfg: config{
 		SleepLockDir:  sleepLock,
+		StartupScript: startupScript,
 		ClamdConf:     filepath.Join(tmp, "clamd.conf"),
 		CommandTimout: time.Second,
 		WakeTimeout:   time.Second,

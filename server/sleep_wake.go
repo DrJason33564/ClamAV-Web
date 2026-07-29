@@ -85,12 +85,7 @@ func (s *server) sleepClamAV(ctx context.Context) (string, string, int, error) {
 
 func (s *server) wakeClamAV(requestCtx context.Context) (string, string, int, error) {
 	ping, _ := s.pingClamd(requestCtx)
-	if ping == "ready" {
-		if err := removeDirectoryLock(s.cfg.SleepLockDir); err != nil {
-			return "failed", "", http.StatusInternalServerError, fmt.Errorf("remove stale sleep lock: %w", err)
-		}
-		return "awake", "ClamAV is already awake.", http.StatusOK, nil
-	}
+	alreadyAwake := ping == "ready"
 
 	// Do not bind a potentially long ClamAV database load to the HTTP client's
 	// cancellation. The server serializes power transitions and completes the
@@ -110,14 +105,10 @@ func (s *server) wakeClamAV(requestCtx context.Context) (string, string, int, er
 		return "failed", "", http.StatusInternalServerError, fmt.Errorf("wake ClamAV: %w", err)
 	}
 
-	// startup.sh already waits for PONG; verify once more at the API boundary
-	// before deleting the durable sleep marker.
-	ping, message := s.pingClamd(context.Background())
-	if ping != "ready" {
-		return "failed", "", http.StatusInternalServerError, fmt.Errorf("ClamAV wake did not become ready: %s", message)
-	}
-	if err := removeDirectoryLock(s.cfg.SleepLockDir); err != nil {
-		return "failed", "", http.StatusInternalServerError, fmt.Errorf("remove sleep lock: %w", err)
+	// startup.sh owns both the final PONG check and the sleep-lock transition.
+	// A zero exit status is therefore the complete wake result.
+	if alreadyAwake {
+		return "awake", "ClamAV is already awake.", http.StatusOK, nil
 	}
 	return "awake", "ClamAV woke successfully.", http.StatusOK, nil
 }
@@ -185,14 +176,6 @@ func createDirectoryLock(path string) error {
 		if exists {
 			return nil
 		}
-	}
-	return err
-}
-
-func removeDirectoryLock(path string) error {
-	err := os.Remove(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
 	}
 	return err
 }

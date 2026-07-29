@@ -122,7 +122,7 @@ curl -u admin:secret -X POST http://localhost:8080/api/clamav/sleep
 
 ## `POST /api/clamav/wake`
 
-用途：唤醒 ClamAV。后端执行 `/startup.sh --wake`；该模式只启动官方 `/init` 并等待 ClamAV 返回 PONG，不创建目录、不校验应用配置，也不启动 cron 或 Go Web 服务。唤醒成功后删除 `/state/sleep.lock`。
+用途：唤醒 ClamAV。后端执行 `/startup.sh --wake`；该模式只负责确认或启动官方 `/init`、等待 ClamAV 返回 PONG，并删除 `/state/sleep.lock`，不创建目录、不校验应用配置，也不启动 cron 或 Go Web 服务。
 
 调用：
 
@@ -148,11 +148,11 @@ curl -u admin:secret -X POST http://localhost:8080/api/clamav/wake
 
 说明：
 
-- 接口具有幂等性；ClamAV 已可正常 PONG 时会删除可能存在的陈旧 sleep lock，并返回 `200 OK` 和 `awake`。
+- 接口具有幂等性；ClamAV 已可正常 PONG 时，`startup.sh --wake` 不会重复启动 `/init`，只删除可能存在的陈旧 sleep lock，并返回 `200 OK` 和 `awake`。
 - 唤醒失败时保留 `/state/sleep.lock`，返回 `500 Internal Server Error`。
 - 唤醒超时时返回 `504 Gateway Timeout`。
 - `500` 和 `504` 错误响应使用通用 `{"error":"error message"}` 结构，不包含 `status` 字段；当前接口不会返回 `status: "failed"`。
-- `/startup.sh --wake` 会原子更新 `/state/clamav-init.pid`，使容器 PID 1 能继续监督并在容器退出时优雅停止最新的 `/init` 进程。
+- `/startup.sh --wake` 在需要新启动 `/init` 时会原子更新 `/state/clamav-init.pid`，使容器 PID 1 能继续监督并在容器退出时优雅停止最新进程；ClamAV 已就绪时不会改写 PID。
 
 ## `GET /api/browse`
 
@@ -244,6 +244,16 @@ curl -u admin:secret \
 }
 ```
 
+ClamAV 休眠时返回 `409 Conflict`，不会生成批次 ID、加入内存队列或执行 `scan_once.sh`：
+
+```json
+{
+  "id": "",
+  "status": "failed",
+  "message": "ClamAV is sleeping."
+}
+```
+
 说明：
 
 - `id` 是 WebUI 批次 ID，固定以 `web-` 开头。
@@ -253,6 +263,7 @@ curl -u admin:secret \
 - 队列调度器在启动手动批次前会检查 `/state/scan.lock`。如果锁中的 `pid` 仍存活，说明已有自动或其他扫描正在运行，手动批次保持 `queued`，后端每 5 秒重试一次。
 - 如果 `/state/scan.lock` 不存在，或锁中的 `pid` 缺失、为空、非法、已退出，后端认为该锁不阻塞手动队列，并启动 `scan_once.sh`；无效锁文件由 `scan_once.sh` 自己在抢锁流程中清理。
 - `wait` 仅为兼容旧调用保留；手动扫描队列串行调度，后端不会因为该字段向 `scan_once.sh` 传递 `--wait`。
+- 后端在解析扫描请求和创建队列任务前检查 `/state/sleep.lock`；存在时直接返回上述休眠响应。
 
 ## `GET /api/scans`
 
@@ -396,6 +407,8 @@ curl -u admin:secret \
 ```
 
 规则 ID 由后端生成，长度 16 位，只包含小写字母和数字。
+
+`scan_once.sh` 支持仅用于 cron 任务的 `--wake` 参数。带该参数的 cron 调用会在发现 `/state/sleep.lock` 时执行 `/startup.sh --wake`，成功后继续扫描；不带该参数时会生成完整的失败任务记录并在任务日志中写入 `[ERROR] ClamAV is sleeping`。当前 `cron.sh` 生成 crontab 时不会自动追加 `--wake`，定时规则与该参数的配置接入将在后续实现。
 
 ## `GET /api/cron/rules`
 
@@ -713,11 +726,22 @@ curl -u admin:secret \
 }
 ```
 
+ClamAV 休眠响应：
+
+```json
+{
+  "status": "failed",
+  "message": null,
+  "error": "ClamAV is sleeping"
+}
+```
+
 说明：
 
 - `path` 必须存在，且真实路径必须位于 `/scan` 下。
 - 如果路径已经存在于白名单中，后端不会重复写入，但仍会执行 `/exclude.sh` 刷新 allow-list 数据库。
 - 如果扫描锁目录存在，返回 `409 Conflict`，`status` 为 `busy`。
+- 如果 `/state/sleep.lock` 存在，返回 `409 Conflict` 和上述休眠响应，不修改白名单，也不执行刷新或唤醒。
 - 如果 `/exclude.sh` 或 `clamd` reload 失败，返回 `failed`。
 
 ## `DELETE /api/whitelist`
@@ -756,6 +780,7 @@ curl -u admin:secret \
 
 - 删除不存在的条目会返回 `400 Bad Request`，`status` 为 `failed`。
 - 如果扫描锁目录存在，返回 `409 Conflict`，`status` 为 `busy`。
+- 如果 `/state/sleep.lock` 存在，返回与 POST 相同的 `409 Conflict` 休眠响应，不修改白名单，也不执行刷新或唤醒。
 - 如果 `/exclude.sh` 或 `clamd` reload 失败，返回 `failed`。
 
 ## `POST /api/results/lookups`

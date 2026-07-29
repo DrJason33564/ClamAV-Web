@@ -280,14 +280,14 @@ validate_wake_input() {
     [ -x "$INIT_CMD" ] || fail "Official ClamAV init is not executable: $INIT_CMD"
 }
 
-remove_startup_sleep_lock() {
+remove_sleep_lock() {
     [ -e "$SLEEP_LOCK_DIR" ] || return 0
     [ -d "$SLEEP_LOCK_DIR" ] || fail "Sleep lock is not a directory: $SLEEP_LOCK_DIR"
 
     # sleep.lock is intentionally an empty atomic directory. Refuse to remove
     # unexpected contents instead of recursively deleting state data.
+    startup_log "[INFO] Removing sleep lock: $SLEEP_LOCK_DIR"
     rmdir "$SLEEP_LOCK_DIR" || fail "Could not remove sleep lock: $SLEEP_LOCK_DIR"
-    startup_log "[INFO] Removed sleep lock during normal startup: $SLEEP_LOCK_DIR"
 }
 
 mode="normal"
@@ -316,15 +316,23 @@ if [ "$mode" = "wake" ]; then
     # validate application configuration, reload cron, or start the WebUI.
     validate_wake_input
     startup_log "[INFO] startup.sh --wake started."
-    start_clamav || fail "ClamAV wake failed."
-    startup_log "[INFO] ClamAV wake completed."
+
+    # Keep wake idempotent. A ready daemon only needs a stale sleep marker
+    # cleared; starting a second official /init would duplicate ClamAV services.
+    if clamdscan --config-file=/etc/clamav/clamd.conf --ping=1 >/dev/null 2>&1; then
+        startup_log "[INFO] clamd is already ready."
+    else
+        start_clamav || fail "ClamAV wake failed."
+    fi
+    startup_log "[INFO] ClamAV is ready. Finalizing wake state."
+    remove_sleep_lock
     exit 0
 fi
 
 startup_log "[INFO] startup.sh started."
 
 prepare_config_files
-remove_startup_sleep_lock
+remove_sleep_lock
 validate_startup_inputs
 
 startup_log "[INFO] Config validation passed. Executing exclude script: $EXCLUDE_SCRIPT"

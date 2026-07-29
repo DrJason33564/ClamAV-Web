@@ -49,6 +49,27 @@ func (s *server) handleWhitelist(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) updateWhitelist(w http.ResponseWriter, r *http.Request, add bool) {
+	// Keep allow-list mutation and the subsequent clamd reload mutually
+	// exclusive with an in-process sleep transition.
+	s.clamavPowerMu.Lock()
+	defer s.clamavPowerMu.Unlock()
+
+	sleeping, err := directoryLockExists(s.cfg.SleepLockDir)
+	if err != nil {
+		writeWhitelistStatus(w, http.StatusInternalServerError, "failed", "", fmt.Errorf("check ClamAV sleep lock: %w", err))
+		return
+	}
+	if sleeping {
+		// Use an explicit object so message is JSON null. whitelistResponse uses
+		// an omitempty string and would otherwise omit the field.
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"status":  "failed",
+			"message": nil,
+			"error":   "ClamAV is sleeping",
+		})
+		return
+	}
+
 	var req whitelistRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		writeWhitelistStatus(w, http.StatusBadRequest, "failed", "", err)
