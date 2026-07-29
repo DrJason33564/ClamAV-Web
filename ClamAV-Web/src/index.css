@@ -134,3 +134,31 @@
     @apply font-sans;
     }
 }
+
+@layer components {
+  .engine-control-mark {
+    position: absolute;
+    bottom: -6%;
+    width: 78%;
+    height: 78%;
+    background-image: url("/clamav-web-mark.png");
+    background-repeat: no-repeat;
+    background-position: 100% 0%;
+    background-size: 150% 150%;
+    opacity: 0.72;
+    transition: filter 200ms ease;
+  }
+
+  .engine-control-rings {
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(
+      circle at calc(100% - 1.875rem) 1.875rem,
+      color-mix(in oklch, var(--foreground) 12%, transparent) 0 2.8rem,
+      color-mix(in oklch, var(--foreground) 8%, transparent) 2.8rem 4.75rem,
+      color-mix(in oklch, var(--foreground) 5%, transparent) 4.75rem 6.75rem,
+      transparent 6.75rem 100%
+    );
+    pointer-events: none;
+  }
+}

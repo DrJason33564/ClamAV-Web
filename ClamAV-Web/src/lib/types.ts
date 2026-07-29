@@ -38,6 +38,11 @@ export type StatusResponse = {
   checked_at: string
 }
 
+export type ClamAVPowerResponse = {
+  status: "awake" | "sleeping"
+  message: string
+}
+
 export type CronRule = {
   id: string
   enabled: boolean
