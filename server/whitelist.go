@@ -31,9 +31,12 @@ type whitelistResponse struct {
 }
 
 func (s *server) handleWhitelist(w http.ResponseWriter, r *http.Request) {
+	who, _ := actorFromRequest(r)
 	switch r.Method {
 	case http.MethodGet:
-		entries, err := s.readWhitelistEntries()
+		s.configFileMu.Lock()
+		entries, err := s.readWhitelistEntries(who.Username)
+		s.configFileMu.Unlock()
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -53,6 +56,9 @@ func (s *server) updateWhitelist(w http.ResponseWriter, r *http.Request, add boo
 	// exclusive with an in-process sleep transition.
 	s.clamavPowerMu.Lock()
 	defer s.clamavPowerMu.Unlock()
+	s.configFileMu.Lock()
+	defer s.configFileMu.Unlock()
+	who, _ := actorFromRequest(r)
 
 	sleeping, err := directoryLockExists(s.cfg.SleepLockDir)
 	if err != nil {
@@ -89,9 +95,9 @@ func (s *server) updateWhitelist(w http.ResponseWriter, r *http.Request, add boo
 	}
 
 	if add {
-		err = s.addWhitelistEntry(target)
+		err = s.addWhitelistEntry(target, who.Username)
 	} else {
-		err = s.deleteWhitelistEntry(target)
+		err = s.deleteWhitelistEntry(target, who.Username)
 	}
 	if err != nil {
 		writeWhitelistStatus(w, http.StatusBadRequest, "failed", "", err)
@@ -111,7 +117,7 @@ func (s *server) updateWhitelist(w http.ResponseWriter, r *http.Request, add boo
 	if reloadMessage != "" {
 		message = strings.TrimSpace(message + "\n" + reloadMessage)
 	}
-	entries, err := s.readWhitelistEntries()
+	entries, err := s.readWhitelistEntries(who.Username)
 	if err != nil {
 		writeWhitelistStatus(w, http.StatusInternalServerError, "failed", message, err)
 		return
@@ -123,7 +129,11 @@ func (s *server) updateWhitelist(w http.ResponseWriter, r *http.Request, add boo
 	})
 }
 
-func (s *server) readWhitelistEntries() ([]whitelistEntry, error) {
+func (s *server) readWhitelistEntries(usernames ...string) ([]whitelistEntry, error) {
+	username := ""
+	if len(usernames) > 0 {
+		username = usernames[0]
+	}
 	data, err := os.ReadFile(s.cfg.ExcludeConfig)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -134,8 +144,8 @@ func (s *server) readWhitelistEntries() ([]whitelistEntry, error) {
 	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
 	entries := make([]whitelistEntry, 0, len(lines))
 	for i, line := range lines {
-		target, ok := parseWhitelistLine(line)
-		if !ok {
+		target, owner, ok := parseWhitelistOwnedLine(line)
+		if !ok || (username != "" && owner != username) {
 			continue
 		}
 		entries = append(entries, whitelistEntry{Path: target, Line: i + 1})
@@ -143,27 +153,28 @@ func (s *server) readWhitelistEntries() ([]whitelistEntry, error) {
 	return entries, nil
 }
 
-func parseWhitelistLine(line string) (string, bool) {
+func parseWhitelistOwnedLine(line string) (string, string, bool) {
 	line = strings.TrimSpace(line)
 	if line == "" || strings.HasPrefix(line, "#") {
-		return "", false
+		return "", "", false
 	}
 	if strings.HasPrefix(line, "\"") {
 		rest := strings.TrimPrefix(line, "\"")
 		end := strings.Index(rest, "\"")
 		if end < 0 {
-			return "", false
+			return "", "", false
 		}
-		if strings.TrimSpace(rest[end+1:]) != "" {
-			return "", false
+		ownerFields := strings.Fields(strings.TrimSpace(rest[end+1:]))
+		if len(ownerFields) != 1 || !usernamePattern.MatchString(ownerFields[0]) {
+			return "", "", false
 		}
-		return rest[:end], rest[:end] != ""
+		return rest[:end], ownerFields[0], rest[:end] != ""
 	}
 	fields := strings.Fields(line)
-	if len(fields) != 1 {
-		return "", false
+	if len(fields) != 2 || !usernamePattern.MatchString(fields[1]) {
+		return "", "", false
 	}
-	return fields[0], true
+	return fields[0], fields[1], true
 }
 
 func (s *server) prepareWhitelistPath(input string) (string, error) {
@@ -195,22 +206,30 @@ func (s *server) scanLockActive() (bool, error) {
 	return false, err
 }
 
-func (s *server) addWhitelistEntry(target string) error {
+func (s *server) addWhitelistEntry(target string, usernames ...string) error {
+	username := ""
+	if len(usernames) > 0 {
+		username = usernames[0]
+	}
 	lines, err := s.readWhitelistLines()
 	if err != nil {
 		return err
 	}
 	for _, line := range lines {
-		existing, ok := parseWhitelistLine(line)
-		if ok && existing == target {
+		existing, owner, ok := parseWhitelistOwnedLine(line)
+		if ok && existing == target && owner == username {
 			return nil
 		}
 	}
-	lines = append(lines, whitelistConfigLine(target))
+	lines = append(lines, whitelistConfigLine(target, username))
 	return s.writeWhitelistLines(lines)
 }
 
-func (s *server) deleteWhitelistEntry(target string) error {
+func (s *server) deleteWhitelistEntry(target string, usernames ...string) error {
+	username := ""
+	if len(usernames) > 0 {
+		username = usernames[0]
+	}
 	lines, err := s.readWhitelistLines()
 	if err != nil {
 		return err
@@ -218,8 +237,8 @@ func (s *server) deleteWhitelistEntry(target string) error {
 	removed := false
 	kept := make([]string, 0, len(lines))
 	for _, line := range lines {
-		existing, ok := parseWhitelistLine(line)
-		if ok && existing == target {
+		existing, owner, ok := parseWhitelistOwnedLine(line)
+		if ok && existing == target && owner == username {
 			removed = true
 			continue
 		}
@@ -282,11 +301,43 @@ func (s *server) writeWhitelistLines(lines []string) error {
 	return nil
 }
 
-func whitelistConfigLine(target string) string {
+func whitelistConfigLine(target, username string) string {
 	if strings.ContainsAny(target, " \t") {
-		return `"` + target + `"`
+		return `"` + target + `" ` + username
 	}
-	return target
+	return target + " " + username
+}
+
+func (s *server) removeWhitelistForUser(username string) error {
+	s.clamavPowerMu.Lock()
+	defer s.clamavPowerMu.Unlock()
+	s.configFileMu.Lock()
+	defer s.configFileMu.Unlock()
+	lines, err := s.readWhitelistLines()
+	if err != nil {
+		return err
+	}
+	kept := make([]string, 0, len(lines))
+	changed := false
+	for _, line := range lines {
+		_, owner, ok := parseWhitelistOwnedLine(line)
+		if ok && owner == username {
+			changed = true
+			continue
+		}
+		kept = append(kept, line)
+	}
+	if !changed {
+		return nil
+	}
+	if err := s.writeWhitelistLines(kept); err != nil {
+		return err
+	}
+	if _, err := s.runExcludeScript(); err != nil {
+		return err
+	}
+	_, err = s.reloadClamdDatabase()
+	return err
 }
 
 func (s *server) runExcludeScript() (string, error) {

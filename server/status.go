@@ -15,6 +15,7 @@ type statusResponse struct {
 	Ping        string `json:"ping"`
 	PingMessage string `json:"ping_message"`
 	CheckedAt   string `json:"checked_at"`
+	FirstRun    string `json:"first_run"`
 }
 
 func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -28,22 +29,32 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		var decoded any
 		if json.Unmarshal(data, &decoded) == nil {
 			source = decoded
-			s.enrichStatusSource(source)
+			who, _ := actorFromRequest(r)
+			s.enrichStatusSource(source, who.Username)
 		} else {
 			source = string(data)
 		}
 	}
 
 	ping, msg := s.pingClamd(r.Context())
+	firstRun := "not_completed"
+	if s.appConfig != nil && s.appConfig.get().WebFirstRunCompleted == 2 {
+		firstRun = "completed"
+	}
 	writeJSON(w, http.StatusOK, statusResponse{
 		Source:      source,
 		Ping:        ping,
 		PingMessage: msg,
 		CheckedAt:   time.Now().Format(time.RFC3339),
+		FirstRun:    firstRun,
 	})
 }
 
-func (s *server) enrichStatusSource(source any) {
+func (s *server) enrichStatusSource(source any, usernames ...string) {
+	username := ""
+	if len(usernames) > 0 {
+		username = usernames[0]
+	}
 	root, ok := source.(map[string]any)
 	if !ok {
 		return
@@ -52,11 +63,31 @@ func (s *server) enrichStatusSource(source any) {
 	if !ok {
 		return
 	}
+	if activeID, _ := scan["active_job_id"].(string); activeID != "" && username != "" {
+		state, _ := s.jobState(activeID)
+		job, _ := state.(map[string]any)
+		if owner, _ := job["user"].(string); owner != username {
+			scan["active_job_id"] = nil
+		}
+	}
 	jobID, _ := scan["last_job_id"].(string)
+	if s.db != nil && username != "" {
+		var status, result string
+		err := s.db.QueryRow("SELECT job_id,status,result FROM history_jobs WHERE user=? ORDER BY started_at DESC,job_id DESC LIMIT 1", username).Scan(&jobID, &status, &result)
+		if err != nil {
+			scan["last_job_id"] = nil
+			scan["last_job_status"] = nil
+			scan["last_job_result"] = nil
+			return
+		}
+		scan["last_job_id"] = jobID
+		scan["last_job_status"] = status
+		scan["last_job_result"] = result
+		return
+	}
 	if jobID == "" {
 		return
 	}
-
 	scan["last_job_status"] = nil
 	scan["last_job_result"] = nil
 	state, _ := s.jobState(jobID)

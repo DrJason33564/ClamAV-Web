@@ -7,6 +7,9 @@ CLAMD_WAIT_INTERVAL=5
 CRON_CONFIG_FILE="${CRON_CONFIG_FILE:-/config/cron_scan.conf}"
 EXCLUDE_CONFIG_FILE="${EXCLUDE_CONFIG_FILE:-/config/exclude.conf}"
 EXAMPLE_CONFIG="${CRON_SCAN_EXAMPLE:-/cron_scan_example.conf}"
+CLAMAVWEB_CONFIG_FILE="${CLAMAVWEB_CONFIG_FILE:-/config/clamavweb.conf}"
+CLAMAVWEB_CONFIG_EXAMPLE="${CLAMAVWEB_CONFIG_EXAMPLE:-/clamavweb_example.conf}"
+DATA_DIR="${DATA_DIR:-/data}"
 
 LOG_DIR="${SCAN_LOG_DIR:-/log}"
 STARTUP_LOG="${STARTUP_LOG_FILE:-${LOG_DIR}/startup.log}"
@@ -230,12 +233,20 @@ prepare_config_files() {
     mkdir -p \
         "$(dirname "$CRON_CONFIG_FILE")" \
         "$(dirname "$EXCLUDE_CONFIG_FILE")" \
+		"$(dirname "$CLAMAVWEB_CONFIG_FILE")" \
+		"$DATA_DIR" \
         "$LOG_DIR" \
         "$STATUS_DIR" \
         "$JOBS_DIR" \
         "$QUARANTINE_DIR"
 
     touch "$STARTUP_LOG"
+
+	if [ ! -f "$CLAMAVWEB_CONFIG_FILE" ]; then
+		cp "$CLAMAVWEB_CONFIG_EXAMPLE" "$CLAMAVWEB_CONFIG_FILE"
+		chmod 0600 "$CLAMAVWEB_CONFIG_FILE"
+		startup_log "[INFO] Created server config: $CLAMAVWEB_CONFIG_FILE"
+	fi
 
     if [ ! -f "$EXCLUDE_CONFIG_FILE" ]; then
         : > "$EXCLUDE_CONFIG_FILE"

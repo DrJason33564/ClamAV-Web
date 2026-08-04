@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -8,6 +9,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+)
+
+var (
+	errUserBusy  = errors.New("user has an active scan")
+	errLastAdmin = errors.New("the last active administrator cannot be deleted")
 )
 
 type cleanRequest struct {
@@ -29,7 +36,8 @@ func (s *server) handleResultsClean(w http.ResponseWriter, r *http.Request) {
 		writeCleanResponse(w, http.StatusBadRequest, "failed", 0, errors.New("clean_all must be Y"))
 		return
 	}
-	deleted, err := s.cleanAllResults()
+	who, _ := actorFromRequest(r)
+	deleted, err := s.cleanUserResults(r.Context(), who.Username)
 	if err != nil {
 		writeCleanResponse(w, http.StatusInternalServerError, "failed", deleted, err)
 		return
@@ -46,7 +54,8 @@ func (s *server) handleQuarantineClean(w http.ResponseWriter, r *http.Request) {
 		writeCleanResponse(w, http.StatusBadRequest, "failed", 0, errors.New("clean_all must be Y"))
 		return
 	}
-	deleted, err := cleanDirectoryChildren(s.cfg.QuarantineDir)
+	who, _ := actorFromRequest(r)
+	deleted, err := s.cleanUserQuarantine(who.Username)
 	if err != nil {
 		writeCleanResponse(w, http.StatusInternalServerError, "failed", deleted, err)
 		return
@@ -72,6 +81,142 @@ func (s *server) cleanAllResults() (int, error) {
 	}
 	deletedJobs, err := cleanMatchingFiles(s.cfg.JobsDir, removableResultJob)
 	return deletedLogs + deletedJobs, err
+}
+
+func (s *server) cleanUserResults(ctx context.Context, username string) (int, error) {
+	if s.history != nil {
+		_ = s.history.refresh(ctx)
+	}
+	rows, err := s.db.QueryContext(ctx, "SELECT job_id,json_file FROM history_jobs WHERE user=?", username)
+	if err != nil {
+		return 0, err
+	}
+	type ownedJob struct{ id, jsonFile string }
+	var jobs []ownedJob
+	for rows.Next() {
+		var job ownedJob
+		if err := rows.Scan(&job.id, &job.jsonFile); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		jobs = append(jobs, job)
+	}
+	rows.Close()
+	deleted := 0
+	for _, job := range jobs {
+		for _, path := range []string{job.jsonFile, filepath.Join(s.cfg.LogDir, job.id+".log"), filepath.Join(s.cfg.LogDir, "clamav_detection_"+job.id+".log")} {
+			if err := os.Remove(path); err == nil {
+				deleted++
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return deleted, err
+			}
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM history_jobs WHERE user=?", username); err != nil {
+		return deleted, err
+	}
+	return deleted, nil
+}
+
+func (s *server) cleanUserQuarantine(username string) (int, error) {
+	entries, err := os.ReadDir(s.cfg.QuarantineDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	deleted := 0
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasSuffix(entry.Name(), ".rec") || entry.Name() == clamavQuarantineLockName {
+			continue
+		}
+		target := filepath.Join(s.cfg.QuarantineDir, entry.Name())
+		_, owner, err := readQuarantineRecord(target + ".rec")
+		if err != nil || owner != username {
+			continue
+		}
+		if err := s.deleteQuarantineSubject(entry.Name(), username); err != nil {
+			return deleted, err
+		}
+		deleted++
+	}
+	return deleted, nil
+}
+
+func (s *server) cleanDeleteUser(ctx context.Context, username string) error {
+	s.accountDeleteMu.Lock()
+	defer s.accountDeleteMu.Unlock()
+	var id int64
+	var role, status string
+	if err := s.db.QueryRowContext(ctx, "SELECT id,role,status FROM users WHERE username=?", username).Scan(&id, &role, &status); err != nil {
+		return err
+	}
+	if role == "admin" && status == "active" {
+		if last, err := s.isLastActiveAdmin(ctx, username); err != nil {
+			return err
+		} else if last {
+			return errLastAdmin
+		}
+	}
+	if s.history != nil {
+		_ = s.history.refresh(ctx)
+		var activeJobs int
+		if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM history_jobs WHERE user=? AND status IN ('waiting','running')", username).Scan(&activeJobs); err != nil {
+			return err
+		}
+		if activeJobs > 0 {
+			return errUserBusy
+		}
+	}
+	s.mu.Lock()
+	if active := s.batches[s.activeBatchID]; active != nil && active.User == username {
+		s.mu.Unlock()
+		return errUserBusy
+	}
+	kept := s.queuedBatchIDs[:0]
+	for _, batchID := range s.queuedBatchIDs {
+		if batch := s.batches[batchID]; batch != nil && batch.User == username {
+			delete(s.batches, batchID)
+			continue
+		}
+		kept = append(kept, batchID)
+	}
+	s.queuedBatchIDs = kept
+	s.mu.Unlock()
+	now := time.Now().Unix()
+	if _, err := s.db.ExecContext(ctx, "UPDATE users SET status='deleting',updated_at=? WHERE id=?", now, id); err != nil {
+		return err
+	}
+	_, _ = s.db.ExecContext(ctx, "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL", now, id)
+	s.resultMu.Lock()
+	for lookupID, lookup := range s.resultLookups {
+		if lookup.User == username {
+			delete(s.resultLookups, lookupID)
+		}
+	}
+	s.resultMu.Unlock()
+	s.quarantineMu.Lock()
+	for lookupID, lookup := range s.quarantineLookups {
+		if lookup.User == username {
+			delete(s.quarantineLookups, lookupID)
+		}
+	}
+	s.quarantineMu.Unlock()
+	if err := s.removeCronRulesForUser(username); err != nil {
+		return err
+	}
+	if err := s.removeWhitelistForUser(username); err != nil {
+		return err
+	}
+	if _, err := s.cleanUserQuarantine(username); err != nil {
+		return err
+	}
+	if _, err := s.cleanUserResults(ctx, username); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, "DELETE FROM users WHERE id=?", id)
+	return err
 }
 
 func cleanMatchingFiles(dir string, match func(string) bool) (int, error) {

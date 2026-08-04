@@ -1,9 +1,16 @@
 package main
 
 import (
+	"context"
+	"database/sql"
+	"errors"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
+	"time"
 )
 
 type server struct {
@@ -18,22 +25,60 @@ type server struct {
 	quarantineMu      sync.RWMutex
 	quarantineLookups map[string]*quarantineLookup
 	clamavPowerMu     sync.Mutex
+	configFileMu      sync.Mutex
+	accountDeleteMu   sync.Mutex
+	db                *sql.DB
+	appConfig         *appConfigStore
+	history           *historyIndexer
+	loginMu           sync.Mutex
+	loginAttempts     map[string]loginAttempt
 }
 
 func main() {
 	cfg := loadConfig()
+	appConfig, err := newAppConfigStore(cfg.AppConfigFile)
+	if err != nil {
+		log.Fatalf("load server config: %v", err)
+	}
+	db, err := openDatabase(cfg.DatabaseFile)
+	if err != nil {
+		log.Fatalf("open database: %v", err)
+	}
+	defer db.Close()
 	s := &server{
 		cfg:               cfg,
 		batches:           make(map[string]*scanBatch),
 		resultLookups:     make(map[string]*resultLookup),
 		quarantineLookups: make(map[string]*quarantineLookup),
+		db:                db,
+		appConfig:         appConfig,
+		loginAttempts:     make(map[string]loginAttempt),
 	}
+	s.history = &historyIndexer{db: db, jobsDir: cfg.JobsDir}
+	if err := s.history.refresh(context.Background()); err != nil {
+		log.Printf("initial history index refresh failed: %v", err)
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	go s.runHistoryIndexer(ctx)
+	go s.runSessionJanitor(ctx)
 
 	mux := http.NewServeMux()
 	mux.Handle("/", frontendHandler())
 	mux.HandleFunc("/api/status", s.handleStatus)
-	mux.HandleFunc("/api/clamav/sleep", s.handleClamAVSleep)
-	mux.HandleFunc("/api/clamav/wake", s.handleClamAVWake)
+	mux.HandleFunc("/api/first-run/status", s.handleFirstRunStatus)
+	mux.HandleFunc("/api/first-run/complete", s.handleFirstRunComplete)
+	mux.HandleFunc("/api/auth/register", s.handleAuthRegister)
+	mux.HandleFunc("/api/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("/api/auth/logout", s.handleAuthLogout)
+	mux.HandleFunc("/api/auth/me", s.handleAuthMe)
+	mux.HandleFunc("/api/auth/password", s.handleAuthPassword)
+	mux.HandleFunc("/api/auth/account", s.handleAuthAccount)
+	mux.HandleFunc("/api/admin/users", s.handleAdminUsers)
+	mux.HandleFunc("/api/admin/users/", s.handleAdminUser)
+	mux.HandleFunc("/api/config", s.handleServiceConfig)
+	mux.Handle("/api/clamav/sleep", s.adminOnly(http.HandlerFunc(s.handleClamAVSleep)))
+	mux.Handle("/api/clamav/wake", s.adminOnly(http.HandlerFunc(s.handleClamAVWake)))
 	mux.HandleFunc("/api/browse", s.handleBrowse)
 	mux.HandleFunc("/api/scans", s.handleScans)
 	mux.HandleFunc("/api/scans/reorder", s.handleScanReorder)
@@ -53,7 +98,14 @@ func main() {
 	mux.HandleFunc("/api/quarantine/clean", s.handleQuarantineClean)
 
 	log.Printf("clamav scanner web service listening on %s", cfg.Addr)
-	if err := http.ListenAndServe(cfg.Addr, logRequests(s.requireAuth(mux))); err != nil {
+	httpServer := &http.Server{Addr: cfg.Addr, Handler: logRequests(s.requireAuth(mux))}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		_ = httpServer.Shutdown(shutdownCtx)
+	}()
+	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
 }

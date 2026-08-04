@@ -1,21 +1,19 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
-var resultJobFileNamePattern = regexp.MustCompile(`^(manual|cron)-([0-9]{14})\.json$`)
-var resultJobIDPattern = regexp.MustCompile(`^(manual|cron)-[0-9]{14}$`)
+var resultJobIDPattern = version2JobIDPattern
 
 type resultLookup struct {
 	ID        string          `json:"lookup_id"`
@@ -26,6 +24,7 @@ type resultLookup struct {
 	StartedAt time.Time       `json:"started_at"`
 	UpdatedAt time.Time       `json:"updated_at"`
 	scope     resultScope
+	User      string `json:"-"`
 }
 
 type resultLogItem struct {
@@ -73,6 +72,7 @@ func (s *server) handleResultLookupStart(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	who, _ := actorFromRequest(r)
 
 	lookup := &resultLookup{
 		ID:        "result-" + randomHex(8),
@@ -80,6 +80,7 @@ func (s *server) handleResultLookupStart(w http.ResponseWriter, r *http.Request)
 		StartedAt: time.Now(),
 		UpdatedAt: time.Now(),
 		scope:     scope,
+		User:      who.Username,
 	}
 	s.resultMu.Lock()
 	s.cleanupResultLookupsLocked(time.Now().Add(-15 * time.Minute))
@@ -112,6 +113,12 @@ func (s *server) handleResultLookup(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	who, _ := actorFromRequest(r)
+	if lookup.User != who.Username {
+		s.resultMu.RUnlock()
+		http.NotFound(w, r)
+		return
+	}
 	snapshot := *lookup
 	if lookup.Results != nil {
 		snapshot.Results = append([]resultLogItem(nil), lookup.Results...)
@@ -136,9 +143,10 @@ func (s *server) runResultLookup(id string) {
 		return
 	}
 	scope := lookup.scope
+	username := lookup.User
 	s.resultMu.RUnlock()
 
-	results, total, err := s.readResultLogItems(scope)
+	results, total, err := s.readResultLogItems(scope, username)
 	s.resultMu.Lock()
 	defer s.resultMu.Unlock()
 	lookup, ok = s.resultLookups[id]
@@ -156,57 +164,35 @@ func (s *server) runResultLookup(id string) {
 	lookup.Total = total
 }
 
-func (s *server) readResultLogItems(scope resultScope) ([]resultLogItem, int, error) {
-	entries, err := os.ReadDir(s.cfg.JobsDir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, 0, nil
-		}
+func (s *server) readResultLogItems(scope resultScope, username string) ([]resultLogItem, int, error) {
+	var total int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM history_jobs WHERE user=?", username).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	jobFiles := make([]resultJobFile, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		match := resultJobFileNamePattern.FindStringSubmatch(entry.Name())
-		if match == nil {
-			continue
-		}
-		jobType := match[1]
-		date := match[2]
-		jobID := strings.TrimSuffix(entry.Name(), ".json")
-		jobFiles = append(jobFiles, resultJobFile{
-			ID:   jobID,
-			Type: jobType,
-			Date: date,
-		})
+	query := "SELECT job_id,job_type,started_at,result FROM history_jobs WHERE user=? ORDER BY started_at DESC,job_id DESC"
+	args := []any{username}
+	if !scope.All {
+		query += " LIMIT ? OFFSET ?"
+		args = append(args, scope.End-scope.Start+1, scope.Start-1)
 	}
-	sort.Slice(jobFiles, func(i, j int) bool {
-		return jobFiles[i].Date > jobFiles[j].Date
-	})
-	total := len(jobFiles)
-
-	// Scope is applied before opening JSON files. We still need to enumerate
-	// filenames to sort by job id timestamp, but range requests only read the
-	// selected job state files instead of every historical JSON document.
-	jobFiles = applyResultScope(jobFiles, scope)
-
-	items := make([]resultLogItem, 0, len(jobFiles))
-	for _, job := range jobFiles {
-		jobID := job.ID
-		result, err := s.readJobResult(jobID)
-		if err != nil {
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, total, err
+	}
+	defer rows.Close()
+	items := []resultLogItem{}
+	for rows.Next() {
+		var item resultLogItem
+		var startedAt int64
+		if err := rows.Scan(&item.ID, &item.Type, &startedAt, &item.Result); err != nil {
 			return nil, total, err
 		}
-		items = append(items, resultLogItem{
-			ID:     jobID,
-			Type:   job.Type,
-			Date:   job.Date,
-			Result: result,
-		})
+		// Preserve the existing API date representation while job IDs and stored
+		// timestamps use Unix time in version 2.
+		item.Date = time.Unix(startedAt, 0).Format("20060102150405")
+		items = append(items, item)
 	}
-	return items, total, nil
+	return items, total, rows.Err()
 }
 
 func parseResultScope(scopeText string) (resultScope, error) {
@@ -298,7 +284,8 @@ func (s *server) handleDetectionResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.readDetectionResult(jobID)
+	who, _ := actorFromRequest(r)
+	result, err := s.readDetectionResult(jobID, who.Username)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -310,7 +297,20 @@ func (s *server) handleDetectionResult(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-func (s *server) readDetectionResult(jobID string) (*detectionLookupResponse, error) {
+func (s *server) readDetectionResult(jobID string, usernames ...string) (*detectionLookupResponse, error) {
+	if len(usernames) > 0 {
+		username := usernames[0]
+		var jsonFile string
+		if err := s.db.QueryRow("SELECT json_file FROM history_jobs WHERE job_id=? AND user=?", jobID, username).Scan(&jsonFile); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		if filepath.Dir(jsonFile) != filepath.Clean(s.cfg.JobsDir) {
+			return nil, errors.New("indexed job path is outside jobs directory")
+		}
+	}
 	logText, err := s.readJobLog(jobID)
 	if err != nil {
 		return nil, err

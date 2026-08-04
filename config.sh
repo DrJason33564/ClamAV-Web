@@ -42,10 +42,10 @@ split_cron_config_line() {
     set -- $line
     set +f
 
-    if [ "$#" -lt 7 ]; then
+    if [ "$#" -lt 8 ]; then
         config_invalid "format" "$line_no" "$line"
         config_log "[ERROR] Invalid line $line_no: expected 5 cron fields, scan target and action, got: $line"
-        config_log "[ERROR] Expected format: minute hour day month weekday scan_target action"
+        config_log "[ERROR] Expected format: minute hour day month weekday scan_target action owner"
         config_log "[ERROR] scan_target may be quoted with double quotes if it contains spaces."
         config_log "[ERROR] Supported actions: warn, move, remove"
         return 1
@@ -93,11 +93,12 @@ split_cron_config_line() {
             set -- $after_quote
             set +f
 
-            if [ "$#" -ne 1 ]; then
-                config_invalid "action" "$line_no" "$line"
+            if [ "$#" -ne 2 ]; then
+                config_invalid "format" "$line_no" "$line"
                 return 1
             fi
             CRON_ACTION="$1"
+            CRON_USER="$2"
             ;;
         *)
             set -f
@@ -105,13 +106,14 @@ split_cron_config_line() {
             set -- $tail
             set +f
 
-            if [ "$#" -ne 2 ]; then
+            if [ "$#" -ne 3 ]; then
                 config_invalid "target" "$line_no" "$line"
                 config_log "[ERROR] Wrap paths containing spaces in double quotes, for example: \"/scan/My Folder\" move"
                 return 1
             fi
             CRON_TARGET="$1"
             CRON_ACTION="$2"
+            CRON_USER="$3"
             ;;
     esac
 
@@ -127,6 +129,18 @@ split_cron_config_line() {
 
     if [ -z "$CRON_TARGET" ]; then
         config_invalid "target" "$line_no" "$line"
+        return 1
+    fi
+
+    case "$CRON_USER" in
+        ''|*[!A-Za-z0-9._-]*)
+            config_invalid "owner" "$line_no" "$CRON_USER"
+            return 1
+            ;;
+    esac
+
+    if [ "${#CRON_USER}" -gt 64 ]; then
+        config_invalid "owner" "$line_no" "$CRON_USER"
         return 1
     fi
 

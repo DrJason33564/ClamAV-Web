@@ -14,7 +14,7 @@ ClamAV TimeDock 是一个面向 ClamAV 的 Web 管理应用，以 Docker 镜像�
 - 将可信文件或目录加入信任区
 - 查看、恢复、删除或清空隔离文件
 - 支持仅告警、移入隔离区和直接删除三种处理方式
-- 所有页面和 API 均使用账号密码验证
+- 内置用户、Argon2id 密码哈希、Cookie 会话和多用户数据隔离
 
 扫描任务会串行执行，避免多个扫描同时占用 ClamAV。
 
@@ -31,7 +31,7 @@ docker build -t clamav-timedock .
 先创建用于持久化数据的目录：
 
 ```sh
-mkdir -p config scan quarantine log state
+mkdir -p config data scan quarantine log state
 ```
 
 然后启动：
@@ -42,8 +42,8 @@ docker run -d \
   --restart unless-stopped \
   -p 8080:8080 \
   -e TZ=Asia/Shanghai \
-  -e SCANNER_ACCOUNTS='admin:请替换为强密码' \
-  -v "$(pwd)/config:/config" \
+	-v "$(pwd)/config:/config" \
+	-v "$(pwd)/data:/data" \
   -v "$(pwd)/scan:/scan" \
   -v "$(pwd)/quarantine:/quarantine" \
   -v "$(pwd)/log:/log" \
@@ -57,13 +57,7 @@ docker run -d \
 http://主机地址:8080
 ```
 
-使用 `SCANNER_ACCOUNTS` 设置的账号登录。该变量为必填项，多个账号（虽然现在尚未实际使用到）可以用逗号、分号或换行分隔：
-
-```text
-admin:password1,operator:password2
-```
-
-首次启动会自动生成所需配置。默认没有启用的定时扫描任务，可在 WebUI 中自行添加。
+首次启动会自动生成服务配置和 SQLite 数据库。用户数据库为空时，通过首次运行流程注册的第一个账户会被设为 admin；之后只有 admin 可以新增、禁用、启用或删除用户。密码不会以明文写入环境变量或数据库。
 
 ## WebUI 使用指南
 
@@ -181,21 +175,22 @@ WebUI 在增删信任条目后会自动更新 allow-list 并让 ClamAV 重新加
 | `/state` | 任务历史和运行状态 |
 | `/log` | 扫描日志与检出详情 |
 | `/config` | WebUI 管理的定时任务和信任区数据 |
+| `/data` | SQLite 用户、会话和历史任务索引 |
 
-建议持久化挂载以上五个目录。请确保容器对 `/scan` 有读取权限；使用隔离、删除和恢复功能时还需要写入权限。
+建议持久化挂载以上六个目录。请确保容器对 `/scan` 有读取权限；使用隔离、删除和恢复功能时还需要写入权限。
 
 ## 常用环境变量
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `SCANNER_ACCOUNTS` | 无 | **必填**；WebUI 账号，格式为 `user:password` |
 | `SCANNER_ADDR` | `:8080` | Web 服务监听地址 |
+| `SCANNER_COOKIE_SECURE` | `false` | HTTPS 反向代理部署时设为 `true`，为登录 Cookie 添加 `Secure` |
 | `TZ` | 镜像默认值 | 页面时间和定时任务使用的时区 |
 | `SCAN_LOG_MAX_BYTES` | `5242880` | 单个日志的轮转阈值，单位为字节 |
 | `SCAN_WAIT_INTERVAL` | `30` | 定时任务等待扫描锁的重试间隔，单位为秒 |
 | `SCAN_WAIT_MAX_SECONDS` | `0` | 最长等待时间；`0` 表示不限制 |
 
-通常只需设置账号、时区和端口，其余值保持默认即可。
+通常只需设置时区和端口；HTTPS 部署时同时启用安全 Cookie。
 
 ## 部署与安全建议
 

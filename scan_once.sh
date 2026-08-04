@@ -15,15 +15,15 @@ LOG_SCRIPT="${LOG_SCRIPT:-/log.sh}"
 . "$LOG_SCRIPT"
 
 usage() {
-    echo "Usage: $0 [--id <job_id>] --type <manual|cron> --target <path> --action <warn|move|remove> [--wait] [--wake]" >&2
+    echo "Usage: $0 [--id <job_id>] --type <manual|cron> -u <username> --target <path> --action <warn|move|remove> [--wait] [--wake]" >&2
 }
 
 json_escape() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
-now_compact() {
-    date '+%Y%m%d%H%M%S'
+now_unix() {
+    date '+%s'
 }
 
 now_iso() {
@@ -66,14 +66,15 @@ write_job_state() {
 
     cat > "$tmp_job" <<EOF_JOB
 {
-  "version": 1,
+  "version": 2,
   "job_id": "$(json_escape "$JOB_ID")",
   "type": "$(json_escape "$JOB_TYPE")",
+  "user": "$(json_escape "$JOB_USER")",
   "status": "$status",
   "target": "$(json_escape "$TARGET")",
   "action": "$ACTION",
   "pid": ${CLAMDSCAN_PID_JSON:-null},
-  "started_at": "$STARTED_AT",
+  "started_at": $STARTED_AT,
   "finished_at": $finished_at,
   "exit_code": $exit_code_json,
   "result": "$result",
@@ -132,6 +133,7 @@ log_scan_header() {
     log "[INFO] Scan started: $TARGET"
     log "[INFO] Job id: $JOB_ID"
     log "[INFO] Job type: $JOB_TYPE"
+    log "[INFO] Job owner: $JOB_USER"
     log_scan_action
     SCAN_HEADER_LOGGED=1
 }
@@ -142,9 +144,9 @@ fail_scan_job() {
     exit_code="$3"
 
     log "$log_message"
-    FINISHED_AT="$(now_compact)"
+    FINISHED_AT="$(now_unix)"
     ACTIVE_JOB_JSON="null"
-    write_job_state "failed" "\"$FINISHED_AT\"" "$exit_code" "error" "null" "$job_message"
+    write_job_state "failed" "$FINISHED_AT" "$exit_code" "error" "null" "$job_message"
     exit "$exit_code"
 }
 
@@ -174,7 +176,7 @@ write_quarantine_record() {
 
     detected_name="$(basename "$source_file" 2>/dev/null || printf '%s' "$source_file")"
     record_file="${QUARANTINE_DIR}/${detected_name}.rec"
-    printf '"%s"\n' "$source_file" > "$record_file"
+    printf '"%s" %s\n' "$source_file" "$JOB_USER" > "$record_file"
     log "[INFO] Quarantine source record saved to: $record_file"
 }
 
@@ -217,7 +219,7 @@ cleanup_lock() {
 }
 
 make_job_id() {
-    base="${JOB_TYPE}-$(date '+%Y%m%d%H%M%S')"
+    base="${JOB_TYPE}-$(now_unix)"
     candidate="$base"
     i=1
 
@@ -274,7 +276,7 @@ acquire_scan_lock() {
 
         if [ "$WAIT_FOR_LOCK" -ne 1 ]; then
             log "[WARN] Another scan is running. Job rejected: $JOB_ID"
-            write_job_state "failed" "\"$(now_compact)\"" "75" "error" "null" "Another scan is running."
+            write_job_state "failed" "$(now_unix)" "75" "error" "null" "Another scan is running."
             exit 75
         fi
 
@@ -282,7 +284,7 @@ acquire_scan_lock() {
         # failing just because a previous manual or cron scan is still active.
         if [ "$wait_max_seconds" -gt 0 ] && [ "$waited" -ge "$wait_max_seconds" ]; then
             log "[WARN] Another scan is still running after ${waited}s. Job rejected: $JOB_ID"
-            write_job_state "failed" "\"$(now_compact)\"" "75" "error" "null" "Another scan is running."
+            write_job_state "failed" "$(now_unix)" "75" "error" "null" "Another scan is running."
             exit 75
         fi
 
@@ -301,6 +303,7 @@ acquire_scan_lock() {
 
 JOB_ID=""
 JOB_TYPE=""
+JOB_USER=""
 TARGET=""
 ACTION=""
 WAIT_FOR_LOCK=0
@@ -316,6 +319,11 @@ while [ "$#" -gt 0 ]; do
         --type)
             [ "$#" -ge 2 ] || { usage; exit 2; }
             JOB_TYPE="$2"
+            shift 2
+            ;;
+        -u|--user)
+            [ "$#" -ge 2 ] || { usage; exit 2; }
+            JOB_USER="$2"
             shift 2
             ;;
         --target)
@@ -344,7 +352,19 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$JOB_TYPE" ] || { usage; exit 2; }
+[ -n "$JOB_USER" ] || { usage; exit 2; }
 [ -n "$TARGET" ] || { usage; exit 2; }
+
+case "$JOB_USER" in
+    ''|*[!A-Za-z0-9._-]*)
+        echo "Unsupported job owner: $JOB_USER" >&2
+        exit 2
+        ;;
+esac
+if [ "${#JOB_USER}" -gt 64 ]; then
+    echo "Unsupported job owner: $JOB_USER" >&2
+    exit 2
+fi
 
 case "$JOB_TYPE" in
     manual|cron)
@@ -385,7 +405,7 @@ esac
 JOB_LOG="${LOG_DIR}/${JOB_ID}.log"
 DETECTION_LOG="${LOG_DIR}/clamav_detection_${JOB_ID}.log"
 JOB_STATE="${JOBS_DIR}/${JOB_ID}.json"
-STARTED_AT="$(now_compact)"
+STARTED_AT="$(now_unix)"
 ACTIVE_JOB_JSON="\"$(json_escape "$JOB_ID")\""
 LAST_JOB_JSON="\"$(json_escape "$JOB_ID")\""
 CLAMDSCAN_PID_JSON="null"
@@ -407,6 +427,10 @@ if [ "$JOB_TYPE" = "cron" ]; then
     fi
 fi
 
+# Publish a durable waiting state before lock acquisition. Besides making cron
+# waits observable, this prevents account deletion from racing an already
+# launched scheduled scan whose owner would otherwise no longer exist.
+write_job_state "waiting" "null" "null" "unknown" "null" "Waiting for the global scan lock."
 acquire_scan_lock
 
 # Recheck after taking the scan lock so a sleep transition racing with this
@@ -422,8 +446,8 @@ fi
 
 if [ ! -e "$TARGET" ]; then
     log "[WARN] Scan target does not exist: $TARGET"
-    FINISHED_AT="$(now_compact)"
-    write_job_state "finished" "\"$FINISHED_AT\"" "0" "clean" "null" "Scan target does not exist, skipped."
+    FINISHED_AT="$(now_unix)"
+    write_job_state "finished" "$FINISHED_AT" "0" "clean" "null" "Scan target does not exist, skipped."
     ACTIVE_JOB_JSON="null"
     write_status "ready" "Scan target does not exist, skipped."
     exit 0
@@ -431,8 +455,8 @@ fi
 
 if [ "$ACTION" = "move" ] && [ ! -d "$QUARANTINE_DIR" ]; then
     log "[ERROR] Quarantine path is not a directory: $QUARANTINE_DIR"
-    FINISHED_AT="$(now_compact)"
-    write_job_state "failed" "\"$FINISHED_AT\"" "2" "error" "null" "Quarantine path is not a directory."
+    FINISHED_AT="$(now_unix)"
+    write_job_state "failed" "$FINISHED_AT" "2" "error" "null" "Quarantine path is not a directory."
     ACTIVE_JOB_JSON="null"
     write_status "error" "Quarantine path is not a directory."
     exit 2
@@ -470,24 +494,24 @@ else
 fi
 rm -f "$tmp_output"
 
-FINISHED_AT="$(now_compact)"
+FINISHED_AT="$(now_unix)"
 ACTIVE_JOB_JSON="null"
 
 case "$rc" in
     0)
         log "[INFO] Scan finished cleanly: $TARGET"
-        write_job_state "finished" "\"$FINISHED_AT\"" "$rc" "clean" "null" "Scan finished cleanly."
+        write_job_state "finished" "$FINISHED_AT" "$rc" "clean" "null" "Scan finished cleanly."
         write_status "ready" "Scan finished cleanly."
         ;;
     1)
         log "[ALERT] Threat found while scanning: $TARGET"
         log_applied_action
-        write_job_state "finished" "\"$FINISHED_AT\"" "$rc" "found" "\"$(json_escape "$DETECTION_LOG")\"" "Threat found while scanning."
+        write_job_state "finished" "$FINISHED_AT" "$rc" "found" "\"$(json_escape "$DETECTION_LOG")\"" "Threat found while scanning."
         write_status "ready" "Threat found while scanning."
         ;;
     *)
         log "[ERROR] Scan failed for $TARGET, exit code: $rc"
-        write_job_state "failed" "\"$FINISHED_AT\"" "$rc" "error" "null" "Scan failed with exit code $rc."
+        write_job_state "failed" "$FINISHED_AT" "$rc" "error" "null" "Scan failed with exit code $rc."
         write_status "error" "Scan failed with exit code $rc."
         ;;
 esac

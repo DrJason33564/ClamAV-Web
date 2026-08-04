@@ -55,8 +55,14 @@ func TestCronScanSleepHandling(t *testing.T) {
 			if result.job["status"] != test.wantStatus {
 				t.Fatalf("expected job status %q, got %#v", test.wantStatus, result.job["status"])
 			}
+			if result.job["version"] != float64(2) || result.job["user"] != "alice" {
+				t.Fatalf("expected version 2 job owned by alice, got %#v", result.job)
+			}
+			if _, ok := result.job["started_at"].(float64); !ok {
+				t.Fatalf("started_at must be a Unix timestamp number, got %#v", result.job["started_at"])
+			}
 			for _, field := range []string{
-				"version", "job_id", "type", "status", "target", "action", "pid",
+				"version", "job_id", "type", "user", "status", "target", "action", "pid",
 				"started_at", "finished_at", "exit_code", "result", "log_file",
 				"detection_log", "message",
 			} {
@@ -88,7 +94,7 @@ func TestCronScanSleepHandling(t *testing.T) {
 
 func TestManualScanRejectsWakeFlag(t *testing.T) {
 	script := repositoryScript(t, "scan_once.sh")
-	cmd := exec.Command(script, "--type", "manual", "--target", "/missing", "--action", "warn", "--wake")
+	cmd := exec.Command(script, "--type", "manual", "-u", "alice", "--target", "/missing", "--action", "warn", "--wake")
 	cmd.Env = append(os.Environ(), "LOG_SCRIPT="+repositoryScript(t, "log.sh"))
 	err := cmd.Run()
 	var exitErr *exec.ExitError
@@ -167,7 +173,7 @@ func runCronScanFixture(t *testing.T, wake bool, wakeSucceeds bool) cronScanFixt
 	script := repositoryScript(t, "scan_once.sh")
 	logScript := repositoryScript(t, "log.sh")
 	missingTarget := filepath.Join(tmp, "missing-target")
-	args := []string{"--type", "cron", "--target", missingTarget, "--action", "warn"}
+	args := []string{"--type", "cron", "-u", "alice", "--target", missingTarget, "--action", "warn"}
 	if wake {
 		args = append(args, "--wake")
 	}

@@ -72,63 +72,19 @@ func TestWhitelistUpdatesRejectSleepingClamAV(t *testing.T) {
 	}
 }
 
-func TestParseAccounts(t *testing.T) {
-	accounts, err := parseAccounts("admin:secret, ops:pass:with:colon;user:pw")
+func TestArgon2PasswordHash(t *testing.T) {
+	hash, err := hashPassword("correct horse battery staple")
 	if err != nil {
-		t.Fatalf("parseAccounts returned error: %v", err)
+		t.Fatal(err)
 	}
-
-	if len(accounts) != 3 {
-		t.Fatalf("expected 3 accounts, got %d", len(accounts))
+	if !verifyPassword("correct horse battery staple", hash) {
+		t.Fatal("expected password to verify")
 	}
-	if accounts[0].Username != "admin" || accounts[0].Password != "secret" {
-		t.Fatalf("unexpected first account: %#v", accounts[0])
+	if verifyPassword("wrong password", hash) {
+		t.Fatal("wrong password unexpectedly verified")
 	}
-	if accounts[1].Username != "ops" || accounts[1].Password != "pass:with:colon" {
-		t.Fatalf("unexpected second account: %#v", accounts[1])
-	}
-}
-
-func TestParseAccountsRejectsInvalidEntries(t *testing.T) {
-	tests := []string{
-		"admin",
-		":secret",
-		"admin:",
-		"admin:secret,admin:other",
-	}
-
-	for _, test := range tests {
-		t.Run(test, func(t *testing.T) {
-			if _, err := parseAccounts(test); err == nil {
-				t.Fatal("expected parseAccounts to reject invalid entry")
-			}
-		})
-	}
-}
-
-func TestRequireAuth(t *testing.T) {
-	s := &server{
-		cfg: config{Accounts: []account{{Username: "admin", Password: "secret"}}},
-	}
-	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	})
-
-	unauthorized := httptest.NewRecorder()
-	s.requireAuth(next).ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/", nil))
-	if unauthorized.Code != http.StatusUnauthorized {
-		t.Fatalf("expected unauthorized request to return 401, got %d", unauthorized.Code)
-	}
-	if unauthorized.Header().Get("WWW-Authenticate") == "" {
-		t.Fatal("expected WWW-Authenticate header")
-	}
-
-	authorizedReq := httptest.NewRequest(http.MethodGet, "/", nil)
-	authorizedReq.SetBasicAuth("admin", "secret")
-	authorized := httptest.NewRecorder()
-	s.requireAuth(next).ServeHTTP(authorized, authorizedReq)
-	if authorized.Code != http.StatusNoContent {
-		t.Fatalf("expected authorized request to pass through, got %d", authorized.Code)
+	if hash2, _ := hashPassword("correct horse battery staple"); hash == hash2 {
+		t.Fatal("expected independently salted password hashes")
 	}
 }
 
@@ -349,7 +305,7 @@ func TestCronConfigPreservesCommentsAndDisabledRule(t *testing.T) {
 	body := strings.Join([]string{
 		"# user readable header",
 		"# scanner-cron-rule id=abc123def456gh78 enabled=true",
-		"30 3 * * * /scan/docs warn",
+		"30 3 * * * /scan/docs warn alice",
 		"# user note",
 		"",
 	}, "\n")
@@ -384,7 +340,7 @@ func TestCronConfigPreservesCommentsAndDisabledRule(t *testing.T) {
 	if !strings.Contains(text, "# scanner-cron-rule id=abc123def456gh78 enabled=false") {
 		t.Fatalf("expected metadata to be disabled, got:\n%s", text)
 	}
-	if !strings.Contains(text, "# 30 3 * * * /scan/docs warn") {
+	if !strings.Contains(text, "# 30 3 * * * /scan/docs warn alice") {
 		t.Fatalf("expected rule line to be commented, got:\n%s", text)
 	}
 }
@@ -413,9 +369,9 @@ func TestWhitelistEntriesParseQuotedPaths(t *testing.T) {
 	excludeConfig := filepath.Join(tmp, "exclude.conf")
 	body := strings.Join([]string{
 		"# trusted paths",
-		"/scan/trusted",
-		"\"/scan/file with space.zip\"",
-		"/scan/invalid path",
+		"/scan/trusted alice",
+		"\"/scan/file with space.zip\" alice",
+		"/scan/invalid path extra",
 	}, "\n")
 	if err := os.WriteFile(excludeConfig, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
@@ -471,7 +427,7 @@ func TestWhitelistAddDeleteAndBusyLock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.addWhitelistEntry(target); err != nil {
+	if err := s.addWhitelistEntry(target, "alice"); err != nil {
 		t.Fatal(err)
 	}
 	content, err := os.ReadFile(excludeConfig)
@@ -488,7 +444,7 @@ func TestWhitelistAddDeleteAndBusyLock(t *testing.T) {
 	if message != "refreshed" {
 		t.Fatalf("unexpected script message: %q", message)
 	}
-	if err := s.deleteWhitelistEntry(target); err != nil {
+	if err := s.deleteWhitelistEntry(target, "alice"); err != nil {
 		t.Fatal(err)
 	}
 	entries, err := s.readWhitelistEntries()
@@ -503,11 +459,11 @@ func TestWhitelistAddDeleteAndBusyLock(t *testing.T) {
 func TestReadResultLogItems(t *testing.T) {
 	tmp := t.TempDir()
 	files := map[string]string{
-		"manual-20260707173642.json": `{"job_id":"manual-20260707173642","result":"found"}`,
-		"cron-20260707094101.json":   `{"job_id":"cron-20260707094101","result":"clean"}`,
-		"manual-20260707180000.json": `{"job_id":"manual-20260707180000","result":null}`,
-		"manual-bad.json":            `{"job_id":"manual-bad","result":"found"}`,
-		"web-123.json":               `{"job_id":"web-123","result":"clean"}`,
+		"manual-1783431402.json": `{"version":2,"job_id":"manual-1783431402","type":"manual","status":"finished","result":"found","action":"warn","started_at":1783431402,"finished_at":1783431410,"user":"alice"}`,
+		"cron-1783407661.json":   `{"version":2,"job_id":"cron-1783407661","type":"cron","status":"finished","result":"clean","action":"warn","started_at":1783407661,"finished_at":1783407670,"user":"alice"}`,
+		"manual-1783432800.json": `{"version":2,"job_id":"manual-1783432800","type":"manual","status":"running","result":"unknown","action":"warn","started_at":1783432800,"finished_at":null,"user":"alice"}`,
+		"manual-bad.json":        `{"version":2,"job_id":"manual-bad","user":"alice"}`,
+		"manual-1783432900.json": `{"version":1,"job_id":"manual-1783432900","user":"alice"}`,
 	}
 	for name, body := range files {
 		if err := os.WriteFile(filepath.Join(tmp, name), []byte(body), 0o644); err != nil {
@@ -515,8 +471,17 @@ func TestReadResultLogItems(t *testing.T) {
 		}
 	}
 
-	s := &server{cfg: config{JobsDir: tmp}}
-	items, total, err := s.readResultLogItems(resultScope{All: true})
+	db, err := openDatabase(filepath.Join(tmp, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := &server{cfg: config{JobsDir: tmp}, db: db}
+	s.history = &historyIndexer{db: db, jobsDir: tmp}
+	if err := s.history.refresh(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	items, total, err := s.readResultLogItems(resultScope{All: true}, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -526,17 +491,17 @@ func TestReadResultLogItems(t *testing.T) {
 	if len(items) != 3 {
 		t.Fatalf("expected 3 result jobs, got %#v", items)
 	}
-	if items[0].ID != "manual-20260707180000" || items[0].Type != "manual" || items[0].Date != "20260707180000" || items[0].Result != nil {
+	if items[0].ID != "manual-1783432800" || items[0].Type != "manual" || items[0].Result != "unknown" {
 		t.Fatalf("unexpected first item: %#v", items[0])
 	}
-	if items[1].ID != "manual-20260707173642" || items[1].Type != "manual" || items[1].Date != "20260707173642" || items[1].Result != "found" {
+	if items[1].ID != "manual-1783431402" || items[1].Type != "manual" || items[1].Result != "found" {
 		t.Fatalf("unexpected second item: %#v", items[1])
 	}
-	if items[2].ID != "cron-20260707094101" || items[2].Type != "cron" || items[2].Date != "20260707094101" || items[2].Result != "clean" {
+	if items[2].ID != "cron-1783407661" || items[2].Type != "cron" || items[2].Result != "clean" {
 		t.Fatalf("unexpected third item: %#v", items[2])
 	}
 
-	scoped, scopedTotal, err := s.readResultLogItems(resultScope{Start: 1, End: 2})
+	scoped, scopedTotal, err := s.readResultLogItems(resultScope{Start: 1, End: 2}, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -546,7 +511,7 @@ func TestReadResultLogItems(t *testing.T) {
 	if len(scoped) != 2 {
 		t.Fatalf("expected 2 scoped result jobs, got %#v", scoped)
 	}
-	if scoped[0].ID != "manual-20260707180000" || scoped[1].ID != "manual-20260707173642" {
+	if scoped[0].ID != "manual-1783432800" || scoped[1].ID != "manual-1783431402" {
 		t.Fatalf("unexpected scoped jobs: %#v", scoped)
 	}
 }
@@ -749,7 +714,7 @@ func TestQuarantineSubjectsDeleteAndRecover(t *testing.T) {
 	if err := os.WriteFile(quarantined, []byte("infected"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(quarantined+".rec", []byte("\""+sourceFile+"\"\n"), 0o644); err != nil {
+	if err := os.WriteFile(quarantined+".rec", []byte("\""+sourceFile+"\" alice\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(quarantineDir, "orphan.rec"), []byte("\"/scan/orphan\"\n"), 0o644); err != nil {
@@ -788,7 +753,7 @@ func TestQuarantineSubjectsDeleteAndRecover(t *testing.T) {
 	if err := os.WriteFile(deleteTarget, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(deleteTarget+".rec", []byte("\"/scan/delete-me.txt\"\n"), 0o644); err != nil {
+	if err := os.WriteFile(deleteTarget+".rec", []byte("\"/scan/delete-me.txt\" alice\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.deleteQuarantineSubject("delete-me.txt"); err != nil {
@@ -819,7 +784,7 @@ func TestQuarantineRecoverFallsBackAcrossDevices(t *testing.T) {
 	if err := os.WriteFile(quarantined, content, 0o640); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(quarantined+".rec", []byte("\""+sourceFile+"\"\n"), 0o644); err != nil {
+	if err := os.WriteFile(quarantined+".rec", []byte("\""+sourceFile+"\" alice\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

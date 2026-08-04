@@ -84,13 +84,14 @@ reload_cron() {
         escaped_scan_script="$(printf "%s" "$SCAN_ONCE_SCRIPT" | sed "s/'/'\\\\''/g")"
         escaped_target="$(printf "%s" "$CRON_TARGET" | sed "s/'/'\\\\''/g")"
         escaped_action="$(printf "%s" "$CRON_ACTION" | sed "s/'/'\\\\''/g")"
+        escaped_user="$(printf "%s" "$CRON_USER" | sed "s/'/'\\\\''/g")"
 
-        printf "%s %s %s %s %s root '%s' --type cron --target '%s' --action '%s' --wait\n" \
+        printf "%s %s %s %s %s root '%s' --type cron -u '%s' --target '%s' --action '%s' --wait\n" \
             "$CRON_MINUTE" "$CRON_HOUR" "$CRON_DAY" "$CRON_MONTH" "$CRON_WEEKDAY" \
-            "$escaped_scan_script" "$escaped_target" "$escaped_action" \
+            "$escaped_scan_script" "$escaped_user" "$escaped_target" "$escaped_action" \
             >> "$CRON_FILE"
 
-        log_line "$CRON_LOG_FILE" "[INFO] Registered cron scan: $CRON_MINUTE $CRON_HOUR $CRON_DAY $CRON_MONTH $CRON_WEEKDAY -> $CRON_TARGET [$CRON_ACTION]"
+        log_line "$CRON_LOG_FILE" "[INFO] Registered cron scan: $CRON_MINUTE $CRON_HOUR $CRON_DAY $CRON_MONTH $CRON_WEEKDAY -> $CRON_TARGET [$CRON_ACTION] owner=$CRON_USER"
     done < "$CRON_CONFIG_FILE"
 
     chmod 0644 "$CRON_FILE"
