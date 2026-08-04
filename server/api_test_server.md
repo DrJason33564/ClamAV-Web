@@ -57,6 +57,7 @@ curl -u test:anything http://localhost:8081/api/status
 - `source.clamd.message` 与所选状态匹配。
 - `ping` 与 `source.clamd.status` 相同。
 - `ping_message` 与 `source.clamd.message` 相同。
+- `is_timedock` 固定为 `false`。
 
 状态与消息的对应关系：
 
@@ -150,8 +151,8 @@ curl -u test:anything \
 
 `GET /api/cron/rules` 固定返回两个示例任务：
 
-- `testenabled00001`：已启用，每天 `02:00` 扫描 `/scan/documents`。
-- `testdisabled0002`：未启用，每周日 `04:30` 扫描 `/scan/uploads`。
+- `testenabled00001`：已启用，每天 `02:00` 扫描 `/scan/documents`，执行时唤醒 ClamAV。
+- `testdisabled0002`：未启用，每周日 `04:30` 扫描 `/scan/uploads`，不主动唤醒 ClamAV。
 
 新增、更新、启用、禁用、删除和 reload 请求均返回包含这两个任务的成功响应，不会
 修改返回内容，也不会写入真实配置文件。

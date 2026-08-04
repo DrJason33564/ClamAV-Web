@@ -26,6 +26,7 @@ type cronRule struct {
 	Weekday string `json:"weekday"`
 	Target  string `json:"target"`
 	Action  string `json:"action"`
+	Wake    bool   `json:"wake"`
 	User    string `json:"-"`
 	Line    int    `json:"line,omitempty"`
 }
@@ -70,7 +71,7 @@ func (s *server) handleCronRules(w http.ResponseWriter, r *http.Request) {
 		}
 		who, _ := actorFromRequest(r)
 		s.configFileMu.Lock()
-		rules, message, err := s.addCronRule(req, who.Username)
+		rules, message, err := s.addCronRule(req, who)
 		s.configFileMu.Unlock()
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -106,7 +107,7 @@ func (s *server) handleCronRule(w http.ResponseWriter, r *http.Request) {
 		}
 		who, _ := actorFromRequest(r)
 		s.configFileMu.Lock()
-		rules, message, err := s.setCronRuleEnabled(id, req.Enabled, who.Username)
+		rules, message, err := s.setCronRuleEnabled(id, req.Enabled, who)
 		s.configFileMu.Unlock()
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -131,7 +132,7 @@ func (s *server) handleCronRule(w http.ResponseWriter, r *http.Request) {
 		}
 		who, _ := actorFromRequest(r)
 		s.configFileMu.Lock()
-		rules, message, err := s.updateCronRule(id, req, who.Username)
+		rules, message, err := s.updateCronRule(id, req, who)
 		s.configFileMu.Unlock()
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -290,8 +291,8 @@ func parseCronRuleLine(line string) (cronRule, error) {
 	}
 
 	fields := strings.Fields(line)
-	if len(fields) < 7 {
-		return cronRule{}, errors.New("expected minute hour day month weekday target action")
+	if len(fields) < 9 {
+		return cronRule{}, errors.New("expected minute hour day month weekday target action owner wake")
 	}
 	rule := cronRule{
 		Minute:  fields[0],
@@ -307,12 +308,20 @@ func parseCronRuleLine(line string) (cronRule, error) {
 		return cronRule{}, err
 	}
 	actionFields := strings.Fields(rest)
-	if len(actionFields) != 2 {
-		return cronRule{}, errors.New("expected exactly one action and one owner")
+	if len(actionFields) != 3 {
+		return cronRule{}, errors.New("expected exactly one action, one owner and one wake flag")
 	}
 	rule.Target = target
 	rule.Action = actionFields[0]
 	rule.User = actionFields[1]
+	switch actionFields[2] {
+	case "Y":
+		rule.Wake = true
+	case "N":
+		rule.Wake = false
+	default:
+		return cronRule{}, errors.New("wake flag must be Y or N")
+	}
 	if !usernamePattern.MatchString(rule.User) {
 		return cronRule{}, errors.New("invalid rule owner")
 	}
@@ -356,16 +365,17 @@ func uncommentCronRuleLine(line string) string {
 	return line
 }
 
-func (s *server) addCronRule(req cronRule, usernames ...string) ([]cronRule, string, error) {
-	username := req.User
-	if len(usernames) > 0 {
-		username = usernames[0]
+func (s *server) addCronRule(req cronRule, actors ...actor) ([]cronRule, string, error) {
+	who := actor{Username: req.User}
+	if len(actors) > 0 {
+		who = actors[0]
 	}
+	username := who.Username
 	doc, err := s.readCronConfigDoc()
 	if err != nil {
 		return nil, "", err
 	}
-	rule, err := s.prepareCronRule(req)
+	rule, err := s.prepareCronRule(req, who)
 	if err != nil {
 		return nil, "", err
 	}
@@ -375,16 +385,17 @@ func (s *server) addCronRule(req cronRule, usernames ...string) ([]cronRule, str
 	return s.saveCronConfigDoc(doc, username)
 }
 
-func (s *server) updateCronRule(id string, req cronRule, usernames ...string) ([]cronRule, string, error) {
-	username := req.User
-	if len(usernames) > 0 {
-		username = usernames[0]
+func (s *server) updateCronRule(id string, req cronRule, actors ...actor) ([]cronRule, string, error) {
+	who := actor{Username: req.User}
+	if len(actors) > 0 {
+		who = actors[0]
 	}
+	username := who.Username
 	doc, block, err := s.findCronRuleBlock(id, username)
 	if err != nil {
 		return nil, "", err
 	}
-	rule, err := s.prepareCronRule(req)
+	rule, err := s.prepareCronRule(req, who)
 	if err != nil {
 		return nil, "", err
 	}
@@ -395,16 +406,22 @@ func (s *server) updateCronRule(id string, req cronRule, usernames ...string) ([
 	return s.saveCronConfigDoc(doc, username)
 }
 
-func (s *server) setCronRuleEnabled(id string, enabled bool, usernames ...string) ([]cronRule, string, error) {
-	username := ""
-	if len(usernames) > 0 {
-		username = usernames[0]
+func (s *server) setCronRuleEnabled(id string, enabled bool, actors ...actor) ([]cronRule, string, error) {
+	who := actor{}
+	if len(actors) > 0 {
+		who = actors[0]
 	}
+	username := who.Username
 	doc, block, err := s.findCronRuleBlock(id, username)
 	if err != nil {
 		return nil, "", err
 	}
 	rule := block.Rule
+	if enabled {
+		if _, err := s.safePathForActor(rule.Target, who); err != nil {
+			return nil, "", err
+		}
+	}
 	rule.Enabled = enabled
 	doc.Lines[block.MetaIndex] = cronMetaLine(rule)
 	doc.Lines[block.RuleIndex] = cronConfigLine(rule)
@@ -444,7 +461,7 @@ func (s *server) findCronRuleBlock(id string, usernames ...string) (cronConfigDo
 	return doc, cronRuleBlock{}, errors.New("cron rule not found")
 }
 
-func (s *server) prepareCronRule(req cronRule) (cronRule, error) {
+func (s *server) prepareCronRule(req cronRule, actors ...actor) (cronRule, error) {
 	rule := cronRule{
 		Enabled: req.Enabled,
 		Minute:  strings.TrimSpace(req.Minute),
@@ -454,6 +471,7 @@ func (s *server) prepareCronRule(req cronRule) (cronRule, error) {
 		Weekday: strings.TrimSpace(req.Weekday),
 		Target:  strings.TrimSpace(req.Target),
 		Action:  strings.TrimSpace(req.Action),
+		Wake:    req.Wake,
 	}
 	if rule.Action == "" {
 		rule.Action = "warn"
@@ -461,7 +479,11 @@ func (s *server) prepareCronRule(req cronRule) (cronRule, error) {
 	if err := validateCronRuleFields(rule); err != nil {
 		return cronRule{}, err
 	}
-	target, err := s.safePath(rule.Target)
+	who := actor{}
+	if len(actors) > 0 {
+		who = actors[0]
+	}
+	target, err := s.safePathForActor(rule.Target, who)
 	if err != nil {
 		return cronRule{}, err
 	}
@@ -645,7 +667,11 @@ func cronMetaLine(rule cronRule) string {
 }
 
 func cronConfigLine(rule cronRule) string {
-	line := fmt.Sprintf("%s %s %s %s %s %s %s %s",
+	wake := "N"
+	if rule.Wake {
+		wake = "Y"
+	}
+	line := fmt.Sprintf("%s %s %s %s %s %s %s %s %s",
 		rule.Minute,
 		rule.Hour,
 		rule.Day,
@@ -654,6 +680,7 @@ func cronConfigLine(rule cronRule) string {
 		quoteCronTarget(rule.Target),
 		rule.Action,
 		rule.User,
+		wake,
 	)
 	if !rule.Enabled {
 		return "# " + line

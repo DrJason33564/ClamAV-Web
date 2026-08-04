@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -23,7 +22,7 @@ func (s *server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	rows, err := s.db.QueryContext(r.Context(), "SELECT username,role,status,allowed_dirs,created_at,updated_at FROM users ORDER BY username")
+	rows, err := s.db.QueryContext(r.Context(), "SELECT username,role,status,timedock_account,created_at,updated_at FROM users ORDER BY username")
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -32,12 +31,10 @@ func (s *server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 	users := []userRecord{}
 	for rows.Next() {
 		var item userRecord
-		var allowed string
-		if err := rows.Scan(&item.Username, &item.Role, &item.Status, &allowed, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		if err := rows.Scan(&item.Username, &item.Role, &item.Status, &item.TimeDockAccount, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		_ = json.Unmarshal([]byte(allowed), &item.AllowedDirs)
 		users = append(users, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"users": users})
@@ -79,9 +76,10 @@ func (s *server) patchAdminUser(w http.ResponseWriter, r *http.Request, who acto
 		return
 	}
 	var id int64
-	var role, status, allowed string
+	var role, status, timeDockAccount string
+	timeDockAccountChanged := false
 	var password sql.NullString
-	if err := s.db.QueryRowContext(r.Context(), "SELECT id,role,status,allowed_dirs,password_hash FROM users WHERE username=?", username).Scan(&id, &role, &status, &allowed, &password); err != nil {
+	if err := s.db.QueryRowContext(r.Context(), "SELECT id,role,status,timedock_account,password_hash FROM users WHERE username=?", username).Scan(&id, &role, &status, &timeDockAccount, &password); err != nil {
 		writeError(w, http.StatusNotFound, errors.New("user not found"))
 		return
 	}
@@ -113,13 +111,14 @@ func (s *server) patchAdminUser(w http.ResponseWriter, r *http.Request, who acto
 		}
 		status = next
 	}
-	if req.AllowedDirs != nil {
-		encoded, err := json.Marshal(*req.AllowedDirs)
+	if req.TimeDockAccount != nil {
+		normalized, err := normalizeTimeDockAccount(*req.TimeDockAccount)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		allowed = string(encoded)
+		timeDockAccountChanged = normalized != timeDockAccount
+		timeDockAccount = normalized
 	}
 	if req.Password != nil {
 		if *req.Password == "" {
@@ -134,7 +133,7 @@ func (s *server) patchAdminUser(w http.ResponseWriter, r *http.Request, who acto
 		}
 	}
 	now := time.Now().Unix()
-	if _, err := s.db.ExecContext(r.Context(), "UPDATE users SET role=?,status=?,allowed_dirs=?,password_hash=?,updated_at=? WHERE id=?", role, status, allowed, password, now, id); err != nil {
+	if _, err := s.db.ExecContext(r.Context(), "UPDATE users SET role=?,status=?,timedock_account=?,password_hash=?,updated_at=? WHERE id=?", role, status, timeDockAccount, password, now, id); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -148,7 +147,15 @@ func (s *server) patchAdminUser(w http.ResponseWriter, r *http.Request, who acto
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "success", "username": username, "role": role})
+	if s.cfg.IsTimeDock && timeDockAccountChanged && status != "disabled" {
+		// Existing cron targets may belong to the previous TimeDock account.
+		// Disable them until the owner reviews and explicitly re-enables them.
+		if err := s.disableCronRulesForUser(username); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "success", "username": username, "role": role, "timedock_account": timeDockAccount})
 }
 
 func (s *server) handleAuthAccount(w http.ResponseWriter, r *http.Request) {

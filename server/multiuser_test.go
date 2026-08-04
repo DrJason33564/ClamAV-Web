@@ -48,6 +48,9 @@ func TestFirstRegistrationCreatesAdminAndCookieLogin(t *testing.T) {
 	if err := s.db.QueryRow("SELECT role FROM users WHERE username='alice'").Scan(&role); err != nil || role != "admin" {
 		t.Fatalf("expected first user to be admin, role=%q err=%v", role, err)
 	}
+	if _, err := s.db.Exec("UPDATE users SET timedock_account='Jason' WHERE username='alice'"); err != nil {
+		t.Fatal(err)
+	}
 	login := httptest.NewRecorder()
 	s.handleAuthLogin(login, httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"username":"alice","password":"correct horse battery staple"}`)))
 	if login.Code != http.StatusOK || len(login.Result().Cookies()) != 1 {
@@ -57,7 +60,7 @@ func TestFirstRegistrationCreatesAdminAndCookieLogin(t *testing.T) {
 	request.AddCookie(login.Result().Cookies()[0])
 	response := httptest.NewRecorder()
 	s.requireAuth(http.HandlerFunc(s.handleAuthMe)).ServeHTTP(response, request)
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"username":"alice"`) {
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"username":"alice"`) || !strings.Contains(response.Body.String(), `"timedock_account":"Jason"`) {
 		t.Fatalf("authenticated request failed: %d %s", response.Code, response.Body.String())
 	}
 }
@@ -125,9 +128,9 @@ func TestCronAndWhitelistReadsAreOwnerScoped(t *testing.T) {
 	cronFile := filepath.Join(tmp, "cron.conf")
 	cronBody := strings.Join([]string{
 		"# scanner-cron-rule id=aaaaaaaaaaaaaaaa enabled=true",
-		"0 1 * * * /scan warn alice",
+		"0 1 * * * /scan warn alice Y",
 		"# scanner-cron-rule id=bbbbbbbbbbbbbbbb enabled=true",
-		"0 2 * * * /scan move bob",
+		"0 2 * * * /scan move bob N",
 	}, "\n") + "\n"
 	if err := os.WriteFile(cronFile, []byte(cronBody), 0o600); err != nil {
 		t.Fatal(err)
@@ -138,7 +141,7 @@ func TestCronAndWhitelistReadsAreOwnerScoped(t *testing.T) {
 	}
 	s := &server{cfg: config{CronConfigFile: cronFile, ExcludeConfig: excludeFile}}
 	rules, err := s.readCronRules("alice")
-	if err != nil || len(rules) != 1 || rules[0].ID != "aaaaaaaaaaaaaaaa" {
+	if err != nil || len(rules) != 1 || rules[0].ID != "aaaaaaaaaaaaaaaa" || !rules[0].Wake {
 		t.Fatalf("unexpected cron view: %#v err=%v", rules, err)
 	}
 	entries, err := s.readWhitelistEntries("alice")

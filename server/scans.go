@@ -118,8 +118,9 @@ func (s *server) startScan(w http.ResponseWriter, r *http.Request) {
 
 	targets := make([]string, 0, len(req.Targets))
 	seen := map[string]bool{}
+	who, _ := actorFromRequest(r)
 	for _, target := range req.Targets {
-		path, err := s.safePath(target)
+		path, err := s.safePathForActor(target, who)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("%s: %w", target, err))
 			return
@@ -145,7 +146,6 @@ func (s *server) startScan(w http.ResponseWriter, r *http.Request) {
 		Targets: targets,
 		Message: "Queued",
 	}
-	who, _ := actorFromRequest(r)
 	batch.User = who.Username
 
 	status, message := s.enqueueBatch(batch)

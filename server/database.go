@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT NOT NULL UNIQUE,
     password_hash TEXT,
     role TEXT NOT NULL CHECK(role IN ('user','admin')),
-    allowed_dirs TEXT NOT NULL DEFAULT '[]',
+    timedock_account TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled','deleting')),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL

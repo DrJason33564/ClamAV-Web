@@ -35,7 +35,10 @@ type server struct {
 }
 
 func main() {
-	cfg := loadConfig()
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("load environment config: %v", err)
+	}
 	appConfig, err := newAppConfigStore(cfg.AppConfigFile)
 	if err != nil {
 		log.Fatalf("load server config: %v", err)

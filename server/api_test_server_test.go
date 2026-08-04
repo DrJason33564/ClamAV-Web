@@ -95,12 +95,12 @@ var templateCronRules = []map[string]any{
 	{
 		"id": "testenabled00001", "enabled": true,
 		"minute": "0", "hour": "2", "day": "*", "month": "*", "weekday": "*",
-		"target": "/scan/documents", "action": "warn", "line": 2,
+		"target": "/scan/documents", "action": "warn", "wake": true, "line": 2,
 	},
 	{
 		"id": "testdisabled0002", "enabled": false,
 		"minute": "30", "hour": "4", "day": "*", "month": "*", "weekday": "0",
-		"target": "/scan/uploads", "action": "move", "line": 4,
+		"target": "/scan/uploads", "action": "move", "wake": false, "line": 4,
 	},
 }
 
@@ -269,6 +269,7 @@ func templateStatus(w http.ResponseWriter, r *http.Request) {
 		"ping":         state.status,
 		"ping_message": state.message,
 		"checked_at":   timestamp,
+		"is_timedock":  false,
 	})
 }
 
@@ -657,6 +658,9 @@ func TestTemplateAPIResponses(t *testing.T) {
 		clamd := source["clamd"].(map[string]any)
 		if body["ping"] != clamd["status"] || body["ping_message"] != clamd["message"] {
 			t.Fatalf("status fields do not match: %#v", body)
+		}
+		if body["is_timedock"] != false {
+			t.Fatalf("unexpected is_timedock value: %#v", body["is_timedock"])
 		}
 		scan := source["scan"].(map[string]any)
 		if scan["last_job_id"] != templateLastJobID {

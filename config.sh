@@ -42,10 +42,10 @@ split_cron_config_line() {
     set -- $line
     set +f
 
-    if [ "$#" -lt 8 ]; then
+    if [ "$#" -lt 9 ]; then
         config_invalid "format" "$line_no" "$line"
-        config_log "[ERROR] Invalid line $line_no: expected 5 cron fields, scan target and action, got: $line"
-        config_log "[ERROR] Expected format: minute hour day month weekday scan_target action owner"
+        config_log "[ERROR] Invalid line $line_no: expected 5 cron fields, scan target, action, owner and wake flag, got: $line"
+        config_log "[ERROR] Expected format: minute hour day month weekday scan_target action owner wake(Y/N)"
         config_log "[ERROR] scan_target may be quoted with double quotes if it contains spaces."
         config_log "[ERROR] Supported actions: warn, move, remove"
         return 1
@@ -93,12 +93,13 @@ split_cron_config_line() {
             set -- $after_quote
             set +f
 
-            if [ "$#" -ne 2 ]; then
+            if [ "$#" -ne 3 ]; then
                 config_invalid "format" "$line_no" "$line"
                 return 1
             fi
             CRON_ACTION="$1"
             CRON_USER="$2"
+            CRON_WAKE="$3"
             ;;
         *)
             set -f
@@ -106,14 +107,15 @@ split_cron_config_line() {
             set -- $tail
             set +f
 
-            if [ "$#" -ne 3 ]; then
+            if [ "$#" -ne 4 ]; then
                 config_invalid "target" "$line_no" "$line"
-                config_log "[ERROR] Wrap paths containing spaces in double quotes, for example: \"/scan/My Folder\" move"
+                config_log "[ERROR] Wrap paths containing spaces in double quotes, for example: \"/scan/My Folder\" move admin Y"
                 return 1
             fi
             CRON_TARGET="$1"
             CRON_ACTION="$2"
             CRON_USER="$3"
+            CRON_WAKE="$4"
             ;;
     esac
 
@@ -143,6 +145,16 @@ split_cron_config_line() {
         config_invalid "owner" "$line_no" "$CRON_USER"
         return 1
     fi
+
+    case "$CRON_WAKE" in
+        Y|N)
+            ;;
+        *)
+            config_invalid "wake" "$line_no" "$CRON_WAKE"
+            config_log "[ERROR] Wake flag must be Y or N"
+            return 1
+            ;;
+    esac
 
     return 0
 }

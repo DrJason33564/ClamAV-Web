@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -34,9 +35,10 @@ const (
 var usernamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
 type actor struct {
-	ID       int64
-	Username string
-	Role     string
+	ID              int64
+	Username        string
+	Role            string
+	TimeDockAccount string
 }
 
 type actorContextKey struct{}
@@ -57,19 +59,19 @@ type accountDeleteRequest struct {
 }
 
 type userPatchRequest struct {
-	Role        *string   `json:"role,omitempty"`
-	Status      *string   `json:"status,omitempty"`
-	AllowedDirs *[]string `json:"allowed_dirs,omitempty"`
-	Password    *string   `json:"password,omitempty"`
+	Role            *string `json:"role,omitempty"`
+	Status          *string `json:"status,omitempty"`
+	TimeDockAccount *string `json:"timedock_account,omitempty"`
+	Password        *string `json:"password,omitempty"`
 }
 
 type userRecord struct {
-	Username    string   `json:"username"`
-	Role        string   `json:"role"`
-	Status      string   `json:"status"`
-	AllowedDirs []string `json:"allowed_dirs"`
-	CreatedAt   int64    `json:"created_at"`
-	UpdatedAt   int64    `json:"updated_at"`
+	Username        string `json:"username"`
+	Role            string `json:"role"`
+	Status          string `json:"status"`
+	TimeDockAccount string `json:"timedock_account"`
+	CreatedAt       int64  `json:"created_at"`
+	UpdatedAt       int64  `json:"updated_at"`
 }
 
 type loginAttempt struct {
@@ -158,10 +160,10 @@ func (s *server) authenticateRequest(r *http.Request) (actor, error) {
 	var who actor
 	var sessionID, lastSeen, absoluteExpires int64
 	err = s.db.QueryRowContext(r.Context(), `
-SELECT s.id, u.id, u.username, u.role, s.last_seen_at, s.absolute_expires_at
+SELECT s.id, u.id, u.username, u.role, u.timedock_account, s.last_seen_at, s.absolute_expires_at
 FROM sessions s JOIN users u ON u.id=s.user_id
 WHERE s.token_hash=? AND s.revoked_at IS NULL AND s.idle_expires_at>? AND s.absolute_expires_at>?
-  AND u.status='active'`, hash[:], now, now).Scan(&sessionID, &who.ID, &who.Username, &who.Role, &lastSeen, &absoluteExpires)
+  AND u.status='active'`, hash[:], now, now).Scan(&sessionID, &who.ID, &who.Username, &who.Role, &who.TimeDockAccount, &lastSeen, &absoluteExpires)
 	if err != nil {
 		return actor{}, err
 	}
@@ -348,7 +350,27 @@ func (s *server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	who, _ := actorFromRequest(r)
-	writeJSON(w, http.StatusOK, map[string]any{"username": who.Username, "role": who.Role})
+	writeJSON(w, http.StatusOK, map[string]any{"username": who.Username, "role": who.Role, "timedock_account": who.TimeDockAccount})
+}
+
+func normalizeTimeDockAccount(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	count := 0
+	for _, r := range value {
+		count++
+		if count > 64 {
+			return "", errors.New("timedock_account must not exceed 64 Unicode characters")
+		}
+		// Restrict the value to a single safe path component. In particular,
+		// whitespace, slash and dot are rejected rather than normalized.
+		if unicode.Is(unicode.Han, r) || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			continue
+		}
+		return "", errors.New("timedock_account may contain only Chinese characters, English letters, and numbers")
+	}
+	return value, nil
 }
 
 func (s *server) handleAuthPassword(w http.ResponseWriter, r *http.Request) {

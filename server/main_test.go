@@ -305,7 +305,7 @@ func TestCronConfigPreservesCommentsAndDisabledRule(t *testing.T) {
 	body := strings.Join([]string{
 		"# user readable header",
 		"# scanner-cron-rule id=abc123def456gh78 enabled=true",
-		"30 3 * * * /scan/docs warn alice",
+		"30 3 * * * /scan/docs warn alice Y",
 		"# user note",
 		"",
 	}, "\n")
@@ -340,13 +340,13 @@ func TestCronConfigPreservesCommentsAndDisabledRule(t *testing.T) {
 	if !strings.Contains(text, "# scanner-cron-rule id=abc123def456gh78 enabled=false") {
 		t.Fatalf("expected metadata to be disabled, got:\n%s", text)
 	}
-	if !strings.Contains(text, "# 30 3 * * * /scan/docs warn alice") {
+	if !strings.Contains(text, "# 30 3 * * * /scan/docs warn alice Y") {
 		t.Fatalf("expected rule line to be commented, got:\n%s", text)
 	}
 }
 
 func TestValidateCronRuleFields(t *testing.T) {
-	valid := cronRule{Minute: "*/5", Hour: "0-23/2", Day: "*", Month: "1,6,12", Weekday: "0-7", Target: "/scan", Action: "warn"}
+	valid := cronRule{Minute: "*/5", Hour: "0-23/2", Day: "*", Month: "1,6,12", Weekday: "0-7", Target: "/scan", Action: "warn", Wake: true}
 	if err := validateCronRuleFields(valid); err != nil {
 		t.Fatalf("expected rule to be valid: %v", err)
 	}
@@ -354,6 +354,28 @@ func TestValidateCronRuleFields(t *testing.T) {
 	invalid.Minute = "99"
 	if err := validateCronRuleFields(invalid); err == nil || !strings.Contains(err.Error(), "minute") {
 		t.Fatalf("expected minute validation error, got %v", err)
+	}
+}
+
+func TestCronRuleWakeColumn(t *testing.T) {
+	wakeRule, err := parseCronRuleLine(`15 2 * * 0 "/scan/My Folder" remove admin Y`)
+	if err != nil || !wakeRule.Wake {
+		t.Fatalf("expected Y to enable wake, rule=%#v err=%v", wakeRule, err)
+	}
+	wakeRule.Enabled = true
+	if got := cronConfigLine(wakeRule); got != `15 2 * * 0 "/scan/My Folder" remove admin Y` {
+		t.Fatalf("unexpected serialized wake rule: %q", got)
+	}
+
+	noWakeRule, err := parseCronRuleLine("0 3 * * * /scan warn alice N")
+	if err != nil || noWakeRule.Wake {
+		t.Fatalf("expected N to disable wake, rule=%#v err=%v", noWakeRule, err)
+	}
+	if _, err := parseCronRuleLine("0 3 * * * /scan warn alice maybe"); err == nil {
+		t.Fatal("expected an invalid wake column to be rejected")
+	}
+	if _, err := parseCronRuleLine("0 3 * * * /scan warn alice"); err == nil {
+		t.Fatal("expected a missing wake column to be rejected")
 	}
 }
 

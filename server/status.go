@@ -16,6 +16,7 @@ type statusResponse struct {
 	PingMessage string `json:"ping_message"`
 	CheckedAt   string `json:"checked_at"`
 	FirstRun    string `json:"first_run"`
+	IsTimeDock  bool   `json:"is_timedock"`
 }
 
 func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -47,6 +48,7 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		PingMessage: msg,
 		CheckedAt:   time.Now().Format(time.RFC3339),
 		FirstRun:    firstRun,
+		IsTimeDock:  s.cfg.IsTimeDock,
 	})
 }
 

@@ -205,10 +205,12 @@ func (s *server) handleQuarantineRecover(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	who, _ := actorFromRequest(r)
-	if err := s.recoverQuarantineSubject(name, who.Username); err != nil {
+	if err := s.recoverQuarantineSubject(name, who); err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, os.ErrNotExist) {
 			status = http.StatusNotFound
+		} else if errors.Is(err, errTimeDockAccountRequired) || errors.Is(err, errTimeDockPathDenied) {
+			status = http.StatusBadRequest
 		}
 		writeQuarantineAction(w, status, err)
 		return
@@ -251,11 +253,12 @@ func (s *server) deleteQuarantineSubject(name string, usernames ...string) error
 	return nil
 }
 
-func (s *server) recoverQuarantineSubject(name string, usernames ...string) error {
-	username := ""
-	if len(usernames) > 0 {
-		username = usernames[0]
+func (s *server) recoverQuarantineSubject(name string, actors ...actor) error {
+	who := actor{}
+	if len(actors) > 0 {
+		who = actors[0]
 	}
+	username := who.Username
 	quarantined := filepath.Join(s.cfg.QuarantineDir, name)
 	recPath := quarantined + ".rec"
 	sourceFile, owner, err := readQuarantineRecord(recPath)
@@ -267,6 +270,9 @@ func (s *server) recoverQuarantineSubject(name string, usernames ...string) erro
 	}
 	if sourceFile == "" {
 		return errors.New("quarantine record is empty")
+	}
+	if err := s.authorizeRestorePath(sourceFile, who); err != nil {
+		return err
 	}
 	if _, err := os.Stat(quarantined); err != nil {
 		return err

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,11 +31,16 @@ type config struct {
 	DataDir        string
 	DatabaseFile   string
 	AppConfigFile  string
+	IsTimeDock     bool
 }
 
-func loadConfig() config {
+func loadConfig() (config, error) {
 	statusDir := env("STATUS_DIR", "/state")
 	dataDir := env("DATA_DIR", "/data")
+	isTimeDock, err := parseYNFlag("IS_TIMEDOCK", os.Getenv("IS_TIMEDOCK"))
+	if err != nil {
+		return config{}, err
+	}
 	return config{
 		Addr:           env("SCANNER_ADDR", ":8080"),
 		StatusFile:     env("STATUS_FILE", filepath.Join(statusDir, "status.json")),
@@ -61,6 +67,18 @@ func loadConfig() config {
 		DataDir:       dataDir,
 		DatabaseFile:  env("DATABASE_FILE", filepath.Join(dataDir, "clamavweb.db")),
 		AppConfigFile: env("CLAMAVWEB_CONFIG_FILE", "/config/clamavweb.conf"),
+		IsTimeDock:    isTimeDock,
+	}, nil
+}
+
+func parseYNFlag(name, value string) (bool, error) {
+	switch strings.TrimSpace(value) {
+	case "", "N":
+		return false, nil
+	case "Y":
+		return true, nil
+	default:
+		return false, fmt.Errorf("%s must be Y or N", name)
 	}
 }
 

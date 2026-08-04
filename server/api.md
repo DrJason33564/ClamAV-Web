@@ -76,6 +76,8 @@ admin 额外拥有的权限仅包括：
 - 文件浏览、手动扫描、cron 和白名单路径限制在 `/scan`；
 - 后端解析符号链接，指向允许根目录之外的路径会被拒绝。
 
+`IS_TIMEDOCK=Y` 时还会启用 TimeDock 账户目录限制。`timedock_account` 最多 64 个 Unicode 字符，只允许汉字、英文字母和数字，匹配文件夹名称时区分大小写。
+
 ## 2. 首次运行
 
 ### `GET /api/first-run/status`
@@ -167,7 +169,7 @@ WEB_FIRSTRUN_COMPLETED=2
 ### `GET /api/auth/me`
 
 ```json
-{"username":"alice","role":"user"}
+{"username":"alice","role":"user","timedock_account":"Jason"}
 ```
 
 ### `PUT /api/auth/password`
@@ -219,7 +221,7 @@ WEB_FIRSTRUN_COMPLETED=2
       "username": "alice",
       "role": "user",
       "status": "active",
-      "allowed_dirs": [],
+      "timedock_account": "Jason",
       "created_at": 1783433000,
       "updated_at": 1783433000
     }
@@ -227,7 +229,7 @@ WEB_FIRSTRUN_COMPLETED=2
 }
 ```
 
-`allowed_dirs` 当前只保存占位数据，尚未替代统一的 `/scan` 路径限制。
+`timedock_account` 可为空。TimeDock 模式下为空的用户不能浏览或提交扫描路径。
 
 ### `POST /api/admin/users`
 
@@ -241,7 +243,7 @@ WEB_FIRSTRUN_COMPLETED=2
 {
   "role": "admin",
   "status": "active",
-  "allowed_dirs": ["/scan/team-a"],
+  "timedock_account": "Jason",
   "password": "new password"
 }
 ```
@@ -250,6 +252,8 @@ WEB_FIRSTRUN_COMPLETED=2
 
 - `role` 只能是 `user` 或 `admin`；
 - `status` 只能是 `active` 或 `disabled`；
+- `timedock_account` 可为空；非空时最多 64 个 Unicode 字符，且只允许汉字、英文字母和数字；
+- TimeDock 模式下修改 `timedock_account` 会停用该用户已启用的 cron，避免旧规则继续访问此前绑定的账户目录；
 - `password: ""` 会清除密码，使用户无法登录；
 - 设置或清除密码会撤销该用户全部 session；
 - 禁用会撤销 session，并停用该用户当前启用的 cron；
@@ -288,11 +292,14 @@ WEB_FIRSTRUN_COMPLETED=2
   "ping": "ready",
   "ping_message": "clamd is ready",
   "checked_at": "2026-08-04T19:00:00+08:00",
-  "first_run": "completed"
+  "first_run": "completed",
+  "is_timedock": true
 }
 ```
 
 `status.json` 是全局文件，但 API 会过滤 `active_job_id`，并从 SQLite 查询当前用户自己的最近任务。不会返回其他用户任务。
+
+`is_timedock` 在环境变量 `IS_TIMEDOCK=Y` 时为 `true`；未设置、为空或为 `N` 时为 `false`。
 
 ### `GET /api/config`
 
@@ -341,6 +348,19 @@ sleep/wake 均为幂等操作。
 
 如果路径指向文件，则返回文件所在目录。目录排在文件之前，指向 `/scan` 外部的符号链接会被拒绝。
 
+### TimeDock 模式
+
+`IS_TIMEDOCK=Y` 时：
+
+- `/scan` 的直接子目录中只识别真实目录 `extdev` 或名称匹配 `usb[0-9]+` 的真实目录；
+- 请求 `/scan` 时，只返回第一层中实际包含当前用户账户目录的设备。例如存在 `/scan/usb1/Jason`、`/scan/usb2/Jason` 和 `/scan/usb3/James` 时，账户为 `Jason` 的用户只看到 `usb1` 和 `usb2`；
+- 请求 `/scan/usb1` 时，只返回名称与 `timedock_account` 完全匹配的第一层账户目录；
+- 进入 `/scan/usb1/Jason` 后按普通模式继续浏览其文件和子目录；
+- 不能访问没有当前账户目录的设备、其他账户目录或通过符号链接跳转到其他账户；
+- `timedock_account` 为空时返回 `400`：`{"error":"Please set your TimeDock account"}`。
+
+`IS_TIMEDOCK` 未设置、为空或为 `N` 时保持原有文件浏览行为。其他值会导致服务拒绝启动。
+
 ## 7. 手动扫描与内存队列
 
 ### `POST /api/scans`
@@ -358,6 +378,8 @@ sleep/wake 均为幂等操作。
 - `action`：`warn`、`move` 或 `remove`，默认 `warn`；
 - `wait` 只为兼容旧请求保留；
 - owner 从登录 Cookie 获得，客户端不能指定。
+
+TimeDock 模式下，每个 `targets` 路径都必须位于当前用户匹配到的账户目录内；直接构造请求不能绕过文件浏览器的目录限制。
 
 响应：
 
@@ -439,19 +461,21 @@ ClamAV 扫描全局串行。每次选择下一任务时：
 cron 配置实际结构：
 
 ```text
-分钟 小时 日期 月份 星期 "扫描路径" action owner
+分钟 小时 日期 月份 星期 "扫描路径" action owner wake
 ```
 
 例如：
 
 ```text
-30 3 * * * /scan warn alice
-0 */6 * * * "/scan/Team A" move alice
+30 3 * * * /scan warn alice N
+0 */6 * * * "/scan/Team A" move alice Y
 ```
+
+`wake` 只能为 `Y` 或 `N`。`Y` 表示执行该规则时向 `scan_once.sh` 附加 `--wake`，在扫描前唤醒睡眠状态的 ClamAV；`N` 表示不主动唤醒。
 
 ### `GET /api/cron/rules`
 
-只返回当前用户规则。owner 不由 API 输出，也不能由客户端修改。
+只返回当前用户规则。owner 不由 API 输出，也不能由客户端修改。响应中的 `wake` 为布尔值。
 
 ### `POST /api/cron/rules`
 
@@ -464,15 +488,18 @@ cron 配置实际结构：
   "month": "*",
   "weekday": "*",
   "target": "/scan",
-  "action": "warn"
+  "action": "warn",
+  "wake": true
 }
 ```
 
-后端生成规则 ID，并强制将当前用户名写入 owner。
+后端生成规则 ID，并强制将当前用户名写入 owner。`wake` 为 `true` 时规则文件写入 `Y`，为 `false` 时写入 `N`。
+
+TimeDock 模式下，新增、完整更新和重新启用规则时都会校验 `target` 位于当前用户账户目录内。
 
 ### `PUT /api/cron/rules/{id}`
 
-完整更新当前用户规则。不能更新其他用户同 ID 规则。
+完整更新当前用户规则，字段结构与新增接口相同。不能更新其他用户同 ID 规则。
 
 ### `PATCH /api/cron/rules/{id}/enabled`
 
@@ -507,6 +534,8 @@ cron 配置实际结构：
 ```
 
 后端写入当前用户名，然后重新生成 SHA-256 allow-list 并让 ClamAV reload。
+
+TimeDock 模式下，新增和删除请求中的路径都必须位于当前用户账户目录内。
 
 ### `DELETE /api/whitelist`
 
@@ -616,7 +645,7 @@ cron 配置实际结构：
 
 ### `POST /api/quarantine/recover/{filename}`
 
-恢复前验证 owner。原路径已经存在时拒绝覆盖；跨文件系统时使用复制、保留权限、删除隔离文件的回退流程。
+恢复前验证 owner。TimeDock 模式下，元数据中的原路径还必须位于用户当前绑定的账户目录内；即使文件来自该用户此前绑定的账户目录，也不会恢复到当前授权范围之外。原路径已经存在时拒绝覆盖；跨文件系统时使用复制、保留权限、删除隔离文件的回退流程。
 
 ### `POST /api/quarantine/clean`
 

@@ -86,12 +86,19 @@ reload_cron() {
         escaped_action="$(printf "%s" "$CRON_ACTION" | sed "s/'/'\\\\''/g")"
         escaped_user="$(printf "%s" "$CRON_USER" | sed "s/'/'\\\\''/g")"
 
-        printf "%s %s %s %s %s root '%s' --type cron -u '%s' --target '%s' --action '%s' --wait\n" \
+        # The wake column is deliberately rendered as a fixed flag rather than
+        # interpolated shell input, so configuration values cannot add options.
+        wake_flag=""
+        if [ "$CRON_WAKE" = "Y" ]; then
+            wake_flag=" --wake"
+        fi
+
+        printf "%s %s %s %s %s root '%s' --type cron -u '%s' --target '%s' --action '%s' --wait%s\n" \
             "$CRON_MINUTE" "$CRON_HOUR" "$CRON_DAY" "$CRON_MONTH" "$CRON_WEEKDAY" \
-            "$escaped_scan_script" "$escaped_user" "$escaped_target" "$escaped_action" \
+            "$escaped_scan_script" "$escaped_user" "$escaped_target" "$escaped_action" "$wake_flag" \
             >> "$CRON_FILE"
 
-        log_line "$CRON_LOG_FILE" "[INFO] Registered cron scan: $CRON_MINUTE $CRON_HOUR $CRON_DAY $CRON_MONTH $CRON_WEEKDAY -> $CRON_TARGET [$CRON_ACTION] owner=$CRON_USER"
+        log_line "$CRON_LOG_FILE" "[INFO] Registered cron scan: $CRON_MINUTE $CRON_HOUR $CRON_DAY $CRON_MONTH $CRON_WEEKDAY -> $CRON_TARGET [$CRON_ACTION] owner=$CRON_USER wake=$CRON_WAKE"
     done < "$CRON_CONFIG_FILE"
 
     chmod 0644 "$CRON_FILE"

@@ -81,7 +81,7 @@ func (s *server) updateWhitelist(w http.ResponseWriter, r *http.Request, add boo
 		writeWhitelistStatus(w, http.StatusBadRequest, "failed", "", err)
 		return
 	}
-	target, err := s.prepareWhitelistPath(req.Path)
+	target, err := s.prepareWhitelistPath(req.Path, who)
 	if err != nil {
 		writeWhitelistStatus(w, http.StatusBadRequest, "failed", "", err)
 		return
@@ -177,12 +177,16 @@ func parseWhitelistOwnedLine(line string) (string, string, bool) {
 	return fields[0], fields[1], true
 }
 
-func (s *server) prepareWhitelistPath(input string) (string, error) {
+func (s *server) prepareWhitelistPath(input string, actors ...actor) (string, error) {
 	target := strings.TrimSpace(input)
 	if target == "" {
 		return "", errors.New("path is required")
 	}
-	target, err := s.safePath(target)
+	who := actor{}
+	if len(actors) > 0 {
+		who = actors[0]
+	}
+	target, err := s.safePathForActor(target, who)
 	if err != nil {
 		return "", err
 	}
