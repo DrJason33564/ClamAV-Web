@@ -11,7 +11,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-func openDatabase(path string) (*sql.DB, error) {
+type databaseSchema func(context.Context, *sql.DB) error
+
+func openSQLiteDatabase(path string, initialize databaseSchema) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
@@ -22,8 +24,8 @@ func openDatabase(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	// SQLite has a single writer. A small connection pool plus WAL keeps API
-	// reads responsive while the history indexer performs short transactions.
+	// Each SQLite file has a single writer. A small connection pool plus WAL
+	// keeps concurrent API reads responsive during short write transactions.
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
 	db.SetConnMaxLifetime(0)
@@ -40,14 +42,22 @@ func openDatabase(path string) (*sql.DB, error) {
 			return nil, fmt.Errorf("initialize sqlite: %w", err)
 		}
 	}
-	if err := migrateDatabase(ctx, db); err != nil {
+	if err := initialize(ctx, db); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return db, nil
 }
 
-func migrateDatabase(ctx context.Context, db *sql.DB) error {
+func openUserDatabase(path string) (*sql.DB, error) {
+	return openSQLiteDatabase(path, initializeUserDatabase)
+}
+
+func openHistoryDatabase(path string) (*sql.DB, error) {
+	return openSQLiteDatabase(path, initializeHistoryDatabase)
+}
+
+func initializeUserDatabase(ctx context.Context, db *sql.DB) error {
 	const schema = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -73,6 +83,20 @@ CREATE TABLE IF NOT EXISTS sessions (
     absolute_expires_at INTEGER NOT NULL,
     revoked_at INTEGER
 );
+CREATE INDEX IF NOT EXISTS sessions_token_active ON sessions(token_hash, revoked_at, absolute_expires_at);
+INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, unixepoch());`
+	if _, err := db.ExecContext(ctx, schema); err != nil {
+		return fmt.Errorf("initialize user database: %w", err)
+	}
+	return nil
+}
+
+func initializeHistoryDatabase(ctx context.Context, db *sql.DB) error {
+	const schema = `
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS history_jobs (
     job_id TEXT PRIMARY KEY,
     job_type TEXT NOT NULL CHECK(job_type IN ('manual','cron')),
@@ -87,10 +111,9 @@ CREATE TABLE IF NOT EXISTS history_jobs (
     indexed_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS history_jobs_user_started ON history_jobs(user, started_at DESC, job_id DESC);
-CREATE INDEX IF NOT EXISTS sessions_token_active ON sessions(token_hash, revoked_at, absolute_expires_at);
 INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, unixepoch());`
 	if _, err := db.ExecContext(ctx, schema); err != nil {
-		return fmt.Errorf("migrate sqlite database: %w", err)
+		return fmt.Errorf("initialize history database: %w", err)
 	}
 	return nil
 }

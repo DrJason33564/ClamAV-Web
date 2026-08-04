@@ -161,7 +161,7 @@ func (s *server) authenticateRequest(r *http.Request) (actor, error) {
 	now := time.Now().Unix()
 	var who actor
 	var sessionID, lastSeen, absoluteExpires int64
-	err = s.db.QueryRowContext(r.Context(), `
+	err = s.userDB.QueryRowContext(r.Context(), `
 SELECT s.id, u.id, u.username, u.role, u.timedock_account, s.last_seen_at, s.absolute_expires_at
 FROM sessions s JOIN users u ON u.id=s.user_id
 WHERE s.token_hash=? AND s.revoked_at IS NULL AND s.idle_expires_at>? AND s.absolute_expires_at>?
@@ -174,7 +174,7 @@ WHERE s.token_hash=? AND s.revoked_at IS NULL AND s.idle_expires_at>? AND s.abso
 		if idleExpires > absoluteExpires {
 			idleExpires = absoluteExpires
 		}
-		_, _ = s.db.ExecContext(r.Context(), "UPDATE sessions SET last_seen_at=?, idle_expires_at=? WHERE id=?", now, idleExpires, sessionID)
+		_, _ = s.userDB.ExecContext(r.Context(), "UPDATE sessions SET last_seen_at=?, idle_expires_at=? WHERE id=?", now, idleExpires, sessionID)
 	}
 	return who, nil
 }
@@ -200,7 +200,7 @@ func (s *server) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tx, err := s.db.BeginTx(r.Context(), &sql.TxOptions{Isolation: sql.LevelSerializable})
+	tx, err := s.userDB.BeginTx(r.Context(), &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -274,7 +274,7 @@ func (s *server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	var id int64
 	var username, role, status string
 	var passwordHash sql.NullString
-	err := s.db.QueryRowContext(r.Context(), "SELECT id,username,password_hash,role,status FROM users WHERE username=?", req.Username).Scan(&id, &username, &passwordHash, &role, &status)
+	err := s.userDB.QueryRowContext(r.Context(), "SELECT id,username,password_hash,role,status FROM users WHERE username=?", req.Username).Scan(&id, &username, &passwordHash, &role, &status)
 	valid := err == nil && status == "active" && passwordHash.Valid && verifyPassword(req.Password, passwordHash.String)
 	if err != nil || !passwordHash.Valid {
 		// Keep unknown users and passwordless users close to the normal timing path.
@@ -292,7 +292,7 @@ func (s *server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
-	if _, err := s.db.ExecContext(r.Context(), `INSERT INTO sessions(token_hash,user_id,created_at,last_seen_at,idle_expires_at,absolute_expires_at) VALUES(?,?,?,?,?,?)`, tokenHash, id, now.Unix(), now.Unix(), now.Add(sessionIdleTTL).Unix(), now.Add(sessionAbsoluteTTL).Unix()); err != nil {
+	if _, err := s.userDB.ExecContext(r.Context(), `INSERT INTO sessions(token_hash,user_id,created_at,last_seen_at,idle_expires_at,absolute_expires_at) VALUES(?,?,?,?,?,?)`, tokenHash, id, now.Unix(), now.Unix(), now.Add(sessionIdleTTL).Unix(), now.Add(sessionAbsoluteTTL).Unix()); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -345,7 +345,7 @@ func (s *server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	if cookie, err := r.Cookie(sessionCookieName); err == nil {
 		hash := sha256.Sum256([]byte(cookie.Value))
-		_, _ = s.db.ExecContext(r.Context(), "UPDATE sessions SET revoked_at=? WHERE token_hash=?", time.Now().Unix(), hash[:])
+		_, _ = s.userDB.ExecContext(r.Context(), "UPDATE sessions SET revoked_at=? WHERE token_hash=?", time.Now().Unix(), hash[:])
 	}
 	clearSessionCookie(w, r)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "success"})
@@ -392,7 +392,7 @@ func (s *server) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var current string
-	if err := s.db.QueryRowContext(r.Context(), "SELECT password_hash FROM users WHERE id=?", who.ID).Scan(&current); err != nil || !verifyPassword(req.CurrentPassword, current) {
+	if err := s.userDB.QueryRowContext(r.Context(), "SELECT password_hash FROM users WHERE id=?", who.ID).Scan(&current); err != nil || !verifyPassword(req.CurrentPassword, current) {
 		writeError(w, http.StatusUnauthorized, errors.New("current password is incorrect"))
 		return
 	}
@@ -402,7 +402,7 @@ func (s *server) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().Unix()
-	tx, err := s.db.BeginTx(r.Context(), nil)
+	tx, err := s.userDB.BeginTx(r.Context(), nil)
 	if err == nil {
 		_, err = tx.ExecContext(r.Context(), "UPDATE users SET password_hash=?,updated_at=? WHERE id=?", next, now, who.ID)
 	}
@@ -501,7 +501,7 @@ func (s *server) runSessionJanitor(ctx context.Context) {
 			// Keep recently revoked rows briefly for operational diagnosis, but
 			// expired credentials do not need to grow the database indefinitely.
 			cutoff := now.Add(-24 * time.Hour).Unix()
-			_, _ = s.db.ExecContext(ctx, `DELETE FROM sessions
+			_, _ = s.userDB.ExecContext(ctx, `DELETE FROM sessions
 WHERE absolute_expires_at<? OR idle_expires_at<? OR (revoked_at IS NOT NULL AND revoked_at<?)`, now.Unix(), now.Unix(), cutoff)
 		}
 	}

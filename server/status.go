@@ -73,9 +73,9 @@ func (s *server) enrichStatusSource(source any, usernames ...string) {
 		}
 	}
 	jobID, _ := scan["last_job_id"].(string)
-	if s.db != nil && username != "" {
+	if s.historyDB != nil && username != "" {
 		var status, result string
-		err := s.db.QueryRow("SELECT job_id,status,result FROM history_jobs WHERE user=? ORDER BY started_at DESC,job_id DESC LIMIT 1", username).Scan(&jobID, &status, &result)
+		err := s.historyDB.QueryRow("SELECT job_id,status,result FROM history_jobs WHERE user=? ORDER BY started_at DESC,job_id DESC LIMIT 1", username).Scan(&jobID, &status, &result)
 		if err != nil {
 			scan["last_job_id"] = nil
 			scan["last_job_status"] = nil

@@ -493,13 +493,13 @@ func TestReadResultLogItems(t *testing.T) {
 		}
 	}
 
-	db, err := openDatabase(filepath.Join(tmp, "test.db"))
+	historyDB, err := openHistoryDatabase(filepath.Join(tmp, "history.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
-	s := &server{cfg: config{JobsDir: tmp}, db: db}
-	s.history = &historyIndexer{db: db, jobsDir: tmp}
+	defer historyDB.Close()
+	s := &server{cfg: config{JobsDir: tmp}, historyDB: historyDB}
+	s.history = &historyIndexer{db: historyDB, jobsDir: tmp}
 	if err := s.history.refresh(t.Context()); err != nil {
 		t.Fatal(err)
 	}

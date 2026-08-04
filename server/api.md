@@ -670,7 +670,8 @@ TimeDock 模式下，新增和删除请求中的路径都必须位于当前用�
 
 | 路径 | 用途 |
 |---|---|
-| `/data/clamavweb.db` | 用户、session、历史任务索引 |
+| `/data/users.db` | 用户、密码哈希和 session |
+| `/data/history.db` | 历史任务索引 |
 | `/config/clamavweb.conf` | 服务端配置 |
 | `/config/cron_scan.conf` | 所有用户 cron 规则 |
 | `/config/exclude.conf` | 所有用户白名单条目 |
@@ -678,4 +679,4 @@ TimeDock 模式下，新增和删除请求中的路径都必须位于当前用�
 | `/log/*.log` | 扫描和检出日志 |
 | `/quarantine/*` | 隔离文件及 owner 元数据 |
 
-`/data`、`/config`、`/state`、`/log` 和 `/quarantine` 都应持久化。SQLite 历史索引可以从 version 2 JSON 重建，但用户和 session 只能从 `/data/clamavweb.db` 恢复。
+`/data`、`/config`、`/state`、`/log` 和 `/quarantine` 都应持久化。`USER_DATABASE_FILE` 和 `HISTORY_DATABASE_FILE` 可分别覆盖两个数据库路径。历史索引库可以从 version 2 JSON 重建，但用户和 session 只能从用户库恢复。

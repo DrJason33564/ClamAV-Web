@@ -27,7 +27,8 @@ type server struct {
 	clamavPowerMu     sync.Mutex
 	configFileMu      sync.Mutex
 	accountDeleteMu   sync.Mutex
-	db                *sql.DB
+	userDB            *sql.DB
+	historyDB         *sql.DB
 	appConfig         *appConfigStore
 	history           *historyIndexer
 	loginMu           sync.Mutex
@@ -43,21 +44,27 @@ func main() {
 	if err != nil {
 		log.Fatalf("load server config: %v", err)
 	}
-	db, err := openDatabase(cfg.DatabaseFile)
+	userDB, err := openUserDatabase(cfg.UserDatabaseFile)
 	if err != nil {
-		log.Fatalf("open database: %v", err)
+		log.Fatalf("open user database: %v", err)
 	}
-	defer db.Close()
+	defer userDB.Close()
+	historyDB, err := openHistoryDatabase(cfg.HistoryDatabaseFile)
+	if err != nil {
+		log.Fatalf("open history database: %v", err)
+	}
+	defer historyDB.Close()
 	s := &server{
 		cfg:               cfg,
 		batches:           make(map[string]*scanBatch),
 		resultLookups:     make(map[string]*resultLookup),
 		quarantineLookups: make(map[string]*quarantineLookup),
-		db:                db,
+		userDB:            userDB,
+		historyDB:         historyDB,
 		appConfig:         appConfig,
 		loginAttempts:     make(map[string]loginAttempt),
 	}
-	s.history = &historyIndexer{db: db, jobsDir: cfg.JobsDir}
+	s.history = &historyIndexer{db: historyDB, jobsDir: cfg.JobsDir}
 	if err := s.history.refresh(context.Background()); err != nil {
 		log.Printf("initial history index refresh failed: %v", err)
 	}

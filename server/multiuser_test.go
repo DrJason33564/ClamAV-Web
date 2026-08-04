@@ -13,18 +13,24 @@ import (
 func newDatabaseTestServer(t *testing.T) *server {
 	t.Helper()
 	tmp := t.TempDir()
-	db, err := openDatabase(filepath.Join(tmp, "data", "clamavweb.db"))
+	userDB, err := openUserDatabase(filepath.Join(tmp, "data", "users.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() { _ = userDB.Close() })
+	historyDB, err := openHistoryDatabase(filepath.Join(tmp, "data", "history.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = historyDB.Close() })
 	app, err := newAppConfigStore(filepath.Join(tmp, "config", "clamavweb.conf"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	s := &server{
 		cfg:               config{JobsDir: filepath.Join(tmp, "jobs"), LogDir: filepath.Join(tmp, "log")},
-		db:                db,
+		userDB:            userDB,
+		historyDB:         historyDB,
 		appConfig:         app,
 		batches:           map[string]*scanBatch{},
 		resultLookups:     map[string]*resultLookup{},
@@ -33,7 +39,7 @@ func newDatabaseTestServer(t *testing.T) *server {
 	if err := os.MkdirAll(s.cfg.JobsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	s.history = &historyIndexer{db: db, jobsDir: s.cfg.JobsDir}
+	s.history = &historyIndexer{db: historyDB, jobsDir: s.cfg.JobsDir}
 	return s
 }
 
@@ -45,10 +51,10 @@ func TestFirstRegistrationCreatesAdminAndCookieLogin(t *testing.T) {
 		t.Fatalf("register failed: %d %s", register.Code, register.Body.String())
 	}
 	var role string
-	if err := s.db.QueryRow("SELECT role FROM users WHERE username='alice'").Scan(&role); err != nil || role != "admin" {
+	if err := s.userDB.QueryRow("SELECT role FROM users WHERE username='alice'").Scan(&role); err != nil || role != "admin" {
 		t.Fatalf("expected first user to be admin, role=%q err=%v", role, err)
 	}
-	if _, err := s.db.Exec("UPDATE users SET timedock_account='Jason' WHERE username='alice'"); err != nil {
+	if _, err := s.userDB.Exec("UPDATE users SET timedock_account='Jason' WHERE username='alice'"); err != nil {
 		t.Fatal(err)
 	}
 	login := httptest.NewRecorder()

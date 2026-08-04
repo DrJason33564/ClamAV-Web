@@ -50,7 +50,7 @@ func TestNormalizeTimeDockAccount(t *testing.T) {
 func TestUserSchemaAndAdminTimeDockAccount(t *testing.T) {
 	s := newDatabaseTestServer(t)
 	now := time.Now().Unix()
-	if _, err := s.db.Exec(`INSERT INTO users(username,password_hash,role,created_at,updated_at) VALUES('alice',NULL,'admin',?,?)`, now, now); err != nil {
+	if _, err := s.userDB.Exec(`INSERT INTO users(username,password_hash,role,created_at,updated_at) VALUES('alice',NULL,'admin',?,?)`, now, now); err != nil {
 		t.Fatal(err)
 	}
 
@@ -62,7 +62,7 @@ func TestUserSchemaAndAdminTimeDockAccount(t *testing.T) {
 		t.Fatalf("patch failed: %d %s", response.Code, response.Body.String())
 	}
 	var stored string
-	if err := s.db.QueryRow("SELECT timedock_account FROM users WHERE username='alice'").Scan(&stored); err != nil || stored != "杰森30" {
+	if err := s.userDB.QueryRow("SELECT timedock_account FROM users WHERE username='alice'").Scan(&stored); err != nil || stored != "杰森30" {
 		t.Fatalf("unexpected stored account %q err=%v", stored, err)
 	}
 
@@ -104,7 +104,7 @@ func TestAdminCreateUserSetsTimeDockAccountAndListResult(t *testing.T) {
 		t.Fatalf("unexpected users list: %d %s", listResponse.Code, listResponse.Body.String())
 	}
 	var stored string
-	if err := s.db.QueryRow("SELECT timedock_account FROM users WHERE username='bob'").Scan(&stored); err != nil || stored != "鲍勃30" {
+	if err := s.userDB.QueryRow("SELECT timedock_account FROM users WHERE username='bob'").Scan(&stored); err != nil || stored != "鲍勃30" {
 		t.Fatalf("unexpected stored account %q err=%v", stored, err)
 	}
 }

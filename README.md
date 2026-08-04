@@ -186,6 +186,8 @@ WebUI 在增删信任条目后会自动更新 allow-list 并让 ClamAV 重新加
 | `SCANNER_ADDR` | `:8080` | Web 服务监听地址 |
 | `SCANNER_COOKIE_SECURE` | `false` | HTTPS 反向代理部署时设为 `true`，为登录 Cookie 添加 `Secure` |
 | `IS_TIMEDOCK` | `N` | `Y` 时按用户的 TimeDock 账户限制 `/scan` 设备目录浏览及路径提交；只接受 `Y` 或 `N` |
+| `USER_DATABASE_FILE` | `/data/users.db` | 用户、密码哈希和登录 session 数据库路径 |
+| `HISTORY_DATABASE_FILE` | `/data/history.db` | 扫描历史索引数据库路径 |
 | `TZ` | 镜像默认值 | 页面时间和定时任务使用的时区 |
 | `SCAN_LOG_MAX_BYTES` | `5242880` | 单个日志的轮转阈值，单位为字节 |
 | `SCAN_WAIT_INTERVAL` | `30` | 定时任务等待扫描锁的重试间隔，单位为秒 |

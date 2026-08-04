@@ -9,29 +9,30 @@ import (
 )
 
 type config struct {
-	Addr           string
-	StatusFile     string
-	JobsDir        string
-	ScanLockDir    string
-	SleepLockDir   string
-	LogDir         string
-	QuarantineDir  string
-	ScanScript     string
-	StartupScript  string
-	CronConfigFile string
-	CronScript     string
-	ExcludeConfig  string
-	ExcludeScript  string
-	ClamdConf      string
-	ClamdSocket    string
-	BrowseRoots    []string
-	MaxLogBytes    int64
-	CommandTimout  time.Duration
-	WakeTimeout    time.Duration
-	DataDir        string
-	DatabaseFile   string
-	AppConfigFile  string
-	IsTimeDock     bool
+	Addr                string
+	StatusFile          string
+	JobsDir             string
+	ScanLockDir         string
+	SleepLockDir        string
+	LogDir              string
+	QuarantineDir       string
+	ScanScript          string
+	StartupScript       string
+	CronConfigFile      string
+	CronScript          string
+	ExcludeConfig       string
+	ExcludeScript       string
+	ClamdConf           string
+	ClamdSocket         string
+	BrowseRoots         []string
+	MaxLogBytes         int64
+	CommandTimout       time.Duration
+	WakeTimeout         time.Duration
+	DataDir             string
+	UserDatabaseFile    string
+	HistoryDatabaseFile string
+	AppConfigFile       string
+	IsTimeDock          bool
 }
 
 func loadConfig() (config, error) {
@@ -63,11 +64,12 @@ func loadConfig() (config, error) {
 		// startup.sh waits up to 20 minutes (240 attempts * 5 seconds).
 		// Keep the caller alive slightly longer so the script owns the timeout
 		// and can terminate a partially started /init process itself.
-		WakeTimeout:   21 * time.Minute,
-		DataDir:       dataDir,
-		DatabaseFile:  env("DATABASE_FILE", filepath.Join(dataDir, "clamavweb.db")),
-		AppConfigFile: env("CLAMAVWEB_CONFIG_FILE", "/config/clamavweb.conf"),
-		IsTimeDock:    isTimeDock,
+		WakeTimeout:         21 * time.Minute,
+		DataDir:             dataDir,
+		UserDatabaseFile:    env("USER_DATABASE_FILE", filepath.Join(dataDir, "users.db")),
+		HistoryDatabaseFile: env("HISTORY_DATABASE_FILE", filepath.Join(dataDir, "history.db")),
+		AppConfigFile:       env("CLAMAVWEB_CONFIG_FILE", "/config/clamavweb.conf"),
+		IsTimeDock:          isTimeDock,
 	}, nil
 }
 

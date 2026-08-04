@@ -87,7 +87,7 @@ func (s *server) cleanUserResults(ctx context.Context, username string) (int, er
 	if s.history != nil {
 		_ = s.history.refresh(ctx)
 	}
-	rows, err := s.db.QueryContext(ctx, "SELECT job_id,json_file FROM history_jobs WHERE user=?", username)
+	rows, err := s.historyDB.QueryContext(ctx, "SELECT job_id,json_file FROM history_jobs WHERE user=?", username)
 	if err != nil {
 		return 0, err
 	}
@@ -112,7 +112,7 @@ func (s *server) cleanUserResults(ctx context.Context, username string) (int, er
 			}
 		}
 	}
-	if _, err := s.db.ExecContext(ctx, "DELETE FROM history_jobs WHERE user=?", username); err != nil {
+	if _, err := s.historyDB.ExecContext(ctx, "DELETE FROM history_jobs WHERE user=?", username); err != nil {
 		return deleted, err
 	}
 	return deleted, nil
@@ -149,7 +149,7 @@ func (s *server) cleanDeleteUser(ctx context.Context, username string) error {
 	defer s.accountDeleteMu.Unlock()
 	var id int64
 	var role, status string
-	if err := s.db.QueryRowContext(ctx, "SELECT id,role,status FROM users WHERE username=?", username).Scan(&id, &role, &status); err != nil {
+	if err := s.userDB.QueryRowContext(ctx, "SELECT id,role,status FROM users WHERE username=?", username).Scan(&id, &role, &status); err != nil {
 		return err
 	}
 	if role == "admin" && status == "active" {
@@ -162,7 +162,7 @@ func (s *server) cleanDeleteUser(ctx context.Context, username string) error {
 	if s.history != nil {
 		_ = s.history.refresh(ctx)
 		var activeJobs int
-		if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM history_jobs WHERE user=? AND status IN ('waiting','running')", username).Scan(&activeJobs); err != nil {
+		if err := s.historyDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM history_jobs WHERE user=? AND status IN ('waiting','running')", username).Scan(&activeJobs); err != nil {
 			return err
 		}
 		if activeJobs > 0 {
@@ -185,10 +185,10 @@ func (s *server) cleanDeleteUser(ctx context.Context, username string) error {
 	s.queuedBatchIDs = kept
 	s.mu.Unlock()
 	now := time.Now().Unix()
-	if _, err := s.db.ExecContext(ctx, "UPDATE users SET status='deleting',updated_at=? WHERE id=?", now, id); err != nil {
+	if _, err := s.userDB.ExecContext(ctx, "UPDATE users SET status='deleting',updated_at=? WHERE id=?", now, id); err != nil {
 		return err
 	}
-	_, _ = s.db.ExecContext(ctx, "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL", now, id)
+	_, _ = s.userDB.ExecContext(ctx, "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL", now, id)
 	s.resultMu.Lock()
 	for lookupID, lookup := range s.resultLookups {
 		if lookup.User == username {
@@ -215,7 +215,7 @@ func (s *server) cleanDeleteUser(ctx context.Context, username string) error {
 	if _, err := s.cleanUserResults(ctx, username); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, "DELETE FROM users WHERE id=?", id)
+	_, err := s.userDB.ExecContext(ctx, "DELETE FROM users WHERE id=?", id)
 	return err
 }
 

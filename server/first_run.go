@@ -27,7 +27,7 @@ func (s *server) handleFirstRunComplete(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var count int
-	if err := s.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM users WHERE role='admin' AND status='active'").Scan(&count); err != nil {
+	if err := s.userDB.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM users WHERE role='admin' AND status='active'").Scan(&count); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

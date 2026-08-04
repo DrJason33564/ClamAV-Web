@@ -22,7 +22,7 @@ func (s *server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	rows, err := s.db.QueryContext(r.Context(), "SELECT username,role,status,timedock_account,password_hash,created_at,updated_at FROM users ORDER BY username")
+	rows, err := s.userDB.QueryContext(r.Context(), "SELECT username,role,status,timedock_account,password_hash,created_at,updated_at FROM users ORDER BY username")
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -81,7 +81,7 @@ func (s *server) patchAdminUser(w http.ResponseWriter, r *http.Request, who acto
 	var role, status, timeDockAccount string
 	timeDockAccountChanged := false
 	var password sql.NullString
-	if err := s.db.QueryRowContext(r.Context(), "SELECT id,role,status,timedock_account,password_hash FROM users WHERE username=?", username).Scan(&id, &role, &status, &timeDockAccount, &password); err != nil {
+	if err := s.userDB.QueryRowContext(r.Context(), "SELECT id,role,status,timedock_account,password_hash FROM users WHERE username=?", username).Scan(&id, &role, &status, &timeDockAccount, &password); err != nil {
 		writeError(w, http.StatusNotFound, errors.New("user not found"))
 		return
 	}
@@ -135,12 +135,12 @@ func (s *server) patchAdminUser(w http.ResponseWriter, r *http.Request, who acto
 		}
 	}
 	now := time.Now().Unix()
-	if _, err := s.db.ExecContext(r.Context(), "UPDATE users SET role=?,status=?,timedock_account=?,password_hash=?,updated_at=? WHERE id=?", role, status, timeDockAccount, password, now, id); err != nil {
+	if _, err := s.userDB.ExecContext(r.Context(), "UPDATE users SET role=?,status=?,timedock_account=?,password_hash=?,updated_at=? WHERE id=?", role, status, timeDockAccount, password, now, id); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if status == "disabled" || req.Password != nil {
-		_, _ = s.db.ExecContext(r.Context(), "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL", now, id)
+		_, _ = s.userDB.ExecContext(r.Context(), "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL", now, id)
 	}
 	if status == "disabled" {
 		// Disabled accounts must not retain unattended scheduled execution.
@@ -172,7 +172,7 @@ func (s *server) handleAuthAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var hash string
-	if err := s.db.QueryRowContext(r.Context(), "SELECT password_hash FROM users WHERE id=?", who.ID).Scan(&hash); err != nil || !verifyPassword(req.Password, hash) {
+	if err := s.userDB.QueryRowContext(r.Context(), "SELECT password_hash FROM users WHERE id=?", who.ID).Scan(&hash); err != nil || !verifyPassword(req.Password, hash) {
 		writeError(w, http.StatusUnauthorized, errors.New("password is incorrect"))
 		return
 	}
@@ -186,7 +186,7 @@ func (s *server) handleAuthAccount(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) isLastActiveAdmin(ctx context.Context, username string) (bool, error) {
 	var count int
-	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM users WHERE role='admin' AND status='active' AND username<>?", username).Scan(&count)
+	err := s.userDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM users WHERE role='admin' AND status='active' AND username<>?", username).Scan(&count)
 	return count == 0, err
 }
 

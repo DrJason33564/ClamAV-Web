@@ -166,7 +166,7 @@ func (s *server) runResultLookup(id string) {
 
 func (s *server) readResultLogItems(scope resultScope, username string) ([]resultLogItem, int, error) {
 	var total int
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM history_jobs WHERE user=?", username).Scan(&total); err != nil {
+	if err := s.historyDB.QueryRow("SELECT COUNT(*) FROM history_jobs WHERE user=?", username).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	query := "SELECT job_id,job_type,started_at,result FROM history_jobs WHERE user=? ORDER BY started_at DESC,job_id DESC"
@@ -175,7 +175,7 @@ func (s *server) readResultLogItems(scope resultScope, username string) ([]resul
 		query += " LIMIT ? OFFSET ?"
 		args = append(args, scope.End-scope.Start+1, scope.Start-1)
 	}
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.historyDB.Query(query, args...)
 	if err != nil {
 		return nil, total, err
 	}
@@ -301,7 +301,7 @@ func (s *server) readDetectionResult(jobID string, usernames ...string) (*detect
 	if len(usernames) > 0 {
 		username := usernames[0]
 		var jsonFile string
-		if err := s.db.QueryRow("SELECT json_file FROM history_jobs WHERE job_id=? AND user=?", jobID, username).Scan(&jsonFile); err != nil {
+		if err := s.historyDB.QueryRow("SELECT json_file FROM history_jobs WHERE job_id=? AND user=?", jobID, username).Scan(&jsonFile); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil, nil
 			}
