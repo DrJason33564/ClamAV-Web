@@ -118,7 +118,8 @@ WEB_FIRSTRUN_COMPLETED=2
 {
   "username": "alice",
   "password": "a sufficiently long password",
-  "role": "user"
+  "role": "user",
+  "timedock_account": "Alice30"
 }
 ```
 
@@ -136,6 +137,7 @@ WEB_FIRSTRUN_COMPLETED=2
   "status": "success",
   "username": "alice",
   "role": "user",
+  "timedock_account": "Alice30",
   "password_set": true
 }
 ```
@@ -216,12 +218,14 @@ WEB_FIRSTRUN_COMPLETED=2
 
 ```json
 {
+  "status": "success",
   "users": [
     {
       "username": "alice",
       "role": "user",
       "status": "active",
       "timedock_account": "Jason",
+      "password_set": true,
       "created_at": 1783433000,
       "updated_at": 1783433000
     }
@@ -229,11 +233,22 @@ WEB_FIRSTRUN_COMPLETED=2
 }
 ```
 
-`timedock_account` 可为空。TimeDock 模式下为空的用户不能浏览或提交扫描路径。
+响应顶层包含 `"status":"success"`。`password_set` 只表示账户当前是否设置了密码，不返回密码哈希。`timedock_account` 可为空；TimeDock 模式下为空的用户不能浏览或提交扫描路径。
 
 ### `POST /api/admin/users`
 
 与非首次运行时的 `POST /api/auth/register` 相同。建议管理端使用本路径。
+
+```json
+{
+  "username": "bob",
+  "password": "a sufficiently long password",
+  "role": "user",
+  "timedock_account": "Bob30"
+}
+```
+
+`timedock_account` 可省略或设为空字符串，并使用与 PATCH 相同的校验规则。创建成功响应会返回 `timedock_account` 和 `password_set`。
 
 ### `PATCH /api/admin/users/{username}`
 

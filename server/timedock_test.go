@@ -75,6 +75,40 @@ func TestUserSchemaAndAdminTimeDockAccount(t *testing.T) {
 	}
 }
 
+func TestAdminCreateUserSetsTimeDockAccountAndListResult(t *testing.T) {
+	s := newDatabaseTestServer(t)
+	register := httptest.NewRecorder()
+	s.handleAuthRegister(register, httptest.NewRequest(http.MethodPost, "/api/auth/register", strings.NewReader(`{"username":"admin","password":"correct horse battery staple"}`)))
+	if register.Code != http.StatusCreated {
+		t.Fatalf("admin registration failed: %d %s", register.Code, register.Body.String())
+	}
+	login := httptest.NewRecorder()
+	s.handleAuthLogin(login, httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"username":"admin","password":"correct horse battery staple"}`)))
+	if login.Code != http.StatusOK || len(login.Result().Cookies()) != 1 {
+		t.Fatalf("admin login failed: %d %s", login.Code, login.Body.String())
+	}
+
+	createRequest := httptest.NewRequest(http.MethodPost, "/api/admin/users", strings.NewReader(`{"username":"bob","password":"another secure password","role":"user","timedock_account":"鲍勃30"}`))
+	createRequest.AddCookie(login.Result().Cookies()[0])
+	createResponse := httptest.NewRecorder()
+	s.requireAuth(http.HandlerFunc(s.handleAdminUsers)).ServeHTTP(createResponse, createRequest)
+	if createResponse.Code != http.StatusCreated || !strings.Contains(createResponse.Body.String(), `"timedock_account":"鲍勃30"`) || !strings.Contains(createResponse.Body.String(), `"password_set":true`) {
+		t.Fatalf("user creation failed: %d %s", createResponse.Code, createResponse.Body.String())
+	}
+
+	listRequest := httptest.NewRequest(http.MethodGet, "/api/admin/users", nil)
+	listRequest.AddCookie(login.Result().Cookies()[0])
+	listResponse := httptest.NewRecorder()
+	s.requireAuth(http.HandlerFunc(s.handleAdminUsers)).ServeHTTP(listResponse, listRequest)
+	if listResponse.Code != http.StatusOK || !strings.Contains(listResponse.Body.String(), `"status":"success"`) || !strings.Contains(listResponse.Body.String(), `"password_set":true`) {
+		t.Fatalf("unexpected users list: %d %s", listResponse.Code, listResponse.Body.String())
+	}
+	var stored string
+	if err := s.db.QueryRow("SELECT timedock_account FROM users WHERE username='bob'").Scan(&stored); err != nil || stored != "鲍勃30" {
+		t.Fatalf("unexpected stored account %q err=%v", stored, err)
+	}
+}
+
 func TestTimeDockBrowseKeepsDeviceLevelAndFiltersAccounts(t *testing.T) {
 	root := makeTimeDockTree(t)
 	s := &server{cfg: config{BrowseRoots: []string{root}, IsTimeDock: true}}

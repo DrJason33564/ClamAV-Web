@@ -44,9 +44,10 @@ type actor struct {
 type actorContextKey struct{}
 
 type authRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-	Role     string `json:"role,omitempty"`
+	Username        string `json:"username"`
+	Password        string `json:"password"`
+	Role            string `json:"role,omitempty"`
+	TimeDockAccount string `json:"timedock_account,omitempty"`
 }
 
 type passwordRequest struct {
@@ -70,6 +71,7 @@ type userRecord struct {
 	Role            string `json:"role"`
 	Status          string `json:"status"`
 	TimeDockAccount string `json:"timedock_account"`
+	PasswordSet     bool   `json:"password_set"`
 	CreatedAt       int64  `json:"created_at"`
 	UpdatedAt       int64  `json:"updated_at"`
 }
@@ -192,6 +194,11 @@ func (s *server) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("username must use 1-64 letters, numbers, dot, underscore, or hyphen"))
 		return
 	}
+	timeDockAccount, err := normalizeTimeDockAccount(req.TimeDockAccount)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 
 	tx, err := s.db.BeginTx(r.Context(), &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
@@ -237,7 +244,7 @@ func (s *server) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().Unix()
-	if _, err := tx.ExecContext(r.Context(), `INSERT INTO users(username,password_hash,role,created_at,updated_at) VALUES(?,?,?,?,?)`, req.Username, encoded, role, now, now); err != nil {
+	if _, err := tx.ExecContext(r.Context(), `INSERT INTO users(username,password_hash,role,timedock_account,created_at,updated_at) VALUES(?,?,?,?,?,?)`, req.Username, encoded, role, timeDockAccount, now, now); err != nil {
 		writeError(w, http.StatusConflict, errors.New("username already exists"))
 		return
 	}
@@ -245,7 +252,7 @@ func (s *server) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"status": "success", "username": req.Username, "role": role, "password_set": encoded != nil})
+	writeJSON(w, http.StatusCreated, map[string]any{"status": "success", "username": req.Username, "role": role, "timedock_account": timeDockAccount, "password_set": encoded != nil})
 }
 
 func (s *server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {

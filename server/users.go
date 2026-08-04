@@ -22,7 +22,7 @@ func (s *server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	rows, err := s.db.QueryContext(r.Context(), "SELECT username,role,status,timedock_account,created_at,updated_at FROM users ORDER BY username")
+	rows, err := s.db.QueryContext(r.Context(), "SELECT username,role,status,timedock_account,password_hash,created_at,updated_at FROM users ORDER BY username")
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -31,13 +31,15 @@ func (s *server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 	users := []userRecord{}
 	for rows.Next() {
 		var item userRecord
-		if err := rows.Scan(&item.Username, &item.Role, &item.Status, &item.TimeDockAccount, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		var password sql.NullString
+		if err := rows.Scan(&item.Username, &item.Role, &item.Status, &item.TimeDockAccount, &password, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		item.PasswordSet = password.Valid && password.String != ""
 		users = append(users, item)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"users": users})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "success", "users": users})
 }
 
 func (s *server) handleAdminUser(w http.ResponseWriter, r *http.Request) {
