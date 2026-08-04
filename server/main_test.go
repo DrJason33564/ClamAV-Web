@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,64 @@ import (
 	"testing"
 	"time"
 )
+
+func TestStartScanRejectsSleepingClamAV(t *testing.T) {
+	tmp := t.TempDir()
+	sleepLock := filepath.Join(tmp, "sleep.lock")
+	if err := os.Mkdir(sleepLock, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{
+		cfg:     config{SleepLockDir: sleepLock},
+		batches: make(map[string]*scanBatch),
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/scans", strings.NewReader(`{"targets":["/scan"]}`))
+	response := httptest.NewRecorder()
+
+	s.startScan(response, req)
+
+	if response.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d", response.Code)
+	}
+	var body startScanResponse
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.ID != "" || body.Status != "failed" || body.Message != "ClamAV is sleeping." {
+		t.Fatalf("unexpected sleeping response: %#v", body)
+	}
+	if len(s.batches) != 0 || len(s.queuedBatchIDs) != 0 {
+		t.Fatalf("sleeping request entered scan queue: batches=%d queued=%d", len(s.batches), len(s.queuedBatchIDs))
+	}
+}
+
+func TestWhitelistUpdatesRejectSleepingClamAV(t *testing.T) {
+	tmp := t.TempDir()
+	sleepLock := filepath.Join(tmp, "sleep.lock")
+	if err := os.Mkdir(sleepLock, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{cfg: config{SleepLockDir: sleepLock}}
+
+	for _, method := range []string{http.MethodPost, http.MethodDelete} {
+		t.Run(method, func(t *testing.T) {
+			req := httptest.NewRequest(method, "/api/whitelist", strings.NewReader(`{"path":"/scan/example"}`))
+			response := httptest.NewRecorder()
+			s.handleWhitelist(response, req)
+
+			if response.Code != http.StatusConflict {
+				t.Fatalf("expected 409, got %d", response.Code)
+			}
+			var body map[string]any
+			if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["status"] != "failed" || body["message"] != nil || body["error"] != "ClamAV is sleeping" {
+				t.Fatalf("unexpected sleeping response: %#v", body)
+			}
+		})
+	}
+}
 
 func TestParseAccounts(t *testing.T) {
 	accounts, err := parseAccounts("admin:secret, ops:pass:with:colon;user:pw")

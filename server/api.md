@@ -79,11 +79,83 @@ curl -u admin:secret http://localhost:8080/api/status
 字段说明：
 
 - `source`：状态文件内容。如果状态文件不存在，会返回说明信息。
+- `source.clamd.status`：ClamAV 状态；休眠成功后为 `sleep`。
+- `source.clamd.message`：ClamAV 状态说明；`status` 为 `sleep` 时固定为 `clamd is sleeping.`。
 - `source.scan.last_job_status`：后端根据 `source.scan.last_job_id` 读取 `/state/jobs/<last_job_id>.json` 后补充，可能为 `running`、`finished`、`failed` 或 `null`。
 - `source.scan.last_job_result`：后端根据同一 job 状态文件中的 `result` 字段补充；如果状态文件不存在或字段不存在则为 `null`。
 - `ping`：实时 clamd ping 结果，可能为 `ready`、`error`、`timeout`。
 - `ping_message`：ping 结果说明。
 - `checked_at`：本次 API 检查时间。
+
+## `POST /api/clamav/sleep`
+
+用途：让 ClamAV 进入休眠。后端通过 `/tmp/clamd.sock` 发送 `SHUTDOWN`；命令无响应并正常关闭连接后，原子创建 `/state/sleep.lock` 空目录作为休眠状态标记。Go Web 服务和 cron 保持运行。
+
+调用：
+
+```sh
+curl -u admin:secret -X POST http://localhost:8080/api/clamav/sleep
+```
+
+成功响应：
+
+```json
+{
+  "status": "sleeping",
+  "message": "ClamAV entered sleep mode."
+}
+```
+
+返回字段：
+
+| 字段 | 类型 | 可能值 | 对应情况 |
+| --- | --- | --- | --- |
+| `status` | `string` | `sleeping` | SHUTDOWN 命令成功且 `/state/sleep.lock` 已存在；也包括接口调用前 ClamAV 已休眠的幂等成功情况。 |
+| `message` | `string` | 状态说明 | 首次成功休眠时为 `ClamAV entered sleep mode.`；已经处于休眠状态时为 `ClamAV is already sleeping.`。 |
+
+说明：
+
+- 接口具有幂等性；ClamAV 已休眠时仍返回 `200 OK` 和 `sleeping`。
+- 休眠成功后会原子更新 `/state/status.json`，将 `clamd.status` 写为 `sleep`、`clamd.message` 写为 `clamd is sleeping.`，并保留其他状态字段。
+- `/state/scan.lock` 表示扫描正在执行时，接口返回 `409 Conflict`，不会关闭 ClamAV。
+- socket 连接、写入、响应或休眠锁创建失败时返回 `500 Internal Server Error`。
+- socket 操作超时时返回 `504 Gateway Timeout`。
+- `409`、`500` 和 `504` 错误响应使用通用 `{"error":"error message"}` 结构，不包含 `status` 字段；当前接口不会返回 `status: "failed"`。
+- 本接口当前不会改变手动或 cron 扫描流程；休眠状态下触发扫描的行为将在后续功能中处理。
+
+## `POST /api/clamav/wake`
+
+用途：唤醒 ClamAV。后端执行 `/startup.sh --wake`；该模式只负责确认或启动官方 `/init`、等待 ClamAV 返回 PONG，并删除 `/state/sleep.lock`，不创建目录、不校验应用配置，也不启动 cron 或 Go Web 服务。
+
+调用：
+
+```sh
+curl -u admin:secret -X POST http://localhost:8080/api/clamav/wake
+```
+
+成功响应：
+
+```json
+{
+  "status": "awake",
+  "message": "ClamAV woke successfully."
+}
+```
+
+返回字段：
+
+| 字段 | 类型 | 可能值 | 对应情况 |
+| --- | --- | --- | --- |
+| `status` | `string` | `awake` | `/startup.sh --wake` 执行成功、ClamAV 已通过 PONG 检查且 `/state/sleep.lock` 已删除；也包括接口调用前 ClamAV 已就绪的幂等成功情况。 |
+| `message` | `string` | 状态说明 | 实际执行唤醒并成功时为 `ClamAV woke successfully.`；调用前已经处于工作状态时为 `ClamAV is already awake.`。 |
+
+说明：
+
+- 接口具有幂等性；ClamAV 已可正常 PONG 时，`startup.sh --wake` 不会重复启动 `/init`，只删除可能存在的陈旧 sleep lock，并返回 `200 OK` 和 `awake`。
+- 唤醒失败时保留 `/state/sleep.lock`，返回 `500 Internal Server Error`。
+- 唤醒超时时返回 `504 Gateway Timeout`。
+- `500` 和 `504` 错误响应使用通用 `{"error":"error message"}` 结构，不包含 `status` 字段；当前接口不会返回 `status: "failed"`。
+- `/startup.sh --wake` 在需要新启动 `/init` 时会原子更新 `/state/clamav-init.pid`，使容器 PID 1 能继续监督并在容器退出时优雅停止最新进程；ClamAV 已就绪时不会改写 PID。
 
 ## `GET /api/browse`
 
@@ -175,6 +247,16 @@ curl -u admin:secret \
 }
 ```
 
+ClamAV 休眠时返回 `409 Conflict`，不会生成批次 ID、加入内存队列或执行 `scan_once.sh`：
+
+```json
+{
+  "id": "",
+  "status": "failed",
+  "message": "ClamAV is sleeping."
+}
+```
+
 说明：
 
 - `id` 是 WebUI 批次 ID，固定以 `web-` 开头。
@@ -184,6 +266,7 @@ curl -u admin:secret \
 - 队列调度器在启动手动批次前会检查 `/state/scan.lock`。如果锁中的 `pid` 仍存活，说明已有自动或其他扫描正在运行，手动批次保持 `queued`，后端每 5 秒重试一次。
 - 如果 `/state/scan.lock` 不存在，或锁中的 `pid` 缺失、为空、非法、已退出，后端认为该锁不阻塞手动队列，并启动 `scan_once.sh`；无效锁文件由 `scan_once.sh` 自己在抢锁流程中清理。
 - `wait` 仅为兼容旧调用保留；手动扫描队列串行调度，后端不会因为该字段向 `scan_once.sh` 传递 `--wait`。
+- 后端在解析扫描请求和创建队列任务前检查 `/state/sleep.lock`；存在时直接返回上述休眠响应。
 
 ## `GET /api/scans`
 
@@ -327,6 +410,8 @@ curl -u admin:secret \
 ```
 
 规则 ID 由后端生成，长度 16 位，只包含小写字母和数字。
+
+`scan_once.sh` 支持仅用于 cron 任务的 `--wake` 参数。带该参数的 cron 调用会在发现 `/state/sleep.lock` 时执行 `/startup.sh --wake`，成功后继续扫描；不带该参数时会生成完整的失败任务记录并在任务日志中写入 `[ERROR] ClamAV is sleeping`。当前 `cron.sh` 生成 crontab 时不会自动追加 `--wake`，定时规则与该参数的配置接入将在后续实现。
 
 ## `GET /api/cron/rules`
 
@@ -644,11 +729,22 @@ curl -u admin:secret \
 }
 ```
 
+ClamAV 休眠响应：
+
+```json
+{
+  "status": "failed",
+  "message": null,
+  "error": "ClamAV is sleeping"
+}
+```
+
 说明：
 
 - `path` 必须存在，且真实路径必须位于 `/scan` 下。
 - 如果路径已经存在于白名单中，后端不会重复写入，但仍会执行 `/exclude.sh` 刷新 allow-list 数据库。
 - 如果扫描锁目录存在，返回 `409 Conflict`，`status` 为 `busy`。
+- 如果 `/state/sleep.lock` 存在，返回 `409 Conflict` 和上述休眠响应，不修改白名单，也不执行刷新或唤醒。
 - 如果 `/exclude.sh` 或 `clamd` reload 失败，返回 `failed`。
 
 ## `DELETE /api/whitelist`
@@ -687,6 +783,7 @@ curl -u admin:secret \
 
 - 删除不存在的条目会返回 `400 Bad Request`，`status` 为 `failed`。
 - 如果扫描锁目录存在，返回 `409 Conflict`，`status` 为 `busy`。
+- 如果 `/state/sleep.lock` 存在，返回与 POST 相同的 `409 Conflict` 休眠响应，不修改白名单，也不执行刷新或唤醒。
 - 如果 `/exclude.sh` 或 `clamd` reload 失败，返回 `failed`。
 
 ## `POST /api/results/lookups`

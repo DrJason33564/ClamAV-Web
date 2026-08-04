@@ -6,14 +6,16 @@ STATUS_DIR="${STATUS_DIR:-/state}"
 JOBS_DIR="${JOBS_DIR:-${STATUS_DIR}/jobs}"
 STATUS_FILE="${STATUS_FILE:-${STATUS_DIR}/status.json}"
 LOCK_DIR="${SCAN_LOCK_DIR:-${STATUS_DIR}/scan.lock}"
+SLEEP_LOCK_DIR="${SLEEP_LOCK_DIR:-${STATUS_DIR}/sleep.lock}"
 QUARANTINE_DIR="${QUARANTINE_DIR:-/quarantine}"
 CLAMD_CONF="${CLAMD_CONF:-/etc/clamav/clamd.conf}"
+STARTUP_SCRIPT="${STARTUP_SCRIPT:-/startup.sh}"
 LOG_SCRIPT="${LOG_SCRIPT:-/log.sh}"
 
 . "$LOG_SCRIPT"
 
 usage() {
-    echo "Usage: $0 [--id <job_id>] --type <manual|cron> --target <path> --action <warn|move|remove> [--wait]" >&2
+    echo "Usage: $0 [--id <job_id>] --type <manual|cron> --target <path> --action <warn|move|remove> [--wait] [--wake]" >&2
 }
 
 json_escape() {
@@ -122,6 +124,28 @@ log_scan_action() {
             log "[INFO] Detection action: remove infected files directly"
             ;;
     esac
+}
+
+log_scan_header() {
+    [ "${SCAN_HEADER_LOGGED:-0}" -eq 0 ] || return 0
+
+    log "[INFO] Scan started: $TARGET"
+    log "[INFO] Job id: $JOB_ID"
+    log "[INFO] Job type: $JOB_TYPE"
+    log_scan_action
+    SCAN_HEADER_LOGGED=1
+}
+
+fail_scan_job() {
+    log_message="$1"
+    job_message="$2"
+    exit_code="$3"
+
+    log "$log_message"
+    FINISHED_AT="$(now_compact)"
+    ACTIVE_JOB_JSON="null"
+    write_job_state "failed" "\"$FINISHED_AT\"" "$exit_code" "error" "null" "$job_message"
+    exit "$exit_code"
 }
 
 log_applied_action() {
@@ -268,6 +292,11 @@ acquire_scan_lock() {
     done
 
     LOCK_HELD=1
+    # Publish the owning shell immediately. Without a live PID, another
+    # scan_once.sh can mistake the newly created directory for a stale lock
+    # during the wake and pre-scan phases.
+    printf '%s\n' "$$" > "$LOCK_DIR/pid"
+    printf '%s\n' "$JOB_ID" > "$LOCK_DIR/job_id"
 }
 
 JOB_ID=""
@@ -275,6 +304,7 @@ JOB_TYPE=""
 TARGET=""
 ACTION=""
 WAIT_FOR_LOCK=0
+WAKE_CLAMAV=0
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -300,6 +330,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --wait)
             WAIT_FOR_LOCK=1
+            shift
+            ;;
+        --wake)
+            WAKE_CLAMAV=1
             shift
             ;;
         *)
@@ -330,6 +364,11 @@ case "$ACTION" in
         ;;
 esac
 
+if [ "$WAKE_CLAMAV" -eq 1 ] && [ "$JOB_TYPE" != "cron" ]; then
+    echo "--wake is only supported for cron jobs" >&2
+    exit 2
+fi
+
 mkdir -p "$LOG_DIR" "$JOBS_DIR" "$QUARANTINE_DIR"
 
 if [ -z "$JOB_ID" ]; then
@@ -350,6 +389,7 @@ STARTED_AT="$(now_compact)"
 ACTIVE_JOB_JSON="\"$(json_escape "$JOB_ID")\""
 LAST_JOB_JSON="\"$(json_escape "$JOB_ID")\""
 CLAMDSCAN_PID_JSON="null"
+SCAN_HEADER_LOGGED=0
 
 touch "$JOB_LOG"
 trap cleanup_lock EXIT INT TERM
@@ -358,7 +398,27 @@ trap cleanup_lock EXIT INT TERM
 # discover the script-owned job id before the scan finishes.
 printf 'JOB_ID=%s\n' "$JOB_ID"
 
+# Cron failures caused by sleep state must still have the normal identifying
+# INFO header and a durable, complete job JSON document.
+if [ "$JOB_TYPE" = "cron" ]; then
+    log_scan_header
+    if [ -e "$SLEEP_LOCK_DIR" ] && [ "$WAKE_CLAMAV" -ne 1 ]; then
+        fail_scan_job "[ERROR] ClamAV is sleeping" "ClamAV is sleeping" "1"
+    fi
+fi
+
 acquire_scan_lock
+
+# Recheck after taking the scan lock so a sleep transition racing with this
+# process cannot slip between the initial check and the actual scan.
+if [ "$JOB_TYPE" = "cron" ] && [ -e "$SLEEP_LOCK_DIR" ]; then
+    if [ "$WAKE_CLAMAV" -ne 1 ]; then
+        fail_scan_job "[ERROR] ClamAV is sleeping" "ClamAV is sleeping" "1"
+    fi
+    if ! "$STARTUP_SCRIPT" --wake; then
+        fail_scan_job "[ERROR] Failed to wake ClamAV" "Failed to wake ClamAV" "1"
+    fi
+fi
 
 if [ ! -e "$TARGET" ]; then
     log "[WARN] Scan target does not exist: $TARGET"
@@ -381,10 +441,7 @@ fi
 tmp_output="$(mktemp)"
 trap 'rm -f "$tmp_output"; cleanup_lock' EXIT INT TERM
 
-log "[INFO] Scan started: $TARGET"
-log "[INFO] Job id: $JOB_ID"
-log "[INFO] Job type: $JOB_TYPE"
-log_scan_action
+log_scan_header
 
 extra_args="$(action_args)"
 

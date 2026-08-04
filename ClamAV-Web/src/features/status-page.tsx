@@ -2,6 +2,8 @@ import * as React from "react"
 import {
   ActivityIcon,
   Clock3Icon,
+  LoaderCircleIcon,
+  MoonIcon,
   RefreshCwIcon,
   ScanSearchIcon,
   ShieldCheckIcon,
@@ -13,14 +15,21 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   Card,
+  CardAction,
   CardContent,
   CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
+import { toast } from "@/components/ui/toast"
 import { api } from "@/lib/api"
 import { errorMessage, formatTimestamp } from "@/lib/format"
-import type { StatusResponse, StatusSource } from "@/lib/types"
+import type {
+  ClamAVPowerResponse,
+  StatusResponse,
+  StatusSource,
+} from "@/lib/types"
+import { cn } from "@/lib/utils"
 
 function readPollInterval() {
   const value = Number(localStorage.getItem("statusPollInterval") || "5")
@@ -35,9 +44,11 @@ export function StatusPage() {
   const [status, setStatus] = React.useState<StatusResponse | null>(null)
   const [error, setError] = React.useState("")
   const [loading, setLoading] = React.useState(false)
+  const [powerError, setPowerError] = React.useState("")
+  const [powerLoading, setPowerLoading] = React.useState(false)
   const [pollInterval, setPollInterval] = React.useState(readPollInterval)
   const [debugging, setDebugging] = React.useState(
-    () => localStorage.getItem("debugging") === "true",
+    () => localStorage.getItem("debugging") === "true"
   )
 
   const load = React.useCallback(async () => {
@@ -72,9 +83,16 @@ export function StatusPage() {
 
   const source = sourceObject(status?.source ?? {})
   const scan = source.scan ?? {}
+  const sleeping = source.clamd?.status === "sleep"
   const ready = status?.ping === "ready"
   const active = Boolean(scan.active_job_id)
-  const stateLabel = !ready ? "服务异常" : active ? "正在扫描" : "准备就绪"
+  const stateLabel = sleeping
+    ? "已休眠"
+    : !ready
+      ? "服务异常"
+      : active
+        ? "正在扫描"
+        : "准备就绪"
   const resultLabel =
     scan.last_job_status === "running"
       ? "扫描进行中"
@@ -83,6 +101,26 @@ export function StatusPage() {
         : scan.last_job_result === "found"
           ? "发现威胁"
           : "暂无结果"
+
+  async function togglePower() {
+    const action = sleeping ? "wake" : "sleep"
+    setPowerLoading(true)
+    setPowerError("")
+    try {
+      await api<ClamAVPowerResponse>(`/api/clamav/${action}`, {
+        method: "POST",
+      })
+      toast.add({
+        title: sleeping ? "ClamAV 已唤醒" : "ClamAV 已进入休眠",
+        type: "success",
+      })
+      await load()
+    } catch (nextError) {
+      setPowerError(errorMessage(nextError))
+    } finally {
+      setPowerLoading(false)
+    }
+  }
 
   return (
     <PageLayout
@@ -111,7 +149,11 @@ export function StatusPage() {
             </CardHeader>
             <CardContent className="flex items-center gap-3">
               <ShieldCheckIcon aria-hidden="true" />
-              <Badge variant={ready ? "default" : "destructive"}>
+              <Badge
+                variant={
+                  sleeping ? "secondary" : ready ? "default" : "destructive"
+                }
+              >
                 {stateLabel}
               </Badge>
             </CardContent>
@@ -147,7 +189,71 @@ export function StatusPage() {
             </CardContent>
           </Card>
         </div>
-        {!ready && status && (
+        <Card
+          size="sm"
+          className="relative isolate size-48 self-start"
+          aria-busy={powerLoading}
+        >
+          <div
+            aria-hidden="true"
+            className={cn(
+              "engine-control-mark",
+              (sleeping || !ready) && "grayscale"
+            )}
+          />
+          <div aria-hidden="true" className="engine-control-rings" />
+          <CardHeader className="relative">
+            <CardTitle>
+              <Badge
+                variant={
+                  sleeping ? "secondary" : ready ? "success" : "destructive"
+                }
+              >
+                {sleeping ? "引擎已休眠" : ready ? "引擎运行中" : "引擎异常"}
+              </Badge>
+            </CardTitle>
+            <CardAction>
+              <Button
+                variant={sleeping ? "secondary" : "outline"}
+                size="icon-lg"
+                className="rounded-full"
+                aria-label={
+                  powerLoading && sleeping
+                    ? "正在唤醒 ClamAV"
+                    : sleeping
+                      ? "唤醒 ClamAV"
+                      : "休眠 ClamAV"
+                }
+                aria-busy={powerLoading && sleeping}
+                title={
+                  active
+                    ? "扫描进行中，暂时无法休眠"
+                    : sleeping
+                      ? "唤醒 ClamAV"
+                      : "休眠 ClamAV"
+                }
+                disabled={
+                  powerLoading || active || !status || (!sleeping && !ready)
+                }
+                onClick={() => void togglePower()}
+              >
+                {powerLoading && sleeping ? (
+                  <LoaderCircleIcon
+                    className="animate-spin"
+                    aria-hidden="true"
+                  />
+                ) : (
+                  <MoonIcon
+                    className={cn(sleeping && "fill-current")}
+                    aria-hidden="true"
+                  />
+                )}
+              </Button>
+            </CardAction>
+          </CardHeader>
+        </Card>
+        {powerError && <ErrorAlert message={powerError} />}
+        {!ready && !sleeping && status && (
           <ErrorAlert
             message={`${status.ping}: ${status.ping_message || source.message || "ClamAV 尚未准备好"}`}
           />

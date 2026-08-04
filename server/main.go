@@ -17,6 +17,7 @@ type server struct {
 	resultLookups     map[string]*resultLookup
 	quarantineMu      sync.RWMutex
 	quarantineLookups map[string]*quarantineLookup
+	clamavPowerMu     sync.Mutex
 }
 
 func main() {
@@ -31,6 +32,8 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/", frontendHandler())
 	mux.HandleFunc("/api/status", s.handleStatus)
+	mux.HandleFunc("/api/clamav/sleep", s.handleClamAVSleep)
+	mux.HandleFunc("/api/clamav/wake", s.handleClamAVWake)
 	mux.HandleFunc("/api/browse", s.handleBrowse)
 	mux.HandleFunc("/api/scans", s.handleScans)
 	mux.HandleFunc("/api/scans/reorder", s.handleScanReorder)

@@ -83,6 +83,22 @@ type jobFile struct {
 }
 
 func (s *server) startScan(w http.ResponseWriter, r *http.Request) {
+	sleeping, err := directoryLockExists(s.cfg.SleepLockDir)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("check ClamAV sleep lock: %w", err))
+		return
+	}
+	if sleeping {
+		// A rejected request never enters the in-memory queue and therefore
+		// cannot reach scan_once.sh after ClamAV has been put to sleep.
+		writeJSON(w, http.StatusConflict, startScanResponse{
+			ID:      "",
+			Status:  "failed",
+			Message: "ClamAV is sleeping.",
+		})
+		return
+	}
+
 	var req startScanRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
