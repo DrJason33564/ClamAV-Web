@@ -131,6 +131,31 @@ export type HistoryLookup = {
   error?: string
 }
 
+export type StatisticsCounts = {
+  unknown: number
+  clean: number
+  found: number
+  error: number
+}
+
+export type StatisticsLookupStart = {
+  status: "pending"
+  lookup_id: string
+  scope: number
+  message?: string
+}
+
+export type StatisticsLookupResponse = {
+  lookup_id: string
+  status: "pending" | "success" | "failed"
+  scope: number
+  total: number
+  error?: string
+  started_at?: string
+  updated_at?: string
+  [key: string]: unknown
+}
+
 export type DetectionDetail = {
   job_id: string
   detections: Array<{
