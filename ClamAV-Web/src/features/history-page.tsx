@@ -22,7 +22,7 @@ import { Input } from "@/components/ui/input"
 import { Separator } from "@/components/ui/separator"
 import { toast } from "@/components/ui/toast"
 import { api, jsonRequest, sleep } from "@/lib/api"
-import { errorMessage, formatCompactDate } from "@/lib/format"
+import { actionLabel, errorMessage, formatCompactDate } from "@/lib/format"
 import type { DetectionDetail, HistoryItem, HistoryLookup } from "@/lib/types"
 
 const pageSize = 10
@@ -236,7 +236,13 @@ export function HistoryPage() {
                   </Badge>
                 </CardAction>
               </CardHeader>
-              <CardContent>
+              <CardContent className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-muted-foreground">
+                    检出行为
+                  </span>
+                  <Badge variant="outline">{actionLabel(item.action)}</Badge>
+                </div>
                 <Button
                   variant="outline"
                   size="sm"

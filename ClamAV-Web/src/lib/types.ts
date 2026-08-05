@@ -120,6 +120,7 @@ export type HistoryItem = {
   type: string
   date: string
   result: string | null
+  action: ScanAction
 }
 
 export type HistoryLookup = {
