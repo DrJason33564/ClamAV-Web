@@ -23,9 +23,15 @@ type templateLookupState struct {
 	ReadyAt   time.Time
 }
 
+type templateStatisticsLookupState struct {
+	templateLookupState
+	Scope int
+}
+
 type templateAPI struct {
 	mu                sync.RWMutex
 	resultLookups     map[string]templateLookupState
+	statisticsLookups map[string]templateStatisticsLookupState
 	quarantineLookups map[string]templateLookupState
 	lookupDelay       func() time.Duration
 }
@@ -184,6 +190,7 @@ func newTemplateAPIHandler() http.Handler {
 func newTemplateAPIHandlerWithDelay(lookupDelay func() time.Duration) http.Handler {
 	api := &templateAPI{
 		resultLookups:     make(map[string]templateLookupState),
+		statisticsLookups: make(map[string]templateStatisticsLookupState),
 		quarantineLookups: make(map[string]templateLookupState),
 		lookupDelay:       lookupDelay,
 	}
@@ -202,6 +209,8 @@ func newTemplateAPIHandlerWithDelay(lookupDelay func() time.Duration) http.Handl
 	mux.HandleFunc("/api/whitelist", templateWhitelist)
 	mux.HandleFunc("/api/results/lookups", api.templateResultLookupStart)
 	mux.HandleFunc("/api/results/lookups/", api.templateResultLookup)
+	mux.HandleFunc("/api/results/statistics/lookups", api.templateStatisticsLookupStart)
+	mux.HandleFunc("/api/results/statistics/lookups/", api.templateStatisticsLookup)
 	mux.HandleFunc("/api/results/detection", templateDetection)
 	mux.HandleFunc("/api/results/clean", templateResultsClean)
 	mux.HandleFunc("/api/quarantine/lookups", api.templateQuarantineLookupStart)
@@ -488,6 +497,64 @@ func templateResultItems() []map[string]any {
 	return items
 }
 
+func (api *templateAPI) templateStatisticsLookupStart(w http.ResponseWriter, r *http.Request) {
+	if !templateMethod(w, r, http.MethodPost) {
+		return
+	}
+	scope, err := parseHistoryStatisticsScope(r.URL.Query().Get("scope"))
+	if err != nil {
+		writeTemplateJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	id, state := api.createLookup("statistics")
+	api.mu.Lock()
+	api.statisticsLookups[id] = templateStatisticsLookupState{templateLookupState: state, Scope: scope}
+	api.cleanupLookupsLocked(time.Now().Add(-15 * time.Minute))
+	api.mu.Unlock()
+	writeTemplateJSON(w, http.StatusAccepted, map[string]any{
+		"status": "pending", "lookup_id": id, "scope": scope,
+		"message": "history statistics are loading; poll /api/results/statistics/lookups/" + id,
+	})
+}
+
+func (api *templateAPI) templateStatisticsLookup(w http.ResponseWriter, r *http.Request) {
+	if !templateMethod(w, r, http.MethodGet) {
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/api/results/statistics/lookups/")
+	if id == "" || strings.Contains(id, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	api.mu.RLock()
+	state, ok := api.statisticsLookups[id]
+	api.mu.RUnlock()
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if time.Now().Before(state.ReadyAt) {
+		writeTemplateJSON(w, http.StatusAccepted, map[string]any{
+			"lookup_id": id, "status": "pending", "scope": state.Scope, "total": 0,
+			"started_at": state.StartedAt, "updated_at": state.StartedAt,
+		})
+		return
+	}
+	response := map[string]any{
+		"lookup_id": id, "status": "success", "scope": state.Scope,
+		"started_at": state.StartedAt, "updated_at": state.ReadyAt,
+	}
+	total := 0
+	today := time.Now()
+	for offset := state.Scope - 1; offset >= 0; offset-- {
+		counts := historyStatisticsDay{Unknown: offset % 2, Clean: 2, Found: offset % 3, Error: 0}
+		response[today.AddDate(0, 0, -offset).Format("20060102")] = counts
+		total += counts.Unknown + counts.Clean + counts.Found + counts.Error
+	}
+	response["total"] = total
+	writeTemplateJSON(w, http.StatusOK, response)
+}
+
 func templateDetection(w http.ResponseWriter, r *http.Request) {
 	if !templateMethod(w, r, http.MethodPost) {
 		return
@@ -578,6 +645,11 @@ func (api *templateAPI) cleanupLookupsLocked(before time.Time) {
 	for id, state := range api.resultLookups {
 		if state.StartedAt.Before(before) {
 			delete(api.resultLookups, id)
+		}
+	}
+	for id, state := range api.statisticsLookups {
+		if state.StartedAt.Before(before) {
+			delete(api.statisticsLookups, id)
 		}
 	}
 	for id, state := range api.quarantineLookups {
@@ -760,6 +832,15 @@ func TestTemplateAPIResponses(t *testing.T) {
 			t.Fatalf("history result does not expose action: %#v", first)
 		}
 
+		response, statisticsStart := request(http.MethodPost, "/api/results/statistics/lookups?scope=3")
+		if response.Code != http.StatusAccepted || statisticsStart["status"] != "pending" {
+			t.Fatalf("unexpected statistics lookup start: %d %#v", response.Code, statisticsStart)
+		}
+		response, statistics := request(http.MethodGet, "/api/results/statistics/lookups/"+statisticsStart["lookup_id"].(string))
+		if response.Code != http.StatusOK || statistics["scope"] != float64(3) || statistics["total"].(float64) < 1 {
+			t.Fatalf("unexpected statistics lookup result: %d %#v", response.Code, statistics)
+		}
+
 		response, quarantineStart := request(http.MethodPost, "/api/quarantine/lookups")
 		if response.Code != http.StatusAccepted || quarantineStart["status"] != "pending" {
 			t.Fatalf("unexpected quarantine lookup start: %d %#v", response.Code, quarantineStart)
@@ -820,6 +901,7 @@ func TestTemplateAPIResponses(t *testing.T) {
 
 	t.Run("every documented API route responds", func(t *testing.T) {
 		_, resultStart := request(http.MethodPost, "/api/results/lookups")
+		_, statisticsStart := request(http.MethodPost, "/api/results/statistics/lookups?scope=3")
 		_, quarantineStart := request(http.MethodPost, "/api/quarantine/lookups")
 		routes := []struct {
 			method string
@@ -845,6 +927,8 @@ func TestTemplateAPIResponses(t *testing.T) {
 			{http.MethodDelete, "/api/whitelist", http.StatusOK},
 			{http.MethodPost, "/api/results/lookups", http.StatusAccepted},
 			{http.MethodGet, "/api/results/lookups/" + resultStart["lookup_id"].(string), http.StatusOK},
+			{http.MethodPost, "/api/results/statistics/lookups?scope=3", http.StatusAccepted},
+			{http.MethodGet, "/api/results/statistics/lookups/" + statisticsStart["lookup_id"].(string), http.StatusOK},
 			{http.MethodPost, "/api/results/detection", http.StatusOK},
 			{http.MethodPost, "/api/results/clean", http.StatusOK},
 			{http.MethodPost, "/api/quarantine/clean", http.StatusOK},

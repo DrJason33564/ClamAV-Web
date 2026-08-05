@@ -196,6 +196,13 @@ func (s *server) cleanDeleteUser(ctx context.Context, username string) error {
 		}
 	}
 	s.resultMu.Unlock()
+	s.historyStatisticsMu.Lock()
+	for lookupID, lookup := range s.historyStatisticsLookups {
+		if lookup.User == username {
+			delete(s.historyStatisticsLookups, lookupID)
+		}
+	}
+	s.historyStatisticsMu.Unlock()
 	s.quarantineMu.Lock()
 	for lookupID, lookup := range s.quarantineLookups {
 		if lookup.User == username {

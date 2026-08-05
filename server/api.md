@@ -616,6 +616,66 @@ TimeDock 模式下，新增和删除请求中的路径都必须位于当前用�
 
 接口状态码：`202` 对应 `pending`，`200` 对应 `success`，`500` 对应 `failed`；lookup 不存在或不属于当前用户时返回 `404`。
 
+### `POST /api/results/statistics/lookups?scope=N`
+
+创建当前用户过去 `N` 个本地自然日的扫描统计查询。`scope` 必须显式提供，且必须是
+`1` 到 `31` 之间的正整数。统计范围包含请求当天及之前的 `N-1` 天；当前日只统计到
+请求发生时。日期边界使用服务进程的本地时区（即容器时区）。
+
+创建成功返回 `202 Accepted`：
+
+```json
+{
+  "status": "pending",
+  "lookup_id": "statistics-0123456789abcdef",
+  "scope": 3,
+  "message": "history statistics are loading; poll /api/results/statistics/lookups/statistics-0123456789abcdef"
+}
+```
+
+缺少 `scope`、非整数、零、负数或大于 `31` 时返回 `400 Bad Request`，且不会创建
+lookup。
+
+### `GET /api/results/statistics/lookups/{lookup_id}`
+
+只有创建 lookup 的用户可以轮询。查询尚未完成时返回 `202 Accepted` 和
+`status: pending`；成功后返回 `200 OK`：
+
+```json
+{
+  "lookup_id": "statistics-0123456789abcdef",
+  "status": "success",
+  "scope": 3,
+  "total": 10,
+  "20260803": {"unknown":1,"clean":2,"found":1,"error":0},
+  "20260804": {"unknown":0,"clean":0,"found":0,"error":0},
+  "20260805": {"unknown":1,"clean":4,"found":0,"error":1},
+  "started_at": "2026-08-05T12:00:00+08:00",
+  "updated_at": "2026-08-05T12:00:01+08:00"
+}
+```
+
+响应字段及可能值：
+
+| 字段 | 类型 | 可能值及含义 |
+|---|---|---|
+| `lookup_id` | string | 创建时生成的 `statistics-<随机ID>`。 |
+| `status` | string | `pending`：正在统计；`success`：统计完成；`failed`：查询失败。 |
+| `scope` | integer | 创建 lookup 时指定的天数，范围为 `1–31`。 |
+| `total` | integer | 当前用户在统计范围内的任务总数；等于所有日期四种结果计数之和。 |
+| `YYYYMMDD` | object | 对应容器本地自然日的结果计数；范围内无任务的日期也会返回。 |
+| `YYYYMMDD.unknown` | integer | `result` 为 `unknown` 的任务数；数据库中的其他未知结果也归入此项。 |
+| `YYYYMMDD.clean` | integer | `result` 为 `clean`、即未检出威胁的任务数。 |
+| `YYYYMMDD.found` | integer | `result` 为 `found`、即检出威胁的任务数。 |
+| `YYYYMMDD.error` | integer | `result` 为 `error`、即扫描失败的任务数。 |
+| `error` | string | 仅在 `failed` 时出现，内容为查询失败原因。 |
+| `started_at` | string | lookup 创建时间，RFC3339 格式。 |
+| `updated_at` | string | lookup 最近一次状态更新时间，RFC3339 格式。 |
+
+统计直接从 `history.db` 的 `history_jobs` 表读取，始终包含当前用户名条件。接口按日和
+结果在 SQLite 中聚合，不读取任务 JSON。异常结果归入 `unknown`。状态码为：等待时
+`202`、成功时 `200`、失败时 `500`；lookup 不存在或属于其他用户时返回 `404`。
+
 ### `POST /api/results/detection`
 
 ```json

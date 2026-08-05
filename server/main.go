@@ -14,25 +14,27 @@ import (
 )
 
 type server struct {
-	cfg               config
-	mu                sync.RWMutex
-	activeBatchID     string
-	queuedBatchIDs    []string
-	queueRunnerActive bool
-	batches           map[string]*scanBatch
-	resultMu          sync.RWMutex
-	resultLookups     map[string]*resultLookup
-	quarantineMu      sync.RWMutex
-	quarantineLookups map[string]*quarantineLookup
-	clamavPowerMu     sync.Mutex
-	configFileMu      sync.Mutex
-	accountDeleteMu   sync.Mutex
-	userDB            *sql.DB
-	historyDB         *sql.DB
-	appConfig         *appConfigStore
-	history           *historyIndexer
-	loginMu           sync.Mutex
-	loginAttempts     map[string]loginAttempt
+	cfg                      config
+	mu                       sync.RWMutex
+	activeBatchID            string
+	queuedBatchIDs           []string
+	queueRunnerActive        bool
+	batches                  map[string]*scanBatch
+	resultMu                 sync.RWMutex
+	resultLookups            map[string]*resultLookup
+	historyStatisticsMu      sync.RWMutex
+	historyStatisticsLookups map[string]*historyStatisticsLookup
+	quarantineMu             sync.RWMutex
+	quarantineLookups        map[string]*quarantineLookup
+	clamavPowerMu            sync.Mutex
+	configFileMu             sync.Mutex
+	accountDeleteMu          sync.Mutex
+	userDB                   *sql.DB
+	historyDB                *sql.DB
+	appConfig                *appConfigStore
+	history                  *historyIndexer
+	loginMu                  sync.Mutex
+	loginAttempts            map[string]loginAttempt
 }
 
 func main() {
@@ -55,14 +57,15 @@ func main() {
 	}
 	defer historyDB.Close()
 	s := &server{
-		cfg:               cfg,
-		batches:           make(map[string]*scanBatch),
-		resultLookups:     make(map[string]*resultLookup),
-		quarantineLookups: make(map[string]*quarantineLookup),
-		userDB:            userDB,
-		historyDB:         historyDB,
-		appConfig:         appConfig,
-		loginAttempts:     make(map[string]loginAttempt),
+		cfg:                      cfg,
+		batches:                  make(map[string]*scanBatch),
+		resultLookups:            make(map[string]*resultLookup),
+		historyStatisticsLookups: make(map[string]*historyStatisticsLookup),
+		quarantineLookups:        make(map[string]*quarantineLookup),
+		userDB:                   userDB,
+		historyDB:                historyDB,
+		appConfig:                appConfig,
+		loginAttempts:            make(map[string]loginAttempt),
 	}
 	s.history = &historyIndexer{db: historyDB, jobsDir: cfg.JobsDir}
 	if err := s.history.refresh(context.Background()); err != nil {
@@ -99,6 +102,8 @@ func main() {
 	mux.HandleFunc("/api/whitelist", s.handleWhitelist)
 	mux.HandleFunc("/api/results/lookups", s.handleResultLookupStart)
 	mux.HandleFunc("/api/results/lookups/", s.handleResultLookup)
+	mux.HandleFunc("/api/results/statistics/lookups", s.handleHistoryStatisticsStart)
+	mux.HandleFunc("/api/results/statistics/lookups/", s.handleHistoryStatisticsLookup)
 	mux.HandleFunc("/api/results/detection", s.handleDetectionResult)
 	mux.HandleFunc("/api/results/clean", s.handleResultsClean)
 	mux.HandleFunc("/api/quarantine/lookups", s.handleQuarantineLookupStart)

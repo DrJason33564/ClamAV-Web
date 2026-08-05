@@ -187,6 +187,12 @@ curl -u test:anything -X POST \
 `error`，检出动作循环使用 `warn`、`move` 和 `remove`。查询状态保存在测试服务进程
 的内存中，超过 15 分钟的旧查询会在创建新查询时清理。
 
+扫描统计使用相同的异步流程。`POST /api/results/statistics/lookups?scope=N` 要求
+`scope` 为 `1–31` 的正整数，先返回 `202 Accepted` 和查询 ID；轮询
+`GET /api/results/statistics/lookups/{lookup_id}`，准备完成后返回 `200 OK`。成功响应
+包含 `scope`、`total`，并以 `YYYYMMDD` 顶层键返回 `unknown`、`clean`、`found`、
+`error` 四种计数。测试数据按当前本地日期生成，不读取真实数据库。
+
 `POST /api/results/detection` 不读取请求体中的任务 ID，始终返回固定测试任务以及：
 
 ```json
@@ -229,6 +235,8 @@ pending。准备完成后，轮询 GET 接口会返回 `200 OK`、`status: succe
 | `DELETE` | `/api/whitelist` | 返回成功及固定条目，不删除白名单。 |
 | `POST` | `/api/results/lookups` | 创建查询并返回新的 ID 和 pending 状态。 |
 | `GET` | `/api/results/lookups/{lookup_id}` | 1–5 秒内返回 pending，随后返回 20 条示例结果。 |
+| `POST` | `/api/results/statistics/lookups?scope=N` | 校验 `scope` 后创建统计查询并返回 pending。 |
+| `GET` | `/api/results/statistics/lookups/{lookup_id}` | 1–5 秒内返回 pending，随后返回按日统计的示例结果。 |
 | `POST` | `/api/results/detection` | 恒定返回 `Example Log File`。 |
 | `POST` | `/api/results/clean` | 返回成功和 `deleted: 0`，不删除文件。 |
 | `POST` | `/api/quarantine/clean` | 返回成功和 `deleted: 0`，不删除文件。 |
