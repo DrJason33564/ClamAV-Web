@@ -36,6 +36,39 @@ export type StatusResponse = {
   ping: string
   ping_message: string
   checked_at: string
+  first_run: "completed" | "not_completed"
+  is_timedock: boolean
+}
+
+export type UserRole = "admin" | "user"
+
+export type CurrentUser = {
+  username: string
+  role: UserRole
+  timedock_account: string
+}
+
+export type FirstRunResponse = {
+  first_run: "completed" | "not_completed"
+}
+
+export type AuthResponse = CurrentUser & { status?: string; message?: string }
+
+export type AdminUser = CurrentUser & {
+  status: "active" | "disabled" | "deleting"
+  password_set: boolean
+  created_at: number
+  updated_at: number
+}
+
+export type AdminUsersResponse = {
+  status: string
+  users: AdminUser[]
+}
+
+export type ServiceConfig = {
+  history_index_refresh_interval: number
+  web_firstrun_completed: number
 }
 
 export type ClamAVPowerResponse = {
@@ -53,6 +86,7 @@ export type CronRule = {
   weekday: string
   target: string
   action: ScanAction
+  wake: boolean
 }
 
 export type CronRulesResponse = {

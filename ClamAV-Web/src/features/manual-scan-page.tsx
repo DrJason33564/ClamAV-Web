@@ -5,7 +5,12 @@ import { ActionSelect } from "@/components/action-select"
 import { FileBrowser } from "@/components/file-browser"
 import { PageLayout } from "@/components/page-layout"
 import { Button } from "@/components/ui/button"
-import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field"
+import {
+  Field,
+  FieldDescription,
+  FieldGroup,
+  FieldLabel,
+} from "@/components/ui/field"
 import { toast } from "@/components/ui/toast"
 import { api, jsonRequest } from "@/lib/api"
 import { errorMessage } from "@/lib/format"
@@ -22,7 +27,7 @@ export function ManualScanPage() {
     try {
       const result = await api<{ id: string; status: string }>(
         "/api/scans",
-        jsonRequest("POST", { targets, action }),
+        jsonRequest("POST", { targets, action })
       )
       setTargets([])
       toast.add({

@@ -11,15 +11,20 @@ export class ApiError extends Error {
 export async function api<T>(
   url: string,
   options?: RequestInit,
+  behavior?: { ignoreUnauthorized?: boolean }
 ): Promise<T> {
-  const response = await fetch(url, options)
+  const response = await fetch(url, { credentials: "same-origin", ...options })
   if (!response.ok) {
-    const body = (await response.json().catch(() => null)) as
-      | { error?: string; message?: string }
-      | null
+    const body = (await response.json().catch(() => null)) as {
+      error?: string
+      message?: string
+    } | null
+    if (response.status === 401 && !behavior?.ignoreUnauthorized) {
+      window.dispatchEvent(new Event("clamav-auth-expired"))
+    }
     throw new ApiError(
       body?.error || body?.message || response.statusText,
-      response.status,
+      response.status
     )
   }
   return response.json() as Promise<T>

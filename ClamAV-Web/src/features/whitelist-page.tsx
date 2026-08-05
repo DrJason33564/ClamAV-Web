@@ -34,7 +34,7 @@ export function WhitelistPage() {
   }, [])
 
   React.useEffect(() => {
-    void load()
+    queueMicrotask(() => void load())
   }, [load])
 
   async function add() {
@@ -43,7 +43,7 @@ export function WhitelistPage() {
     try {
       await api<WhitelistResponse>(
         "/api/whitelist",
-        jsonRequest("POST", { path }),
+        jsonRequest("POST", { path })
       )
       setSelection([])
       toast.add({ type: "success", title: "已添加到信任区" })
@@ -62,7 +62,7 @@ export function WhitelistPage() {
     try {
       await api<WhitelistResponse>(
         "/api/whitelist",
-        jsonRequest("DELETE", { path }),
+        jsonRequest("DELETE", { path })
       )
       toast.add({ type: "success", title: "信任区条目已删除" })
       await load()

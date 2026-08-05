@@ -40,7 +40,7 @@ function sourceObject(source: StatusResponse["source"]): StatusSource {
   return typeof source === "object" && source !== null ? source : {}
 }
 
-export function StatusPage() {
+export function StatusPage({ isAdmin }: { isAdmin: boolean }) {
   const [status, setStatus] = React.useState<StatusResponse | null>(null)
   const [error, setError] = React.useState("")
   const [loading, setLoading] = React.useState(false)
@@ -64,7 +64,7 @@ export function StatusPage() {
   }, [])
 
   React.useEffect(() => {
-    void load()
+    queueMicrotask(() => void load())
   }, [load])
 
   React.useEffect(() => {
@@ -226,14 +226,20 @@ export function StatusPage() {
                 }
                 aria-busy={powerLoading && sleeping}
                 title={
-                  active
-                    ? "扫描进行中，暂时无法休眠"
-                    : sleeping
-                      ? "唤醒 ClamAV"
-                      : "休眠 ClamAV"
+                  !isAdmin
+                    ? "仅管理员可以休眠或唤醒 ClamAV"
+                    : active
+                      ? "扫描进行中，暂时无法休眠"
+                      : sleeping
+                        ? "唤醒 ClamAV"
+                        : "休眠 ClamAV"
                 }
                 disabled={
-                  powerLoading || active || !status || (!sleeping && !ready)
+                  !isAdmin ||
+                  powerLoading ||
+                  active ||
+                  !status ||
+                  (!sleeping && !ready)
                 }
                 onClick={() => void togglePower()}
               >

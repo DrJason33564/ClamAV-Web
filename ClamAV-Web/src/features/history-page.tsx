@@ -23,11 +23,7 @@ import { Separator } from "@/components/ui/separator"
 import { toast } from "@/components/ui/toast"
 import { api, jsonRequest, sleep } from "@/lib/api"
 import { errorMessage, formatCompactDate } from "@/lib/format"
-import type {
-  DetectionDetail,
-  HistoryItem,
-  HistoryLookup,
-} from "@/lib/types"
+import type { DetectionDetail, HistoryItem, HistoryLookup } from "@/lib/types"
 
 const pageSize = 10
 
@@ -60,15 +56,15 @@ export function HistoryPage() {
       const start = (nextPage - 1) * pageSize + 1
       const begin = await api<{ lookup_id: string }>(
         `/api/results/lookups?scope=${start}-${nextPage * pageSize}`,
-        { method: "POST" },
+        { method: "POST" }
       )
       let lookup = await api<HistoryLookup>(
-        `/api/results/lookups/${encodeURIComponent(begin.lookup_id)}`,
+        `/api/results/lookups/${encodeURIComponent(begin.lookup_id)}`
       )
       while (lookup.status === "pending" && mounted.current) {
         await sleep(500)
         lookup = await api<HistoryLookup>(
-          `/api/results/lookups/${encodeURIComponent(begin.lookup_id)}`,
+          `/api/results/lookups/${encodeURIComponent(begin.lookup_id)}`
         )
       }
       if (lookup.status === "failed") {
@@ -91,11 +87,11 @@ export function HistoryPage() {
   }, [])
 
   React.useEffect(() => {
-    void load(1)
+    queueMicrotask(() => void load(1))
   }, [load])
 
   React.useEffect(() => {
-    setPageInput(String(page))
+    queueMicrotask(() => setPageInput(String(page)))
   }, [page])
 
   async function openDetail(jobId: string) {
@@ -103,8 +99,8 @@ export function HistoryPage() {
       setDetail(
         await api<DetectionDetail>(
           "/api/results/detection",
-          jsonRequest("POST", { job_id: jobId }),
-        ),
+          jsonRequest("POST", { job_id: jobId })
+        )
       )
     } catch (error) {
       toast.add({
@@ -120,7 +116,7 @@ export function HistoryPage() {
     try {
       const result = await api<{ deleted: number }>(
         "/api/results/clean?clean_all=Y",
-        { method: "POST" },
+        { method: "POST" }
       )
       toast.add({
         type: "success",
@@ -232,7 +228,9 @@ export function HistoryPage() {
                 </CardDescription>
                 <CardAction>
                   <Badge
-                    variant={item.result === "found" ? "destructive" : "secondary"}
+                    variant={
+                      item.result === "found" ? "destructive" : "secondary"
+                    }
                   >
                     {resultLabel(item.result)}
                   </Badge>
