@@ -482,8 +482,8 @@ func TestReadResultLogItems(t *testing.T) {
 	tmp := t.TempDir()
 	files := map[string]string{
 		"manual-1783431402.json": `{"version":2,"job_id":"manual-1783431402","type":"manual","status":"finished","result":"found","action":"warn","started_at":1783431402,"finished_at":1783431410,"user":"alice"}`,
-		"cron-1783407661.json":   `{"version":2,"job_id":"cron-1783407661","type":"cron","status":"finished","result":"clean","action":"warn","started_at":1783407661,"finished_at":1783407670,"user":"alice"}`,
-		"manual-1783432800.json": `{"version":2,"job_id":"manual-1783432800","type":"manual","status":"running","result":"unknown","action":"warn","started_at":1783432800,"finished_at":null,"user":"alice"}`,
+		"cron-1783407661.json":   `{"version":2,"job_id":"cron-1783407661","type":"cron","status":"finished","result":"clean","action":"remove","started_at":1783407661,"finished_at":1783407670,"user":"alice"}`,
+		"manual-1783432800.json": `{"version":2,"job_id":"manual-1783432800","type":"manual","status":"running","result":"unknown","action":"move","started_at":1783432800,"finished_at":null,"user":"alice"}`,
 		"manual-bad.json":        `{"version":2,"job_id":"manual-bad","user":"alice"}`,
 		"manual-1783432900.json": `{"version":1,"job_id":"manual-1783432900","user":"alice"}`,
 	}
@@ -513,13 +513,13 @@ func TestReadResultLogItems(t *testing.T) {
 	if len(items) != 3 {
 		t.Fatalf("expected 3 result jobs, got %#v", items)
 	}
-	if items[0].ID != "manual-1783432800" || items[0].Type != "manual" || items[0].Result != "unknown" {
+	if items[0].ID != "manual-1783432800" || items[0].Type != "manual" || items[0].Result != "unknown" || items[0].Action != "move" {
 		t.Fatalf("unexpected first item: %#v", items[0])
 	}
-	if items[1].ID != "manual-1783431402" || items[1].Type != "manual" || items[1].Result != "found" {
+	if items[1].ID != "manual-1783431402" || items[1].Type != "manual" || items[1].Result != "found" || items[1].Action != "warn" {
 		t.Fatalf("unexpected second item: %#v", items[1])
 	}
-	if items[2].ID != "cron-1783407661" || items[2].Type != "cron" || items[2].Result != "clean" {
+	if items[2].ID != "cron-1783407661" || items[2].Type != "cron" || items[2].Result != "clean" || items[2].Action != "remove" {
 		t.Fatalf("unexpected third item: %#v", items[2])
 	}
 

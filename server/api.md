@@ -587,7 +587,7 @@ TimeDock 模式下，新增和删除请求中的路径都必须位于当前用�
   "lookup_id": "result-0123456789abcdef",
   "status": "success",
   "results": [
-    {"id":"manual-1783433000","type":"manual","date":"20260707173640","result":"clean"}
+    {"id":"manual-1783433000","type":"manual","date":"20260707173640","result":"clean","action":"warn"}
   ],
   "total": 1,
   "started_at": "2026-08-04T19:00:00+08:00",
@@ -596,6 +596,25 @@ TimeDock 模式下，新增和删除请求中的路径都必须位于当前用�
 ```
 
 列表、总数、排序和分页均由 SQLite 完成，并始终包含 owner 条件。
+
+响应字段及可能值：
+
+| 字段 | 类型 | 可能值及含义 |
+|---|---|---|
+| `lookup_id` | string | 创建查询时生成的 `result-<随机ID>`；在该 lookup 生命周期内不变。 |
+| `status` | string | `pending`：查询尚未完成；`success`：查询成功；`failed`：查询失败。 |
+| `results` | array | `success` 时为本次分页范围内的任务数组；无匹配任务时为空数组。`pending` 或 `failed` 时可能省略。 |
+| `results[].id` | string | 任务 ID，形式为 `manual-<Unix秒>` 或 `cron-<Unix秒>`，冲突时可能带三位序号后缀。 |
+| `results[].type` | string | `manual`：手动扫描；`cron`：定时扫描。 |
+| `results[].date` | string | 任务开始时间，格式为 `YYYYMMDDHHMMSS`，使用服务端时区。 |
+| `results[].result` | string | `unknown`：等待中或运行中；`clean`：未检出威胁；`found`：检出威胁；`error`：扫描失败。 |
+| `results[].action` | string | `warn`：仅记录；`move`：移动到隔离区；`remove`：直接删除检出文件。值来自 `history_jobs.action`。 |
+| `total` | integer | 当前用户符合查询条件的历史任务总数，不受当前分页范围限制；未完成时为 `0`。 |
+| `error` | string | 仅在 `failed` 时出现，内容为查询失败原因。 |
+| `started_at` | string | lookup 创建时间，RFC3339 格式。 |
+| `updated_at` | string | lookup 最近一次状态更新时间，RFC3339 格式。 |
+
+接口状态码：`202` 对应 `pending`，`200` 对应 `success`，`500` 对应 `failed`；lookup 不存在或不属于当前用户时返回 `404`。
 
 ### `POST /api/results/detection`
 

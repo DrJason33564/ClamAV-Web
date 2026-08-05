@@ -183,9 +183,9 @@ curl -u test:anything -X POST \
 - 准备时间结束后返回 `200 OK`、`status: success` 以及 20 条示例结果。
 - 未创建过或已被清理的查询 ID 返回 `404 Not Found`。
 
-结果类型包含 `manual` 和 `cron`，结果值循环使用 `clean`、`found`、`error` 和
-`null`。查询状态保存在测试服务进程的内存中，超过 15 分钟的旧查询会在创建新查询
-时清理。
+结果类型包含 `manual` 和 `cron`，结果值循环使用 `unknown`、`clean`、`found` 和
+`error`，检出动作循环使用 `warn`、`move` 和 `remove`。查询状态保存在测试服务进程
+的内存中，超过 15 分钟的旧查询会在创建新查询时清理。
 
 `POST /api/results/detection` 不读取请求体中的任务 ID，始终返回固定测试任务以及：
 

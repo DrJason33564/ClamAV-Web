@@ -32,6 +32,7 @@ type resultLogItem struct {
 	Type   string `json:"type"`
 	Date   string `json:"date"`
 	Result any    `json:"result"`
+	Action string `json:"action"`
 }
 
 type resultJobFile struct {
@@ -169,7 +170,7 @@ func (s *server) readResultLogItems(scope resultScope, username string) ([]resul
 	if err := s.historyDB.QueryRow("SELECT COUNT(*) FROM history_jobs WHERE user=?", username).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	query := "SELECT job_id,job_type,started_at,result FROM history_jobs WHERE user=? ORDER BY started_at DESC,job_id DESC"
+	query := "SELECT job_id,job_type,started_at,result,action FROM history_jobs WHERE user=? ORDER BY started_at DESC,job_id DESC"
 	args := []any{username}
 	if !scope.All {
 		query += " LIMIT ? OFFSET ?"
@@ -184,7 +185,7 @@ func (s *server) readResultLogItems(scope resultScope, username string) ([]resul
 	for rows.Next() {
 		var item resultLogItem
 		var startedAt int64
-		if err := rows.Scan(&item.ID, &item.Type, &startedAt, &item.Result); err != nil {
+		if err := rows.Scan(&item.ID, &item.Type, &startedAt, &item.Result, &item.Action); err != nil {
 			return nil, total, err
 		}
 		// Preserve the existing API date representation while job IDs and stored

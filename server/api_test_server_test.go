@@ -471,7 +471,8 @@ func (api *templateAPI) templateResultLookup(w http.ResponseWriter, r *http.Requ
 
 func templateResultItems() []map[string]any {
 	items := make([]map[string]any, 0, 20)
-	results := []any{"clean", "found", "error", nil}
+	results := []any{"unknown", "clean", "found", "error"}
+	actions := []string{"warn", "move", "remove"}
 	baseTime := time.Date(2026, 7, 28, 7, 0, 0, 0, time.FixedZone("CST", 8*60*60))
 	for i := 0; i < 20; i++ {
 		jobType := "manual"
@@ -480,7 +481,8 @@ func templateResultItems() []map[string]any {
 		}
 		date := baseTime.Add(-time.Duration(i) * time.Minute).Format("20060102150405")
 		items = append(items, map[string]any{
-			"id": jobType + "-" + date, "type": jobType, "date": date, "result": results[i%len(results)],
+			"id": jobType + "-" + date, "type": jobType, "date": date,
+			"result": results[i%len(results)], "action": actions[i%len(actions)],
 		})
 	}
 	return items
@@ -752,6 +754,10 @@ func TestTemplateAPIResponses(t *testing.T) {
 		response, lookup := request(http.MethodGet, "/api/results/lookups/"+start["lookup_id"].(string))
 		if response.Code != http.StatusOK || len(lookup["results"].([]any)) != 20 {
 			t.Fatalf("unexpected lookup result: %d %#v", response.Code, lookup)
+		}
+		first := lookup["results"].([]any)[0].(map[string]any)
+		if first["action"] != "warn" {
+			t.Fatalf("history result does not expose action: %#v", first)
 		}
 
 		response, quarantineStart := request(http.MethodPost, "/api/quarantine/lookups")
