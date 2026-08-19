@@ -63,6 +63,11 @@ func (s *appConfigStore) get() appConfig {
 }
 
 func (s *appConfigStore) update(next appConfig) error {
+	trustedProxies, err := normalizeTrustedReverseProxyList(next.ServerTrustedReverseProxy)
+	if err != nil {
+		return err
+	}
+	next.ServerTrustedReverseProxy = trustedProxies
 	if err := validateAppConfig(next); err != nil {
 		return err
 	}
@@ -138,7 +143,11 @@ func parseAppConfig(content string) (appConfig, error) {
 				return appConfig{}, err
 			}
 		case "SERVER_TRUSTED_REVERSEPROXY":
-			cfg.ServerTrustedReverseProxy = value
+			trustedProxies, err := normalizeTrustedReverseProxyList(value)
+			if err != nil {
+				return appConfig{}, err
+			}
+			cfg.ServerTrustedReverseProxy = trustedProxies
 		default:
 			return appConfig{}, fmt.Errorf("unsupported clamavweb config key %q", key)
 		}
@@ -177,10 +186,28 @@ func validateAppConfig(cfg appConfig) error {
 	if cfg.WebLoginCooldownInterval < 1 || cfg.WebLoginCooldownInterval > maxWebLoginCooldownInterval {
 		return fmt.Errorf("WEB_LOGIN_COOLDOWN_INTERVAL must be between 1 and %d seconds", maxWebLoginCooldownInterval)
 	}
-	if cfg.ServerTrustedReverseProxy != "" && net.ParseIP(cfg.ServerTrustedReverseProxy) == nil {
-		return errors.New("SERVER_TRUSTED_REVERSEPROXY must be empty or a valid IPv4/IPv6 address")
+	if _, err := normalizeTrustedReverseProxyList(cfg.ServerTrustedReverseProxy); err != nil {
+		return err
 	}
 	return nil
+}
+
+func normalizeTrustedReverseProxyList(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	parts := strings.Split(value, ",")
+	normalized := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		ip := net.ParseIP(part)
+		if part == "" || ip == nil {
+			return "", errors.New("SERVER_TRUSTED_REVERSEPROXY must be empty or a comma-separated list of valid IPv4/IPv6 addresses")
+		}
+		normalized = append(normalized, ip.String())
+	}
+	return strings.Join(normalized, ","), nil
 }
 
 func writeAppConfigFile(path string, cfg appConfig) error {

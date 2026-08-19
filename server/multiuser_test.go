@@ -272,7 +272,7 @@ func TestAppConfigRoundTrip(t *testing.T) {
 	cfg.WebLoginMaxTries = 12
 	cfg.WebLoginMaxTriesOverall = 120
 	cfg.WebLoginCooldownInterval = 300
-	cfg.ServerTrustedReverseProxy = "2001:db8::10"
+	cfg.ServerTrustedReverseProxy = "192.0.2.10,2001:db8::10"
 	if err := store.update(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -294,6 +294,7 @@ func TestAppConfigRejectsInvalidLoginAndProxySettings(t *testing.T) {
 		"zero cooldown":           func(cfg *appConfig) { cfg.WebLoginCooldownInterval = 0 },
 		"invalid trusted proxy":   func(cfg *appConfig) { cfg.ServerTrustedReverseProxy = "proxy.example.com" },
 		"trusted proxy with port": func(cfg *appConfig) { cfg.ServerTrustedReverseProxy = "192.0.2.1:8080" },
+		"empty proxy list item":   func(cfg *appConfig) { cfg.ServerTrustedReverseProxy = "192.0.2.1,,192.0.2.2" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := base
@@ -314,7 +315,7 @@ func TestServiceConfigUpdatesLoginLimitsAndTrustedProxy(t *testing.T) {
   "web_login_max_tries": 5,
   "web_login_max_tries_overall": 50,
   "web_login_cooldown_interval": 120,
-  "server_trusted_reverseproxy": "2001:db8::10"
+  "server_trusted_reverseproxy": "192.0.2.10, 2001:db8::10"
 }`))
 	request = request.WithContext(context.WithValue(request.Context(), actorContextKey{}, actor{Username: "admin", Role: "admin"}))
 	response := httptest.NewRecorder()
@@ -323,7 +324,7 @@ func TestServiceConfigUpdatesLoginLimitsAndTrustedProxy(t *testing.T) {
 		t.Fatalf("config update failed: %d %s", response.Code, response.Body.String())
 	}
 	cfg := s.appConfig.get()
-	if cfg.WebLoginMaxTries != 5 || cfg.WebLoginMaxTriesOverall != 50 || cfg.WebLoginCooldownInterval != 120 || cfg.ServerTrustedReverseProxy != "2001:db8::10" {
+	if cfg.WebLoginMaxTries != 5 || cfg.WebLoginMaxTriesOverall != 50 || cfg.WebLoginCooldownInterval != 120 || cfg.ServerTrustedReverseProxy != "192.0.2.10,2001:db8::10" {
 		t.Fatalf("unexpected updated config: %#v", cfg)
 	}
 	if len(s.loginLimiter.byIP) != 0 {

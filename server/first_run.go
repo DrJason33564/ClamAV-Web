@@ -3,7 +3,6 @@ package main
 import (
 	"errors"
 	"net/http"
-	"strings"
 )
 
 func (s *server) handleFirstRunStatus(w http.ResponseWriter, r *http.Request) {
@@ -80,7 +79,12 @@ func (s *server) handleServiceConfig(w http.ResponseWriter, r *http.Request) {
 			cfg.WebLoginCooldownInterval = *req.WebLoginCooldownInterval
 		}
 		if req.ServerTrustedReverseProxy != nil {
-			cfg.ServerTrustedReverseProxy = strings.TrimSpace(*req.ServerTrustedReverseProxy)
+			trustedProxies, err := normalizeTrustedReverseProxyList(*req.ServerTrustedReverseProxy)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			cfg.ServerTrustedReverseProxy = trustedProxies
 		}
 		if err := s.appConfig.update(cfg); err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -89,7 +93,7 @@ func (s *server) handleServiceConfig(w http.ResponseWriter, r *http.Request) {
 		if s.loginLimiter != nil && (oldLoginCfg.WebLoginMaxTries != cfg.WebLoginMaxTries || oldLoginCfg.WebLoginMaxTriesOverall != cfg.WebLoginMaxTriesOverall || oldLoginCfg.WebLoginCooldownInterval != cfg.WebLoginCooldownInterval) {
 			s.loginLimiter.reset()
 		}
-		writeJSON(w, http.StatusOK, cfg)
+		writeJSON(w, http.StatusOK, s.appConfig.get())
 	default:
 		methodNotAllowed(w)
 	}

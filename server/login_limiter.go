@@ -142,8 +142,7 @@ func retryAfterSeconds(wait time.Duration) string {
 
 func requestClientIP(r *http.Request, trustedProxy string) string {
 	remote := addressIP(remoteHost(r.RemoteAddr))
-	trusted := net.ParseIP(strings.TrimSpace(trustedProxy))
-	if trusted == nil || remote == nil || !remote.Equal(trusted) {
+	if remote == nil || !trustedProxyContains(trustedProxy, remote) {
 		return canonicalAddress(r.RemoteAddr)
 	}
 	// A trusted reverse proxy is expected to overwrite/sanitize X-Forwarded-For.
@@ -153,6 +152,15 @@ func requestClientIP(r *http.Request, trustedProxy string) string {
 		return ip.String()
 	}
 	return remote.String()
+}
+
+func trustedProxyContains(configured string, remote net.IP) bool {
+	for _, value := range strings.Split(configured, ",") {
+		if trusted := net.ParseIP(strings.TrimSpace(value)); trusted != nil && remote.Equal(trusted) {
+			return true
+		}
+	}
+	return false
 }
 
 func canonicalAddress(value string) string {

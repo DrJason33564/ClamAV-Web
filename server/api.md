@@ -171,9 +171,10 @@ WEB_FIRSTRUN_COMPLETED=2
 冷却。冷却期间返回 `429` 和 `Retry-After`，且不查询数据库或执行 Argon2，其他 API 不受
 影响。
 
-默认仅使用连接的 `RemoteAddr`。设置 `SERVER_TRUSTED_REVERSEPROXY` 后，只有直接来源为
-该可信 IPv4/IPv6 地址的请求才优先使用 `X-Forwarded-For` 首项；头缺失或非法时回退到
-`RemoteAddr`。完整配置语义见 [`server_conf.md`](server_conf.md)。
+默认仅使用连接的 `RemoteAddr`。设置 `SERVER_TRUSTED_REVERSEPROXY` 后，可使用英文半角
+逗号配置多个可信 IPv4/IPv6 地址；只有直接来源匹配列表中任意地址的请求才优先使用
+`X-Forwarded-For` 首项，头缺失或非法时回退到 `RemoteAddr`。完整配置语义见
+[`server_conf.md`](server_conf.md)。
 
 ### `POST /api/auth/logout`
 
@@ -342,7 +343,7 @@ WEB_FIRSTRUN_COMPLETED=2
   "web_login_max_tries": 10,
   "web_login_max_tries_overall": 100,
   "web_login_cooldown_interval": 600,
-  "server_trusted_reverseproxy": "192.0.2.10"
+  "server_trusted_reverseproxy": "192.0.2.10,2001:db8::10"
 }
 ```
 
@@ -356,7 +357,7 @@ WEB_FIRSTRUN_COMPLETED=2
   "web_login_max_tries": 10,
   "web_login_max_tries_overall": 100,
   "web_login_cooldown_interval": 600,
-  "server_trusted_reverseproxy": "2001:db8::10"
+  "server_trusted_reverseproxy": "192.0.2.10,2001:db8::10"
 }
 ```
 

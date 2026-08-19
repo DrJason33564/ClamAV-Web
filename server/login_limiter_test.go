@@ -107,6 +107,9 @@ func TestRequestClientIPTrustsOnlyConfiguredDirectProxy(t *testing.T) {
 		{"untrusted peer", "192.0.2.10:1234", "192.0.2.11", "198.51.100.20", "192.0.2.10"},
 		{"trusted ipv4 proxy", "192.0.2.10:1234", "192.0.2.10", "198.51.100.20, 192.0.2.10", "198.51.100.20"},
 		{"trusted ipv6 proxy", "[2001:db8::10]:1234", "2001:db8::10", "2001:db8::20", "2001:db8::20"},
+		{"second trusted ipv4 proxy", "192.0.2.11:1234", "192.0.2.10,192.0.2.11", "198.51.100.21", "198.51.100.21"},
+		{"second trusted ipv6 proxy", "[2001:db8::11]:1234", "192.0.2.10, 2001:db8::11", "2001:db8::21", "2001:db8::21"},
+		{"peer absent from proxy list", "192.0.2.12:1234", "192.0.2.10,192.0.2.11", "198.51.100.22", "192.0.2.12"},
 		{"missing header fallback", "[2001:db8::10]:1234", "2001:db8::10", "", "2001:db8::10"},
 		{"invalid header fallback", "192.0.2.10:1234", "192.0.2.10", "not-an-ip", "192.0.2.10"},
 	}
@@ -121,6 +124,21 @@ func TestRequestClientIPTrustsOnlyConfiguredDirectProxy(t *testing.T) {
 				t.Fatalf("requestClientIP() = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestNormalizeTrustedReverseProxyList(t *testing.T) {
+	got, err := normalizeTrustedReverseProxyList(" 192.0.2.10, 2001:0db8:0:0:0:0:0:10 ")
+	if err != nil || got != "192.0.2.10,2001:db8::10" {
+		t.Fatalf("unexpected normalized proxy list %q, err=%v", got, err)
+	}
+	if got, err := normalizeTrustedReverseProxyList("  "); err != nil || got != "" {
+		t.Fatalf("empty proxy list should be valid, got %q err=%v", got, err)
+	}
+	for _, value := range []string{"192.0.2.10,", ",192.0.2.10", "192.0.2.10,,192.0.2.11", "proxy.example.com", "192.0.2.0/24", "192.0.2.10:8080"} {
+		if _, err := normalizeTrustedReverseProxyList(value); err == nil {
+			t.Fatalf("expected proxy list %q to be rejected", value)
+		}
 	}
 }
 
