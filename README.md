@@ -19,7 +19,7 @@
 
 </div>
 
-ClamAV-Web 将 ClamAV 的扫描能力、定时任务和结果处理整合为一个浏览器可用的管理界面。它以单个 Docker 镜像运行：内含 ClamAV、Go 后端、React 前端和 cron 调度服务，适合家庭服务器、小型团队与 TimeDock 场景。
+ClamAV-Web 将 ClamAV 的扫描能力、定时任务和结果处理整合为一个浏览器可用的管理界面。它以单个 Docker 镜像运行：内含 ClamAV、Go 后端、React 前端和 cron 调度服务，适合家庭服务器、小型团队与NAS场景。
 
 > 本项目负责管理、编排与展示；病毒检测和病毒库更新仍由上游 `clamav/clamav` 完成。
 
