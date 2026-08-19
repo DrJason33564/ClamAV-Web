@@ -14,7 +14,7 @@ import {
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Spinner } from "@/components/ui/spinner"
-import { api, jsonRequest } from "@/lib/api"
+import { api, ApiError, jsonRequest } from "@/lib/api"
 import { errorMessage } from "@/lib/format"
 import type { AuthResponse, CurrentUser, FirstRunResponse } from "@/lib/types"
 
@@ -23,6 +23,22 @@ export function LoginPage() {
   const [password, setPassword] = React.useState("")
   const [error, setError] = React.useState("")
   const [loading, setLoading] = React.useState(false)
+  const [cooldownSeconds, setCooldownSeconds] = React.useState(0)
+
+  React.useEffect(() => {
+    if (cooldownSeconds <= 0) return
+
+    const timer = window.setInterval(() => {
+      setCooldownSeconds((current) => {
+        if (current <= 1) {
+          setError("")
+          return 0
+        }
+        return current - 1
+      })
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [cooldownSeconds])
 
   React.useEffect(() => {
     async function prepare() {
@@ -49,6 +65,7 @@ export function LoginPage() {
 
   async function submit(event: React.FormEvent) {
     event.preventDefault()
+    if (cooldownSeconds > 0) return
     setLoading(true)
     setError("")
     try {
@@ -59,7 +76,12 @@ export function LoginPage() {
       )
       window.location.replace("/#status")
     } catch (nextError) {
-      setError(errorMessage(nextError))
+      if (nextError instanceof ApiError && nextError.status === 429) {
+        setCooldownSeconds(Math.max(1, nextError.retryAfter ?? 60))
+        setError("登录请求过于频繁")
+      } else {
+        setError(errorMessage(nextError))
+      }
     } finally {
       setLoading(false)
     }
@@ -77,7 +99,15 @@ export function LoginPage() {
         <CardContent>
           <form onSubmit={submit}>
             <FieldGroup>
-              {error && <ErrorAlert message={error} />}
+              {error && (
+                <ErrorAlert
+                  message={
+                    cooldownSeconds > 0
+                      ? `${error}，请在 ${cooldownSeconds} 秒后重试`
+                      : error
+                  }
+                />
+              )}
               <Field>
                 <FieldLabel htmlFor="login-username">用户名</FieldLabel>
                 <Input
@@ -85,6 +115,7 @@ export function LoginPage() {
                   autoComplete="username"
                   autoFocus
                   required
+                  disabled={cooldownSeconds > 0}
                   value={username}
                   onChange={(event) => setUsername(event.target.value)}
                 />
@@ -96,20 +127,27 @@ export function LoginPage() {
                   type="password"
                   autoComplete="current-password"
                   required
+                  disabled={cooldownSeconds > 0}
                   value={password}
                   onChange={(event) => setPassword(event.target.value)}
                 />
               </Field>
               <Button
                 type="submit"
-                disabled={loading || !username || !password}
+                disabled={
+                  loading || cooldownSeconds > 0 || !username || !password
+                }
               >
                 {loading ? (
                   <Spinner data-icon="inline-start" />
                 ) : (
                   <LogInIcon data-icon="inline-start" />
                 )}
-                {loading ? "正在登录" : "登录"}
+                {loading
+                  ? "正在登录"
+                  : cooldownSeconds > 0
+                    ? `${cooldownSeconds} 秒后重试`
+                    : "登录"}
               </Button>
             </FieldGroup>
           </form>

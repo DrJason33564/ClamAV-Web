@@ -69,6 +69,10 @@ export type AdminUsersResponse = {
 export type ServiceConfig = {
   history_index_refresh_interval: number
   web_firstrun_completed: number
+  web_login_max_tries: number
+  web_login_max_tries_overall: number
+  web_login_cooldown_interval: number
+  server_trusted_reverseproxy: string
 }
 
 export type ClamAVPowerResponse = {

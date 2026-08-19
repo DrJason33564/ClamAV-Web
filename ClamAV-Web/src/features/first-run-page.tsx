@@ -11,11 +11,16 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
-import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
+import {
+  Field,
+  FieldDescription,
+  FieldGroup,
+  FieldLabel,
+} from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Spinner } from "@/components/ui/spinner"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { api, jsonRequest } from "@/lib/api"
+import { api, ApiError, jsonRequest } from "@/lib/api"
 import { errorMessage } from "@/lib/format"
 import type { AuthResponse, CurrentUser, FirstRunResponse } from "@/lib/types"
 
@@ -25,6 +30,7 @@ export function FirstRunPage() {
   const [mode, setMode] = React.useState<Mode>("register")
   const [username, setUsername] = React.useState("")
   const [password, setPassword] = React.useState("")
+  const [registerToken, setRegisterToken] = React.useState("")
   const [error, setError] = React.useState("")
   const [loading, setLoading] = React.useState(false)
 
@@ -54,6 +60,7 @@ export function FirstRunPage() {
           jsonRequest("POST", {
             username,
             password,
+            token: registerToken,
           }),
           { ignoreUnauthorized: true }
         )
@@ -67,7 +74,23 @@ export function FirstRunPage() {
         throw new Error("只有管理员可以完成首次运行设置")
       await complete()
     } catch (nextError) {
-      setError(errorMessage(nextError))
+      if (
+        mode === "register" &&
+        nextError instanceof ApiError &&
+        nextError.status === 403
+      ) {
+        setError(
+          "管理员注册令牌无效，请检查服务端 ADMIN_REGISTER_TOKEN 配置"
+        )
+      } else if (
+        mode === "register" &&
+        nextError instanceof ApiError &&
+        nextError.status === 409
+      ) {
+        setError("首次管理员注册不可用，请检查首次运行状态")
+      } else {
+        setError(errorMessage(nextError))
+      }
     } finally {
       setLoading(false)
     }
@@ -129,9 +152,32 @@ export function FirstRunPage() {
                     onChange={(event) => setPassword(event.target.value)}
                   />
                 </Field>
+                {mode === "register" && (
+                  <Field>
+                    <FieldLabel htmlFor="setup-register-token">
+                      管理员注册令牌
+                    </FieldLabel>
+                    <Input
+                      id="setup-register-token"
+                      type="password"
+                      autoComplete="off"
+                      required
+                      value={registerToken}
+                      onChange={(event) => setRegisterToken(event.target.value)}
+                    />
+                    <FieldDescription>
+                      输入服务端 ADMIN_REGISTER_TOKEN 的值
+                    </FieldDescription>
+                  </Field>
+                )}
                 <Button
                   type="submit"
-                  disabled={loading || !username || !password}
+                  disabled={
+                    loading ||
+                    !username ||
+                    !password ||
+                    (mode === "register" && !registerToken)
+                  }
                 >
                   {loading ? (
                     <Spinner data-icon="inline-start" />

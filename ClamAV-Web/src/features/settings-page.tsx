@@ -40,6 +40,47 @@ function notifyChange() {
   window.dispatchEvent(new Event("clamav-settings-change"))
 }
 
+function integerInRange(value: string, minimum: number, maximum: number) {
+  return (
+    /^[1-9]\d*$/.test(value) &&
+    Number(value) >= minimum &&
+    Number(value) <= maximum
+  )
+}
+
+function validIPAddress(address: string) {
+  if (!address.includes(":")) {
+    const parts = address.split(".")
+    return (
+      parts.length === 4 &&
+      parts.every(
+        (part) =>
+          /^(0|[1-9]\d{0,2})$/.test(part) && Number(part) >= 0 && Number(part) <= 255
+      )
+    )
+  }
+
+  if (!/^[0-9a-f:.]+$/i.test(address)) return false
+  try {
+    new URL(`http://[${address}]/`)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function trustedProxyAddresses(value: string) {
+  return value.split(",").map((address) => address.trim())
+}
+
+function validTrustedProxy(value: string) {
+  if (!value.trim()) return true
+  const addresses = trustedProxyAddresses(value)
+  return addresses.every(
+    (address) => address !== "" && validIPAddress(address)
+  )
+}
+
 export function SettingsPage({
   user,
   isAdmin,
@@ -62,19 +103,44 @@ export function SettingsPage({
   const [deletePassword, setDeletePassword] = React.useState("")
   const [deleteOpen, setDeleteOpen] = React.useState(false)
   const [serviceInterval, setServiceInterval] = React.useState("")
+  const [loginMaxTries, setLoginMaxTries] = React.useState("")
+  const [loginMaxTriesOverall, setLoginMaxTriesOverall] = React.useState("")
+  const [loginCooldownInterval, setLoginCooldownInterval] =
+    React.useState("")
+  const [trustedReverseProxy, setTrustedReverseProxy] = React.useState("")
   const [saving, setSaving] = React.useState(false)
   const intervalValid = /^[1-9]\d*$/.test(interval)
+  const serviceIntervalValid = integerInRange(serviceInterval, 5, 86400)
+  const loginMaxTriesValid = integerInRange(loginMaxTries, 1, 10000)
+  const loginMaxTriesOverallValid =
+    integerInRange(loginMaxTriesOverall, 1, 1000000) &&
+    loginMaxTriesValid &&
+    Number(loginMaxTriesOverall) >= Number(loginMaxTries)
+  const loginCooldownIntervalValid = integerInRange(
+    loginCooldownInterval,
+    1,
+    86400
+  )
+  const trustedReverseProxyValid = validTrustedProxy(trustedReverseProxy)
   const serviceValid =
-    /^\d+$/.test(serviceInterval) &&
-    Number(serviceInterval) >= 5 &&
-    Number(serviceInterval) <= 86400
+    serviceIntervalValid &&
+    loginMaxTriesValid &&
+    loginMaxTriesOverallValid &&
+    loginCooldownIntervalValid &&
+    trustedReverseProxyValid
+
+  const applyServiceConfig = React.useCallback((config: ServiceConfig) => {
+    setServiceInterval(String(config.history_index_refresh_interval))
+    setLoginMaxTries(String(config.web_login_max_tries))
+    setLoginMaxTriesOverall(String(config.web_login_max_tries_overall))
+    setLoginCooldownInterval(String(config.web_login_cooldown_interval))
+    setTrustedReverseProxy(config.server_trusted_reverseproxy)
+  }, [])
 
   React.useEffect(() => {
     if (!isAdmin) return
     api<ServiceConfig>("/api/config")
-      .then((config) =>
-        setServiceInterval(String(config.history_index_refresh_interval))
-      )
+      .then(applyServiceConfig)
       .catch((error) =>
         toast.add({
           type: "error",
@@ -82,7 +148,7 @@ export function SettingsPage({
           description: errorMessage(error),
         })
       )
-  }, [isAdmin])
+  }, [applyServiceConfig, isAdmin])
 
   function updateDebugging(nextValue: boolean) {
     setDebugging(nextValue)
@@ -147,12 +213,19 @@ export function SettingsPage({
     if (!serviceValid) return
     setSaving(true)
     try {
-      await api(
+      const config = await api<ServiceConfig>(
         "/api/config",
         jsonRequest("PATCH", {
           history_index_refresh_interval: Number(serviceInterval),
+          web_login_max_tries: Number(loginMaxTries),
+          web_login_max_tries_overall: Number(loginMaxTriesOverall),
+          web_login_cooldown_interval: Number(loginCooldownInterval),
+          server_trusted_reverseproxy: trustedReverseProxy.trim()
+            ? trustedProxyAddresses(trustedReverseProxy).join(",")
+            : "",
         })
       )
+      applyServiceConfig(config)
       toast.add({ type: "success", title: "服务配置已保存" })
     } catch (error) {
       toast.add({
@@ -296,13 +369,13 @@ export function SettingsPage({
           <TabsContent value="service" className="mt-4">
             <Card>
               <CardHeader>
-                <CardTitle>历史索引</CardTitle>
-                <CardDescription>配置后台历史索引器的刷新频率</CardDescription>
+                <CardTitle>服务配置</CardTitle>
+                <CardDescription>调整服务端配置项</CardDescription>
               </CardHeader>
               <CardContent>
                 <form onSubmit={saveService}>
                   <FieldGroup>
-                    <Field data-invalid={!serviceValid}>
+                    <Field data-invalid={!serviceIntervalValid}>
                       <FieldLabel htmlFor="service-interval">
                         索引刷新间隔（秒）
                       </FieldLabel>
@@ -310,7 +383,7 @@ export function SettingsPage({
                         id="service-interval"
                         inputMode="numeric"
                         value={serviceInterval}
-                        aria-invalid={!serviceValid}
+                        aria-invalid={!serviceIntervalValid}
                         onChange={(event) =>
                           setServiceInterval(
                             event.target.value.replace(/\D/g, "")
@@ -318,6 +391,84 @@ export function SettingsPage({
                         }
                       />
                       <FieldDescription>允许 5–86400 秒</FieldDescription>
+                    </Field>
+                    <Field data-invalid={!loginMaxTriesValid}>
+                      <FieldLabel htmlFor="login-max-tries">
+                        单 IP 登录请求上限
+                      </FieldLabel>
+                      <Input
+                        id="login-max-tries"
+                        inputMode="numeric"
+                        value={loginMaxTries}
+                        aria-invalid={!loginMaxTriesValid}
+                        onChange={(event) =>
+                          setLoginMaxTries(
+                            event.target.value.replace(/\D/g, "")
+                          )
+                        }
+                      />
+                      <FieldDescription>
+                        十分钟内允许 1–10000 次登录请求
+                      </FieldDescription>
+                    </Field>
+                    <Field data-invalid={!loginMaxTriesOverallValid}>
+                      <FieldLabel htmlFor="login-max-tries-overall">
+                        全局登录请求上限
+                      </FieldLabel>
+                      <Input
+                        id="login-max-tries-overall"
+                        inputMode="numeric"
+                        value={loginMaxTriesOverall}
+                        aria-invalid={!loginMaxTriesOverallValid}
+                        onChange={(event) =>
+                          setLoginMaxTriesOverall(
+                            event.target.value.replace(/\D/g, "")
+                          )
+                        }
+                      />
+                      <FieldDescription>
+                        十分钟内允许全局 1-1000000 次登录请求，不小于单 IP 上限
+                      </FieldDescription>
+                    </Field>
+                    <Field data-invalid={!loginCooldownIntervalValid}>
+                      <FieldLabel htmlFor="login-cooldown-interval">
+                        登录冷却时间（秒）
+                      </FieldLabel>
+                      <Input
+                        id="login-cooldown-interval"
+                        inputMode="numeric"
+                        value={loginCooldownInterval}
+                        aria-invalid={!loginCooldownIntervalValid}
+                        onChange={(event) =>
+                          setLoginCooldownInterval(
+                            event.target.value.replace(/\D/g, "")
+                          )
+                        }
+                      />
+                      <FieldDescription>允许 1–86400 秒</FieldDescription>
+                    </Field>
+                    <Field data-invalid={!trustedReverseProxyValid}>
+                      <FieldLabel htmlFor="trusted-reverse-proxy">
+                        可信反向代理
+                      </FieldLabel>
+                      <Input
+                        id="trusted-reverse-proxy"
+                        autoComplete="off"
+                        placeholder="留空表示不信任任何X-Forwarded-For标头"
+                        value={trustedReverseProxy}
+                        aria-invalid={!trustedReverseProxyValid}
+                        onChange={(event) =>
+                          setTrustedReverseProxy(event.target.value)
+                        }
+                      />
+                      <FieldDescription>
+                        填写单个或多个 IPv4 或 IPv6 地址、用英文半角逗号分隔，不含端口和 CIDR
+                      </FieldDescription>
+                    </Field>
+                    <Field>
+                      <FieldDescription>
+                        修改登录限制会清空当前登录计数和冷却状态，保存后立即生效
+                      </FieldDescription>
                     </Field>
                     <Button
                       className="self-start"

@@ -1,11 +1,25 @@
 export class ApiError extends Error {
   status: number
+  retryAfter: number | null
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, retryAfter: number | null = null) {
     super(message)
     this.name = "ApiError"
     this.status = status
+    this.retryAfter = retryAfter
   }
+}
+
+function readRetryAfter(response: Response) {
+  const value = response.headers.get("Retry-After")
+  if (!value) return null
+
+  const seconds = Number(value)
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds)
+
+  const date = Date.parse(value)
+  if (!Number.isFinite(date)) return null
+  return Math.max(0, Math.ceil((date - Date.now()) / 1000))
 }
 
 export async function api<T>(
@@ -24,7 +38,8 @@ export async function api<T>(
     }
     throw new ApiError(
       body?.error || body?.message || response.statusText,
-      response.status
+      response.status,
+      readRetryAfter(response)
     )
   }
   return response.json() as Promise<T>
