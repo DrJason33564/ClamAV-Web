@@ -10,7 +10,7 @@ ClamAV-Web 是一个单镜像应用：上游 `clamav/clamav:stable_base-debian` 
 | --- | --- |
 | 容器与编排 | Docker 多阶段构建；`startup.sh` 同时监管 ClamAV、cron 和 Go 服务。 |
 | 扫描执行 | POSIX shell 调用 `clamdscan`，写入任务状态、日志、锁和隔离结果。 |
-| 后端 | Go 1.25、标准库 `net/http`、SQLite（`modernc.org/sqlite`）、Argon2id。 |
+| 后端 | Go 1.25、标准库 `net/http`、SQLite（`modernc.org/sqlite`）、fsnotify、Argon2id。 |
 | 前端 | React 19、TypeScript、Vite 8、Tailwind CSS 4、Base UI / shadcn 风格组件。 |
 | 持久化 | 文件系统中的配置、状态、日志与隔离文件；SQLite 保存用户、session 与历史索引。 |
 
@@ -28,6 +28,7 @@ flowchart LR
   R[cron] --> S
   S --> D[clamdscan → clamd]
   S --> T[/state/jobs + status.json/]
+  T -->|fsnotify 增量通知| W
   S --> L[/log/]
   S --> Z[/quarantine/]
 ```
@@ -92,7 +93,7 @@ flowchart LR
 | 位置 | 所有者 | 内容 |
 | --- | --- | --- |
 | `/data/users.db` | Go | users、密码哈希、sessions。 |
-| `/data/history.db` | Go | 由任务 JSON 刷新的历史索引。 |
+| `/data/history.db` | Go | 由任务 JSON 增量更新、并可周期重建的历史索引。 |
 | `/state/jobs/*.json` | shell | 每次扫描的版本化任务状态。 |
 | `/state/status.json` | shell | ClamAV 与最近扫描状态。 |
 | `/config/cron_scan.conf` | Go + shell | 带元数据的定时扫描规则。 |
@@ -101,6 +102,14 @@ flowchart LR
 | `/log`、`/quarantine` | shell | 扫描/检出日志与隔离文件。 |
 
 不要绕过 API 直接修改这些文件，除非同时理解对应的锁、格式校验和重载流程。例如，cron 文件必须经 `cron.sh reload` 校验并生成 `/etc/cron.d/clamav-scheduled-scan`。
+
+### 历史索引同步
+
+服务启动时会完整扫描一次 `/state/jobs/*.json`。运行期间，Go 后端通过 fsnotify 监听任务目录，对新增、替换、修改或删除的 JSON 文件进行去抖后的单文件索引，因此 shell 和 cron 创建的任务无需等待下一次周期刷新。
+
+`HISTORY_INDEX_REFRESH_INTERVAL` 仍控制周期完整刷新，作为丢失文件事件或监听不可用时的可靠性兜底。完整刷新会一次性加载数据库内全部文件 mtime，在内存中与目录内容比对；mtime 未变化的 JSON 不会重新解析，数据库中不再存在的文件会被清除。
+
+监听初始化失败时按 5、10、20、40、60 秒阶梯退避，达到 60 秒后保持该间隔；连续失败 10 次会停止监听、向标准日志写入错误，并继续使用周期完整刷新。运行中的 watcher 报错会请求完整刷新，但重复请求会合并，最多每 60 秒执行一次；正常的单文件事件不受该限流影响。
 
 ### 异步查询模式
 

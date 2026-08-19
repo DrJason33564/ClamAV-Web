@@ -590,9 +590,9 @@ TimeDock 模式下，新增和删除请求中的路径都必须位于当前用�
 
 ## 10. 历史任务与 SQLite 索引
 
-服务启动时扫描一次 `/state/jobs`，之后按 `HISTORY_INDEX_REFRESH_INTERVAL` 周期刷新。只接受 version 2 JSON，version 1、旧文件名和无 owner 文件不会进入索引。
+服务启动时扫描一次 `/state/jobs`，运行期间监听任务 JSON 的新增、替换、修改和删除并进行单文件增量索引；`HISTORY_INDEX_REFRESH_INTERVAL` 控制周期完整刷新，作为文件事件丢失或监听不可用时的兜底。只接受 version 2 JSON，version 1、旧文件名和无 owner 文件不会进入索引。
 
-文件 mtime 未变化时不会重复解析 JSON。文件删除、损坏或变成非 version 2 后，相应索引会被删除。
+周期完整刷新会批量读取已索引文件的 mtime，并在内存中完成比对；mtime 未变化时不会重复解析 JSON。文件事件触发的增量索引不依赖 mtime，以免同一时间粒度内的连续原子替换被跳过。文件删除、损坏或变成非 version 2 后，相应索引会被删除。
 
 ### `POST /api/results/lookups?scope=1-20`
 
