@@ -101,11 +101,8 @@ append_file_with_timestamp() {
 
 action_args() {
     case "$ACTION" in
-        warn)
+        warn|move)
             printf '%s' ''
-            ;;
-        move)
-            printf '%s' "--move=$QUARANTINE_DIR"
             ;;
         remove)
             printf '%s' "--remove=yes"
@@ -169,15 +166,204 @@ write_detection_line() {
     printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$DETECTION_LOG"
 }
 
-write_quarantine_record() {
-    source_file="$1"
+path_exists() {
+    [ -e "$1" ] || [ -L "$1" ]
+}
 
-    [ "$ACTION" = "move" ] || return 0
+byte_length() {
+    LC_ALL=C printf '%s' "$1" | wc -c | tr -d ' '
+}
 
-    detected_name="$(basename "$source_file" 2>/dev/null || printf '%s' "$source_file")"
-    record_file="${QUARANTINE_DIR}/${detected_name}.rec"
-    printf '"%s" %s\n' "$source_file" "$JOB_USER" > "$record_file"
-    log "[INFO] Quarantine source record saved to: $record_file"
+command_error_text() {
+    tr '\n' ' ' < "$MOVE_ERROR_FILE" | sed 's/[[:space:]]*$//'
+}
+
+cleanup_failed_quarantine_target() {
+    failed_target="$1"
+
+    if ! path_exists "$failed_target"; then
+        return 0
+    fi
+    if rm -f "$failed_target" 2> "$MOVE_ERROR_FILE"; then
+        return 0
+    fi
+
+    log "[ERROR] Failed to clean incomplete quarantine target: $failed_target; $(command_error_text)"
+    return 1
+}
+
+verify_completed_move() {
+    verify_source="$1"
+    verify_target="$2"
+
+    ! path_exists "$verify_source" && path_exists "$verify_target"
+}
+
+prepare_move_fallback() {
+    fallback_source="$1"
+    fallback_target="$2"
+
+    # If the source disappeared, the target may be the only remaining copy.
+    # Preserve it for manual recovery instead of deleting potentially unique data.
+    if ! path_exists "$fallback_source"; then
+        log "[ERROR] Source disappeared during quarantine fallback; preserving target if present: $fallback_target"
+        return 1
+    fi
+    cleanup_failed_quarantine_target "$fallback_target"
+}
+
+move_detected_file() {
+    move_source="$1"
+    move_target="$2"
+    MOVE_METHOD=""
+
+    if ! path_exists "$move_source"; then
+        log "[ERROR] Quarantine failed: source file no longer exists: $move_source"
+        return 1
+    fi
+
+    if cp -l "$move_source" "$move_target" 2> "$MOVE_ERROR_FILE"; then
+        if rm "$move_source" 2> "$MOVE_ERROR_FILE"; then
+            if verify_completed_move "$move_source" "$move_target"; then
+                MOVE_METHOD="hard-link"
+                return 0
+            fi
+            log "[ERROR] Hard-link move returned success but verification failed: source=$move_source target=$move_target"
+            return 1
+        fi
+        log "[WARN] Hard-link created but source deletion failed; falling back to copy: source=$move_source target=$move_target; $(command_error_text)"
+    else
+        log "[WARN] Hard-link move failed; falling back to copy: source=$move_source target=$move_target; $(command_error_text)"
+    fi
+    if ! prepare_move_fallback "$move_source" "$move_target"; then
+        return 1
+    fi
+
+    if cp -p "$move_source" "$move_target" 2> "$MOVE_ERROR_FILE"; then
+        if rm "$move_source" 2> "$MOVE_ERROR_FILE"; then
+            if verify_completed_move "$move_source" "$move_target"; then
+                MOVE_METHOD="copy"
+                return 0
+            fi
+            log "[ERROR] Copy move returned success but verification failed: source=$move_source target=$move_target"
+            return 1
+        fi
+        log "[WARN] Copy completed but source deletion failed; falling back to mv: source=$move_source target=$move_target; $(command_error_text)"
+    else
+        log "[WARN] Copy move failed; falling back to mv: source=$move_source target=$move_target; $(command_error_text)"
+    fi
+    if ! prepare_move_fallback "$move_source" "$move_target"; then
+        return 1
+    fi
+
+    if mv "$move_source" "$move_target" 2> "$MOVE_ERROR_FILE"; then
+        if verify_completed_move "$move_source" "$move_target"; then
+            MOVE_METHOD="mv"
+            return 0
+        fi
+        log "[ERROR] mv returned success but verification failed: source=$move_source target=$move_target"
+        return 1
+    fi
+
+    log "[ERROR] mv fallback failed: source=$move_source target=$move_target; $(command_error_text)"
+    if path_exists "$move_source"; then
+        cleanup_failed_quarantine_target "$move_target" || return 1
+    else
+        log "[ERROR] Source disappeared after mv failure; preserving target if present: $move_target"
+    fi
+    return 1
+}
+
+reserve_quarantine_name() {
+    reserve_source="$1"
+    reserve_base="$(basename "$reserve_source" 2>/dev/null || printf '%s' "$reserve_source")"
+    reserve_index=0
+
+    case "$reserve_base" in
+        *.rec|clamav-quarantine-lock)
+            reserve_index=1
+            ;;
+    esac
+
+    while :; do
+        if [ "$reserve_index" -eq 0 ]; then
+            reserve_name="$reserve_base"
+        else
+            reserve_suffix="$(printf '%03d' "$reserve_index")"
+            reserve_name="${reserve_base}.${reserve_suffix}"
+        fi
+        reserve_record_name="${reserve_name}.rec"
+
+        if [ "$(byte_length "$reserve_name")" -gt "$QUARANTINE_NAME_MAX" ] || \
+           [ "$(byte_length "$reserve_record_name")" -gt "$QUARANTINE_NAME_MAX" ]; then
+            log "[ERROR] Quarantine failed: target filename exceeds NAME_MAX=${QUARANTINE_NAME_MAX}: $reserve_name"
+            return 1
+        fi
+
+        reserve_target="${QUARANTINE_DIR}/${reserve_name}"
+        reserve_record="${QUARANTINE_DIR}/${reserve_record_name}"
+        if path_exists "$reserve_target" || path_exists "$reserve_record"; then
+            reserve_index=$((reserve_index + 1))
+            continue
+        fi
+
+        # An empty record is an invalid, invisible reservation. The valid record
+        # is atomically published only after the file has moved successfully.
+        if (set -C; : > "$reserve_record") 2>/dev/null; then
+            QUARANTINE_TARGET="$reserve_target"
+            QUARANTINE_RECORD="$reserve_record"
+            return 0
+        fi
+        if path_exists "$reserve_target" || path_exists "$reserve_record"; then
+            reserve_index=$((reserve_index + 1))
+            continue
+        fi
+
+        log "[ERROR] Quarantine failed: cannot reserve target record: $reserve_record"
+        return 1
+    done
+}
+
+quarantine_detected_file() {
+    quarantine_source="$1"
+    QUARANTINE_TARGET=""
+    QUARANTINE_RECORD=""
+
+    if ! reserve_quarantine_name "$quarantine_source"; then
+        return 1
+    fi
+
+    if ! quarantine_tmp_record="$(mktemp "${QUARANTINE_DIR}/.quarantine-rec.XXXXXX")"; then
+        log "[ERROR] Quarantine failed: cannot create temporary metadata for: $quarantine_source"
+        rm -f "$QUARANTINE_RECORD" 2>/dev/null || true
+        return 1
+    fi
+    if ! printf '"%s" %s\n' "$quarantine_source" "$JOB_USER" > "$quarantine_tmp_record"; then
+        log "[ERROR] Quarantine failed: cannot write temporary metadata for: $quarantine_source"
+        rm -f "$quarantine_tmp_record" "$QUARANTINE_RECORD" 2>/dev/null || true
+        return 1
+    fi
+
+    if ! move_detected_file "$quarantine_source" "$QUARANTINE_TARGET"; then
+        rm -f "$quarantine_tmp_record" "$QUARANTINE_RECORD" 2>/dev/null || true
+        log "[ERROR] Quarantine failed: source=$quarantine_source target=$QUARANTINE_TARGET"
+        return 1
+    fi
+
+    if mv "$quarantine_tmp_record" "$QUARANTINE_RECORD" 2> "$MOVE_ERROR_FILE"; then
+        log "[INFO] Quarantine succeeded: source=$quarantine_source target=$QUARANTINE_TARGET method=$MOVE_METHOD"
+        log "[INFO] Quarantine source record saved to: $QUARANTINE_RECORD"
+        return 0
+    fi
+
+    log "[ERROR] Failed to publish quarantine metadata: source=$quarantine_source target=$QUARANTINE_TARGET record=$QUARANTINE_RECORD; $(command_error_text)"
+    rm -f "$quarantine_tmp_record" "$QUARANTINE_RECORD" 2>/dev/null || true
+    if mv "$QUARANTINE_TARGET" "$quarantine_source" 2> "$MOVE_ERROR_FILE"; then
+        log "[WARN] Quarantine move rolled back after metadata failure: target=$QUARANTINE_TARGET source=$quarantine_source"
+    else
+        log "[ERROR] Failed to roll back quarantined file after metadata failure: target=$QUARANTINE_TARGET source=$quarantine_source; $(command_error_text)"
+    fi
+    return 1
 }
 
 log_detections_from_output() {
@@ -188,6 +374,7 @@ log_detections_from_output() {
         case "$line" in
             *" FOUND")
                 found=1
+                DETECTION_COUNT=$((DETECTION_COUNT + 1))
                 source_file="$(printf '%s\n' "$line" | sed 's/: [^:]* FOUND$//')"
                 detection_reason="$(printf '%s\n' "$line" | sed 's/^.*: //; s/ FOUND$//')"
                 source_dir="$(dirname "$source_file" 2>/dev/null || printf '%s' "unknown")"
@@ -198,7 +385,13 @@ log_detections_from_output() {
                 write_detection_line "[DETECTION] Detection reason : $detection_reason"
                 write_detection_line "[DETECTION] Quarantine dir   : $QUARANTINE_DIR"
                 write_detection_line "------------------------------------------"
-                write_quarantine_record "$source_file"
+                if [ "$ACTION" = "move" ]; then
+                    if quarantine_detected_file "$source_file"; then
+                        QUARANTINE_SUCCESS_COUNT=$((QUARANTINE_SUCCESS_COUNT + 1))
+                    else
+                        QUARANTINE_FAILURE_COUNT=$((QUARANTINE_FAILURE_COUNT + 1))
+                    fi
+                fi
                 ;;
             *)
                 log "$line"
@@ -391,6 +584,13 @@ fi
 
 mkdir -p "$LOG_DIR" "$JOBS_DIR" "$QUARANTINE_DIR"
 
+QUARANTINE_NAME_MAX="$(getconf NAME_MAX "$QUARANTINE_DIR" 2>/dev/null || printf '%s' '255')"
+case "$QUARANTINE_NAME_MAX" in
+    ''|*[!0-9]*|0)
+        QUARANTINE_NAME_MAX=255
+        ;;
+esac
+
 if [ -z "$JOB_ID" ]; then
     JOB_ID="$(make_job_id)"
 fi
@@ -410,6 +610,9 @@ ACTIVE_JOB_JSON="\"$(json_escape "$JOB_ID")\""
 LAST_JOB_JSON="\"$(json_escape "$JOB_ID")\""
 CLAMDSCAN_PID_JSON="null"
 SCAN_HEADER_LOGGED=0
+DETECTION_COUNT=0
+QUARANTINE_SUCCESS_COUNT=0
+QUARANTINE_FAILURE_COUNT=0
 
 touch "$JOB_LOG"
 trap cleanup_lock EXIT INT TERM
@@ -463,7 +666,8 @@ if [ "$ACTION" = "move" ] && [ ! -d "$QUARANTINE_DIR" ]; then
 fi
 
 tmp_output="$(mktemp)"
-trap 'rm -f "$tmp_output"; cleanup_lock' EXIT INT TERM
+MOVE_ERROR_FILE="$(mktemp)"
+trap 'rm -f "$tmp_output" "$MOVE_ERROR_FILE"; cleanup_lock' EXIT INT TERM
 
 log_scan_header
 
@@ -505,7 +709,20 @@ case "$rc" in
         ;;
     1)
         log "[ALERT] Threat found while scanning: $TARGET"
+        if [ "$ACTION" = "move" ] && [ "$DETECTION_COUNT" -eq 0 ]; then
+            QUARANTINE_FAILURE_COUNT=$((QUARANTINE_FAILURE_COUNT + 1))
+            log "[ERROR] ClamAV reported a threat, but no detected file path could be parsed for quarantine."
+        fi
+        if [ "$ACTION" = "move" ] && [ "$QUARANTINE_FAILURE_COUNT" -gt 0 ]; then
+            log "[ERROR] Quarantine summary: detected=$DETECTION_COUNT succeeded=$QUARANTINE_SUCCESS_COUNT failed=$QUARANTINE_FAILURE_COUNT"
+            write_job_state "failed" "$FINISHED_AT" "74" "error" "\"$(json_escape "$DETECTION_LOG")\"" "Threats were detected, but one or more files failed to move to quarantine."
+            write_status "error" "Threats were detected, but one or more files could not be moved to quarantine."
+            exit 74
+        fi
         log_applied_action
+        if [ "$ACTION" = "move" ]; then
+            log "[INFO] Quarantine summary: detected=$DETECTION_COUNT succeeded=$QUARANTINE_SUCCESS_COUNT failed=0"
+        fi
         write_job_state "finished" "$FINISHED_AT" "$rc" "found" "\"$(json_escape "$DETECTION_LOG")\"" "Threat found while scanning."
         write_status "ready" "Threat found while scanning."
         ;;
