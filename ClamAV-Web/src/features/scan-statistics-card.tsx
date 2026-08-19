@@ -250,7 +250,6 @@ export function ScanStatisticsCard() {
   const inputInvalid = normalizeScope(scopeInput) === null
   const peak = Math.max(0, ...data.map((point) => point.total))
   const yMaximum = Math.max(5, peak)
-  const yTicks = Array.from({ length: yMaximum + 1 }, (_, index) => index)
   const chartMinimumWidth = Math.max(480, data.length * 48)
   const noData =
     total !== null && (total === 0 || data.every((point) => point.total === 0))
@@ -310,7 +309,7 @@ export function ScanStatisticsCard() {
                 />
                 <YAxis
                   domain={[0, yMaximum]}
-                  ticks={yTicks}
+                  tickCount={6}
                   allowDecimals={false}
                   tickLine={false}
                   axisLine={false}
