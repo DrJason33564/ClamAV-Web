@@ -78,7 +78,7 @@ func TestUserSchemaAndAdminTimeDockAccount(t *testing.T) {
 func TestAdminCreateUserSetsTimeDockAccountAndListResult(t *testing.T) {
 	s := newDatabaseTestServer(t)
 	register := httptest.NewRecorder()
-	s.handleAuthRegister(register, httptest.NewRequest(http.MethodPost, "/api/auth/register", strings.NewReader(`{"username":"admin","password":"correct horse battery staple"}`)))
+	s.handleAuthRegister(register, httptest.NewRequest(http.MethodPost, "/api/auth/register", strings.NewReader(`{"username":"admin","password":"correct horse battery staple","token":"test-admin-token"}`)))
 	if register.Code != http.StatusCreated {
 		t.Fatalf("admin registration failed: %d %s", register.Code, register.Body.String())
 	}

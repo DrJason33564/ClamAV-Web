@@ -57,7 +57,7 @@ docker run -d \
 http://主机地址:8080
 ```
 
-首次启动会自动生成服务配置和 SQLite 数据库。用户数据库为空时，通过首次运行流程注册的第一个账户会被设为 admin；之后只有 admin 可以新增、禁用、启用或删除用户。密码不会以明文写入环境变量或数据库。
+首次启动会自动生成服务配置和 SQLite 数据库。用户数据库为空时，通过首次运行流程注册的第一个账户会被设为 admin；该请求必须提供与非空环境变量 `ADMIN_REGISTER_TOKEN` 一致的令牌。之后只有 admin 可以新增、禁用、启用或删除用户。密码不会以明文写入环境变量或数据库。
 
 ## WebUI 使用指南
 
@@ -185,6 +185,7 @@ WebUI 在增删信任条目后会自动更新 allow-list 并让 ClamAV 重新加
 | --- | --- | --- |
 | `SCANNER_ADDR` | `:8080` | Web 服务监听地址 |
 | `SCANNER_COOKIE_SECURE` | `false` | HTTPS 反向代理部署时设为 `true`，为登录 Cookie 添加 `Secure` |
+| `ADMIN_REGISTER_TOKEN` | 无 | 首次创建管理员时必须在注册请求的 `token` 字段提供相同的非空值；建议通过容器 secret 注入 |
 | `IS_TIMEDOCK` | `N` | `Y` 时按用户的 TimeDock 账户限制 `/scan` 设备目录浏览及路径提交；只接受 `Y` 或 `N` |
 | `USER_DATABASE_FILE` | `/data/users.db` | 用户、密码哈希和登录 session 数据库路径 |
 | `HISTORY_DATABASE_FILE` | `/data/history.db` | 扫描历史索引数据库路径 |

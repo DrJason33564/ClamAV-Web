@@ -1,13 +1,16 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func newDatabaseTestServer(t *testing.T) *server {
@@ -28,13 +31,14 @@ func newDatabaseTestServer(t *testing.T) *server {
 		t.Fatal(err)
 	}
 	s := &server{
-		cfg:               config{JobsDir: filepath.Join(tmp, "jobs"), LogDir: filepath.Join(tmp, "log")},
+		cfg:               config{JobsDir: filepath.Join(tmp, "jobs"), LogDir: filepath.Join(tmp, "log"), AdminRegisterToken: "test-admin-token"},
 		userDB:            userDB,
 		historyDB:         historyDB,
 		appConfig:         app,
 		batches:           map[string]*scanBatch{},
 		resultLookups:     map[string]*resultLookup{},
 		quarantineLookups: map[string]*quarantineLookup{},
+		loginLimiter:      newLoginLimiter(),
 	}
 	if err := os.MkdirAll(s.cfg.JobsDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -46,7 +50,7 @@ func newDatabaseTestServer(t *testing.T) *server {
 func TestFirstRegistrationCreatesAdminAndCookieLogin(t *testing.T) {
 	s := newDatabaseTestServer(t)
 	register := httptest.NewRecorder()
-	s.handleAuthRegister(register, httptest.NewRequest(http.MethodPost, "/api/auth/register", strings.NewReader(`{"username":"alice","password":"correct horse battery staple"}`)))
+	s.handleAuthRegister(register, httptest.NewRequest(http.MethodPost, "/api/auth/register", strings.NewReader(`{"username":"alice","password":"correct horse battery staple","token":"test-admin-token"}`)))
 	if register.Code != http.StatusCreated {
 		t.Fatalf("register failed: %d %s", register.Code, register.Body.String())
 	}
@@ -68,6 +72,107 @@ func TestFirstRegistrationCreatesAdminAndCookieLogin(t *testing.T) {
 	s.requireAuth(http.HandlerFunc(s.handleAuthMe)).ServeHTTP(response, request)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"username":"alice"`) || !strings.Contains(response.Body.String(), `"timedock_account":"Jason"`) {
 		t.Fatalf("authenticated request failed: %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestFirstRegistrationRequiresConfiguredToken(t *testing.T) {
+	for _, test := range []struct {
+		name, configured, provided string
+		want                       int
+	}{
+		{"missing environment token", "", "", http.StatusForbidden},
+		{"missing request token", "test-admin-token", "", http.StatusForbidden},
+		{"incorrect token", "test-admin-token", "wrong", http.StatusForbidden},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := newDatabaseTestServer(t)
+			s.cfg.AdminRegisterToken = test.configured
+			body := `{"username":"alice","password":"correct horse battery staple","token":"` + test.provided + `"}`
+			response := httptest.NewRecorder()
+			s.handleAuthRegister(response, httptest.NewRequest(http.MethodPost, "/api/auth/register", strings.NewReader(body)))
+			if response.Code != test.want {
+				t.Fatalf("expected %d, got %d: %s", test.want, response.Code, response.Body.String())
+			}
+			var count int
+			if err := s.userDB.QueryRow("SELECT COUNT(*) FROM users").Scan(&count); err != nil || count != 0 {
+				t.Fatalf("invalid token must not create a user, count=%d err=%v", count, err)
+			}
+		})
+	}
+}
+
+func TestFirstRegistrationDoesNotReopenAfterFirstRunCompleted(t *testing.T) {
+	s := newDatabaseTestServer(t)
+	cfg := s.appConfig.get()
+	cfg.WebFirstRunCompleted = 2
+	if err := s.appConfig.update(cfg); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	s.handleAuthRegister(response, httptest.NewRequest(http.MethodPost, "/api/auth/register", strings.NewReader(`{"username":"alice","password":"correct horse battery staple","token":"test-admin-token"}`)))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("expected completed first-run state to return 409, got %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestFirstRegistrationIsSerialized(t *testing.T) {
+	s := newDatabaseTestServer(t)
+	var workers sync.WaitGroup
+	statuses := make(chan int, 2)
+	for _, username := range []string{"alice", "bob"} {
+		workers.Add(1)
+		go func(username string) {
+			defer workers.Done()
+			body := `{"username":"` + username + `","password":"correct horse battery staple","token":"test-admin-token"}`
+			response := httptest.NewRecorder()
+			s.handleAuthRegister(response, httptest.NewRequest(http.MethodPost, "/api/auth/register", strings.NewReader(body)))
+			statuses <- response.Code
+		}(username)
+	}
+	workers.Wait()
+	close(statuses)
+	created := 0
+	for status := range statuses {
+		if status == http.StatusCreated {
+			created++
+		}
+	}
+	if created != 1 {
+		t.Fatalf("expected exactly one first administrator, got %d", created)
+	}
+	var count int
+	if err := s.userDB.QueryRow("SELECT COUNT(*) FROM users").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("expected one user row, count=%d err=%v", count, err)
+	}
+}
+
+func TestLoginLimitUsesIPInsteadOfUsername(t *testing.T) {
+	s := newDatabaseTestServer(t)
+	cfg := s.appConfig.get()
+	cfg.WebLoginMaxTries = 2
+	cfg.WebLoginMaxTriesOverall = 10
+	cfg.WebLoginCooldownInterval = 60
+	if err := s.appConfig.update(cfg); err != nil {
+		t.Fatal(err)
+	}
+	for attempt, username := range []string{"missing-one", "missing-two"} {
+		request := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"username":"`+username+`","password":"incorrect password"}`))
+		request.RemoteAddr = "192.0.2.10:1234"
+		response := httptest.NewRecorder()
+		s.handleAuthLogin(response, request)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d expected 401, got %d: %s", attempt+1, response.Code, response.Body.String())
+		}
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"username":"another-name","password":"incorrect password"}`))
+	request.RemoteAddr = "192.0.2.10:1234"
+	response := httptest.NewRecorder()
+	s.handleAuthLogin(response, request)
+	if response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") == "" {
+		t.Fatalf("username changes must not bypass the source limit: %d headers=%v body=%s", response.Code, response.Header(), response.Body.String())
+	}
+	if len(s.loginLimiter.byIP) != 1 {
+		t.Fatalf("one source should create one limiter entry, got %d", len(s.loginLimiter.byIP))
 	}
 }
 
@@ -164,6 +269,10 @@ func TestAppConfigRoundTrip(t *testing.T) {
 	cfg := store.get()
 	cfg.HistoryIndexRefreshInterval = 120
 	cfg.WebFirstRunCompleted = 2
+	cfg.WebLoginMaxTries = 12
+	cfg.WebLoginMaxTriesOverall = 120
+	cfg.WebLoginCooldownInterval = 300
+	cfg.ServerTrustedReverseProxy = "2001:db8::10"
 	if err := store.update(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -174,6 +283,51 @@ func TestAppConfigRoundTrip(t *testing.T) {
 	parsed, err := parseAppConfig(string(data))
 	if err != nil || parsed != cfg {
 		t.Fatalf("config did not round trip: %#v err=%v", parsed, err)
+	}
+}
+
+func TestAppConfigRejectsInvalidLoginAndProxySettings(t *testing.T) {
+	base := defaultAppConfig()
+	for name, mutate := range map[string]func(*appConfig){
+		"zero per-IP limit":       func(cfg *appConfig) { cfg.WebLoginMaxTries = 0 },
+		"overall below per-IP":    func(cfg *appConfig) { cfg.WebLoginMaxTriesOverall = cfg.WebLoginMaxTries - 1 },
+		"zero cooldown":           func(cfg *appConfig) { cfg.WebLoginCooldownInterval = 0 },
+		"invalid trusted proxy":   func(cfg *appConfig) { cfg.ServerTrustedReverseProxy = "proxy.example.com" },
+		"trusted proxy with port": func(cfg *appConfig) { cfg.ServerTrustedReverseProxy = "192.0.2.1:8080" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := base
+			mutate(&cfg)
+			if err := validateAppConfig(cfg); err == nil {
+				t.Fatalf("expected invalid configuration to be rejected: %#v", cfg)
+			}
+		})
+	}
+}
+
+func TestServiceConfigUpdatesLoginLimitsAndTrustedProxy(t *testing.T) {
+	s := newDatabaseTestServer(t)
+	if allowed, _ := s.loginLimiter.allow("192.0.2.1", time.Now(), s.appConfig.get()); !allowed {
+		t.Fatal("failed to seed login limiter")
+	}
+	request := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(`{
+  "web_login_max_tries": 5,
+  "web_login_max_tries_overall": 50,
+  "web_login_cooldown_interval": 120,
+  "server_trusted_reverseproxy": "2001:db8::10"
+}`))
+	request = request.WithContext(context.WithValue(request.Context(), actorContextKey{}, actor{Username: "admin", Role: "admin"}))
+	response := httptest.NewRecorder()
+	s.handleServiceConfig(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("config update failed: %d %s", response.Code, response.Body.String())
+	}
+	cfg := s.appConfig.get()
+	if cfg.WebLoginMaxTries != 5 || cfg.WebLoginMaxTriesOverall != 50 || cfg.WebLoginCooldownInterval != 120 || cfg.ServerTrustedReverseProxy != "2001:db8::10" {
+		t.Fatalf("unexpected updated config: %#v", cfg)
+	}
+	if len(s.loginLimiter.byIP) != 0 {
+		t.Fatal("changing login limits should reset in-memory limiter state")
 	}
 }
 

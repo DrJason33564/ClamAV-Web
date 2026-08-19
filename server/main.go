@@ -29,12 +29,12 @@ type server struct {
 	clamavPowerMu            sync.Mutex
 	configFileMu             sync.Mutex
 	accountDeleteMu          sync.Mutex
+	registrationMu           sync.Mutex
 	userDB                   *sql.DB
 	historyDB                *sql.DB
 	appConfig                *appConfigStore
 	history                  *historyIndexer
-	loginMu                  sync.Mutex
-	loginAttempts            map[string]loginAttempt
+	loginLimiter             *loginLimiter
 }
 
 func main() {
@@ -65,7 +65,7 @@ func main() {
 		userDB:                   userDB,
 		historyDB:                historyDB,
 		appConfig:                appConfig,
-		loginAttempts:            make(map[string]loginAttempt),
+		loginLimiter:             newLoginLimiter(),
 	}
 	s.history = &historyIndexer{db: historyDB, jobsDir: cfg.JobsDir}
 	if err := s.history.refresh(context.Background()); err != nil {
@@ -75,6 +75,7 @@ func main() {
 	defer cancel()
 	go s.runHistoryIndexer(ctx)
 	go s.runSessionJanitor(ctx)
+	go s.loginLimiter.runJanitor(ctx)
 
 	mux := http.NewServeMux()
 	mux.Handle("/", frontendHandler())

@@ -19,7 +19,7 @@
 
 除以下接口和静态页面外，所有 `/api/` 请求都需要有效 Cookie：
 
-- `POST /api/auth/register`：仅数据库为空时可匿名创建首任 admin；
+- `POST /api/auth/register`：仅数据库为空且提供正确 `ADMIN_REGISTER_TOKEN` 时可匿名创建首任 admin；
 - `POST /api/auth/login`；
 - `GET /api/first-run/status`。
 
@@ -64,6 +64,7 @@ admin 额外拥有的权限仅包括：
 - `403`：角色权限不足或跨来源请求被拒绝；
 - `404`：资源不存在或资源不属于当前用户；
 - `409`：扫描锁、休眠状态、最后一名 admin 或用户删除冲突；
+- `429`：登录请求达到单 IP 或全局限制；响应包含 `Retry-After`；
 - `500`：后端、文件系统、SQLite 或外部命令失败。
 
 对其他用户资源的访问通常返回 `404`，避免泄露资源是否存在。
@@ -119,14 +120,19 @@ WEB_FIRSTRUN_COMPLETED=2
   "username": "alice",
   "password": "a sufficiently long password",
   "role": "user",
-  "timedock_account": "Alice30"
+  "timedock_account": "Alice30",
+  "token": "value from ADMIN_REGISTER_TOKEN"
 }
 ```
 
 两种行为：
 
-1. 用户表为空：允许匿名调用，密码必填，首个用户强制为 `admin`；
+1. 用户表为空且 `WEB_FIRSTRUN_COMPLETED=0`：允许匿名调用，密码必填，首个用户强制为 `admin`；请求体的 `token` 必须与非空环境变量 `ADMIN_REGISTER_TOKEN` 完全一致；
 2. 用户表非空：仅 admin 可调用，`role` 可为 `user` 或 `admin`，密码可省略。
+
+环境令牌只保护首位管理员注册。用户表非空后，`token` 可省略且不参与后续 admin 创建用户
+的权限判断。环境变量未设置、令牌缺失或令牌错误时返回 `403`；首次运行已经完成但用户表
+为空时返回 `409`，不会重新开放匿名注册。
 
 密码省略时账户会被创建，但在 admin 设置密码前不能登录。
 
@@ -159,6 +165,15 @@ WEB_FIRSTRUN_COMPLETED=2
 ```
 
 被禁用、正在删除、无密码、用户名不存在或密码错误时统一返回 `401`。
+
+登录限制按客户端 IP 和全局十分钟窗口计数，用户名变化不会产生新的限额。所有进入处理
+流程的登录请求都会计数。达到单 IP 上限后仅该 IP 进入冷却；达到全局上限后所有登录进入
+冷却。冷却期间返回 `429` 和 `Retry-After`，且不查询数据库或执行 Argon2，其他 API 不受
+影响。
+
+默认仅使用连接的 `RemoteAddr`。设置 `SERVER_TRUSTED_REVERSEPROXY` 后，只有直接来源为
+该可信 IPv4/IPv6 地址的请求才优先使用 `X-Forwarded-For` 首项；头缺失或非法时回退到
+`RemoteAddr`。完整配置语义见 [`server_conf.md`](server_conf.md)。
 
 ### `POST /api/auth/logout`
 
@@ -323,7 +338,11 @@ WEB_FIRSTRUN_COMPLETED=2
 ```json
 {
   "history_index_refresh_interval": 60,
-  "web_firstrun_completed": 2
+  "web_firstrun_completed": 2,
+  "web_login_max_tries": 10,
+  "web_login_max_tries_overall": 100,
+  "web_login_cooldown_interval": 600,
+  "server_trusted_reverseproxy": "192.0.2.10"
 }
 ```
 
@@ -332,10 +351,18 @@ WEB_FIRSTRUN_COMPLETED=2
 仅 admin。当前可修改：
 
 ```json
-{"history_index_refresh_interval":120}
+{
+  "history_index_refresh_interval": 120,
+  "web_login_max_tries": 10,
+  "web_login_max_tries_overall": 100,
+  "web_login_cooldown_interval": 600,
+  "server_trusted_reverseproxy": "2001:db8::10"
+}
 ```
 
-允许范围为 5–86400 秒。后台索引器会在下一轮采用新间隔，无需重启。
+历史刷新间隔允许范围为 5–86400 秒。登录限制和可信反代字段的范围、默认值及安全要求见
+[`server_conf.md`](server_conf.md)。修改任一登录限制会清空当前登录计数与冷却状态；可信
+反代修改立即应用。传入空字符串可取消可信反代。
 
 ### `POST /api/clamav/sleep`
 
@@ -759,3 +786,5 @@ lookup。
 | `/quarantine/*` | 隔离文件及 owner 元数据 |
 
 `/data`、`/config`、`/state`、`/log` 和 `/quarantine` 都应持久化。`USER_DATABASE_FILE` 和 `HISTORY_DATABASE_FILE` 可分别覆盖两个数据库路径。历史索引库可以从 version 2 JSON 重建，但用户和 session 只能从用户库恢复。
+
+`clamavweb.conf` 的全部字段、默认值和校验规则见 [`server_conf.md`](server_conf.md)。

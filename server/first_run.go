@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"net/http"
+	"strings"
 )
 
 func (s *server) handleFirstRunStatus(w http.ResponseWriter, r *http.Request) {
@@ -54,7 +55,11 @@ func (s *server) handleServiceConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.appConfig.get())
 	case http.MethodPatch, http.MethodPut:
 		var req struct {
-			HistoryIndexRefreshInterval *int `json:"history_index_refresh_interval"`
+			HistoryIndexRefreshInterval *int    `json:"history_index_refresh_interval"`
+			WebLoginMaxTries            *int    `json:"web_login_max_tries"`
+			WebLoginMaxTriesOverall     *int    `json:"web_login_max_tries_overall"`
+			WebLoginCooldownInterval    *int    `json:"web_login_cooldown_interval"`
+			ServerTrustedReverseProxy   *string `json:"server_trusted_reverseproxy"`
 		}
 		if err := decodeJSONBody(r, &req); err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -64,9 +69,25 @@ func (s *server) handleServiceConfig(w http.ResponseWriter, r *http.Request) {
 		if req.HistoryIndexRefreshInterval != nil {
 			cfg.HistoryIndexRefreshInterval = *req.HistoryIndexRefreshInterval
 		}
+		oldLoginCfg := cfg
+		if req.WebLoginMaxTries != nil {
+			cfg.WebLoginMaxTries = *req.WebLoginMaxTries
+		}
+		if req.WebLoginMaxTriesOverall != nil {
+			cfg.WebLoginMaxTriesOverall = *req.WebLoginMaxTriesOverall
+		}
+		if req.WebLoginCooldownInterval != nil {
+			cfg.WebLoginCooldownInterval = *req.WebLoginCooldownInterval
+		}
+		if req.ServerTrustedReverseProxy != nil {
+			cfg.ServerTrustedReverseProxy = strings.TrimSpace(*req.ServerTrustedReverseProxy)
+		}
 		if err := s.appConfig.update(cfg); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
+		}
+		if s.loginLimiter != nil && (oldLoginCfg.WebLoginMaxTries != cfg.WebLoginMaxTries || oldLoginCfg.WebLoginMaxTriesOverall != cfg.WebLoginMaxTriesOverall || oldLoginCfg.WebLoginCooldownInterval != cfg.WebLoginCooldownInterval) {
+			s.loginLimiter.reset()
 		}
 		writeJSON(w, http.StatusOK, cfg)
 	default:

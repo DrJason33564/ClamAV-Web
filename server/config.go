@@ -33,6 +33,7 @@ type config struct {
 	HistoryDatabaseFile string
 	AppConfigFile       string
 	IsTimeDock          bool
+	AdminRegisterToken  string
 }
 
 func loadConfig() (config, error) {
@@ -70,6 +71,7 @@ func loadConfig() (config, error) {
 		HistoryDatabaseFile: env("HISTORY_DATABASE_FILE", filepath.Join(dataDir, "history.db")),
 		AppConfigFile:       env("CLAMAVWEB_CONFIG_FILE", "/config/clamavweb.conf"),
 		IsTimeDock:          isTimeDock,
+		AdminRegisterToken:  os.Getenv("ADMIN_REGISTER_TOKEN"),
 	}, nil
 }
 

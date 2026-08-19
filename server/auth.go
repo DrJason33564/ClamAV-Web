@@ -48,6 +48,7 @@ type authRequest struct {
 	Password        string `json:"password"`
 	Role            string `json:"role,omitempty"`
 	TimeDockAccount string `json:"timedock_account,omitempty"`
+	Token           string `json:"token,omitempty"`
 }
 
 type passwordRequest struct {
@@ -74,11 +75,6 @@ type userRecord struct {
 	PasswordSet     bool   `json:"password_set"`
 	CreatedAt       int64  `json:"created_at"`
 	UpdatedAt       int64  `json:"updated_at"`
-}
-
-type loginAttempt struct {
-	Failures int
-	ResetAt  time.Time
 }
 
 func (s *server) requireAuth(next http.Handler) http.Handler {
@@ -184,6 +180,10 @@ func (s *server) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	// Serialize the empty-table check and insert so a shared bootstrap token
+	// cannot create two first administrators through concurrent requests.
+	s.registrationMu.Lock()
+	defer s.registrationMu.Unlock()
 	var req authRequest
 	if err := decodeJSONBody(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -212,7 +212,16 @@ func (s *server) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	role := "admin"
-	if count > 0 {
+	if count == 0 {
+		if s.appConfig.get().WebFirstRunCompleted != 0 {
+			writeError(w, http.StatusConflict, errors.New("first-run registration is not available"))
+			return
+		}
+		if !validAdminRegisterToken(req.Token, s.cfg.AdminRegisterToken) {
+			writeError(w, http.StatusForbidden, errors.New("invalid administrator registration token"))
+			return
+		}
+	} else {
 		if !sameOriginRequest(r) {
 			writeError(w, http.StatusForbidden, errors.New("cross-origin request rejected"))
 			return
@@ -260,17 +269,23 @@ func (s *server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	now := time.Now()
+	appCfg := s.appConfig.get()
+	if s.loginLimiter == nil {
+		s.loginLimiter = newLoginLimiter()
+	}
+	clientIP := requestClientIP(r, appCfg.ServerTrustedReverseProxy)
+	if allowed, retryAfter := s.loginLimiter.allow(clientIP, now, appCfg); !allowed {
+		w.Header().Set("Retry-After", retryAfterSeconds(retryAfter))
+		writeError(w, http.StatusTooManyRequests, errors.New("too many login attempts; try again later"))
+		return
+	}
 	var req authRequest
 	if err := decodeJSONBody(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	req.Username = strings.TrimSpace(req.Username)
-	loginKey := req.Username + "|" + remoteHost(r.RemoteAddr)
-	if !s.loginAllowed(loginKey, time.Now()) {
-		writeError(w, http.StatusTooManyRequests, errors.New("too many login attempts; try again later"))
-		return
-	}
 	var id int64
 	var username, role, status string
 	var passwordHash sql.NullString
@@ -281,22 +296,20 @@ func (s *server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		_ = verifyPassword(req.Password, dummyPasswordHash)
 	}
 	if !valid {
-		s.recordLoginFailure(loginKey, time.Now())
 		writeError(w, http.StatusUnauthorized, errors.New("invalid username or password"))
 		return
 	}
-	s.clearLoginFailures(loginKey)
 	token, tokenHash, err := newSessionToken()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	now := time.Now()
-	if _, err := s.userDB.ExecContext(r.Context(), `INSERT INTO sessions(token_hash,user_id,created_at,last_seen_at,idle_expires_at,absolute_expires_at) VALUES(?,?,?,?,?,?)`, tokenHash, id, now.Unix(), now.Unix(), now.Add(sessionIdleTTL).Unix(), now.Add(sessionAbsoluteTTL).Unix()); err != nil {
+	sessionNow := time.Now()
+	if _, err := s.userDB.ExecContext(r.Context(), `INSERT INTO sessions(token_hash,user_id,created_at,last_seen_at,idle_expires_at,absolute_expires_at) VALUES(?,?,?,?,?,?)`, tokenHash, id, sessionNow.Unix(), sessionNow.Unix(), sessionNow.Add(sessionIdleTTL).Unix(), sessionNow.Add(sessionAbsoluteTTL).Unix()); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	setSessionCookie(w, r, token, now.Add(sessionAbsoluteTTL))
+	setSessionCookie(w, r, token, sessionNow.Add(sessionAbsoluteTTL))
 	writeJSON(w, http.StatusOK, map[string]any{"status": "success", "username": username, "role": role})
 }
 
@@ -305,37 +318,6 @@ func remoteHost(remoteAddr string) string {
 		return host
 	}
 	return remoteAddr
-}
-
-func (s *server) loginAllowed(key string, now time.Time) bool {
-	s.loginMu.Lock()
-	defer s.loginMu.Unlock()
-	attempt, ok := s.loginAttempts[key]
-	if !ok || now.After(attempt.ResetAt) {
-		delete(s.loginAttempts, key)
-		return true
-	}
-	return attempt.Failures < 5
-}
-
-func (s *server) recordLoginFailure(key string, now time.Time) {
-	s.loginMu.Lock()
-	defer s.loginMu.Unlock()
-	if s.loginAttempts == nil {
-		s.loginAttempts = make(map[string]loginAttempt)
-	}
-	attempt := s.loginAttempts[key]
-	if now.After(attempt.ResetAt) {
-		attempt = loginAttempt{ResetAt: now.Add(5 * time.Minute)}
-	}
-	attempt.Failures++
-	s.loginAttempts[key] = attempt
-}
-
-func (s *server) clearLoginFailures(key string) {
-	s.loginMu.Lock()
-	delete(s.loginAttempts, key)
-	s.loginMu.Unlock()
 }
 
 func (s *server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
@@ -463,6 +445,15 @@ func verifyPassword(password, encoded string) bool {
 }
 
 var dummyPasswordHash, _ = hashPassword("clamavweb-dummy-password")
+
+func validAdminRegisterToken(provided, configured string) bool {
+	if configured == "" || provided == "" {
+		return false
+	}
+	want := sha256.Sum256([]byte(configured))
+	got := sha256.Sum256([]byte(provided))
+	return subtle.ConstantTimeCompare(got[:], want[:]) == 1
+}
 
 func newSessionToken() (string, []byte, error) {
 	raw := make([]byte, 32)
