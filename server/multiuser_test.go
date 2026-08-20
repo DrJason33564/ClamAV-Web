@@ -249,6 +249,41 @@ func TestRandomUserSchedulerAlwaysSelectsOwnerHead(t *testing.T) {
 	}
 }
 
+func TestQueuedScanMutationsAreOwnerScoped(t *testing.T) {
+	s := &server{
+		activeBatchID:  "bob-active",
+		queuedBatchIDs: []string{"alice-first", "bob-first", "alice-second"},
+		batches: map[string]*scanBatch{
+			"bob-active":   {ID: "bob-active", UserID: testBobUserID},
+			"alice-first":  {ID: "alice-first", UserID: testAliceUserID},
+			"bob-first":    {ID: "bob-first", UserID: testBobUserID},
+			"alice-second": {ID: "alice-second", UserID: testAliceUserID},
+		},
+	}
+	original := strings.Join(s.queuedBatchIDs, ",")
+	if err := s.reorderQueuedBatch("bob-first", 1, testAliceUserID); err == nil {
+		t.Fatal("expected cross-owner reorder to be rejected")
+	}
+	if err := s.cancelQueuedBatch("bob-first", "Y", testAliceUserID); err == nil {
+		t.Fatal("expected cross-owner cancellation to be rejected")
+	}
+	if err := s.reorderQueuedBatch("bob-active", 1, testAliceUserID); err == nil || err.Error() != "queued scan not found" {
+		t.Fatalf("cross-owner active reorder leaked batch state: %v", err)
+	}
+	if err := s.cancelQueuedBatch("bob-active", "Y", testAliceUserID); err == nil || err.Error() != "queued scan not found" {
+		t.Fatalf("cross-owner active cancellation leaked batch state: %v", err)
+	}
+	if err := s.reorderQueuedBatch("alice-first", 1, ""); err == nil {
+		t.Fatal("expected empty-owner reorder to be rejected")
+	}
+	if err := s.cancelQueuedBatch("alice-first", "Y", ""); err == nil {
+		t.Fatal("expected empty-owner cancellation to be rejected")
+	}
+	if got := strings.Join(s.queuedBatchIDs, ","); got != original {
+		t.Fatalf("rejected mutations changed the queue: %s", got)
+	}
+}
+
 func TestQuarantineRecordsAreOwnerScoped(t *testing.T) {
 	tmp := t.TempDir()
 	for _, item := range []struct{ name, owner string }{{"a.dat", testAliceUserID}, {"b.dat", testBobUserID}} {
@@ -266,6 +301,15 @@ func TestQuarantineRecordsAreOwnerScoped(t *testing.T) {
 	}
 	if err := s.deleteQuarantineSubject("b.dat", testAliceUserID); !os.IsNotExist(err) {
 		t.Fatalf("expected cross-owner delete to look missing, got %v", err)
+	}
+	if items, err := s.readQuarantineSubjects(t.Context(), ""); err != nil || len(items) != 0 {
+		t.Fatalf("empty owner must not expose quarantine records: %#v err=%v", items, err)
+	}
+	if err := s.deleteQuarantineSubject("a.dat", ""); !os.IsNotExist(err) {
+		t.Fatalf("expected empty-owner delete to look missing, got %v", err)
+	}
+	if err := s.recoverQuarantineSubject("a.dat", actor{}); !os.IsNotExist(err) {
+		t.Fatalf("expected empty-owner recovery to look missing, got %v", err)
 	}
 }
 

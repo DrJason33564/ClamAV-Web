@@ -146,13 +146,12 @@ func (s *server) runQuarantineLookup(ctx context.Context, id string) {
 	s.debug("quarantine", "quarantine lookup completed", "lookup_id", id, "user_id", userID, "subjects", len(subjects))
 }
 
-func (s *server) readQuarantineSubjects(ctx context.Context, userIDs ...string) ([]quarantineSubject, error) {
+func (s *server) readQuarantineSubjects(ctx context.Context, userID string) ([]quarantineSubject, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	userID := ""
-	if len(userIDs) > 0 {
-		userID = userIDs[0]
+	if !validUserID(userID) {
+		return []quarantineSubject{}, nil
 	}
 	directory, err := os.Open(s.cfg.QuarantineDir)
 	if err != nil {
@@ -183,7 +182,7 @@ func (s *server) readQuarantineSubjects(ctx context.Context, userIDs ...string) 
 				// invisible rather than being assigned to an administrator.
 				continue
 			}
-			if userID != "" && owner != userID {
+			if owner != userID {
 				continue
 			}
 			subjects = append(subjects, quarantineSubject{
@@ -267,14 +266,13 @@ func quarantineNameFromPath(path string, prefix string) (string, error) {
 	return name, nil
 }
 
-func (s *server) deleteQuarantineSubject(name string, userIDs ...string) error {
-	userID := ""
-	if len(userIDs) > 0 {
-		userID = userIDs[0]
+func (s *server) deleteQuarantineSubject(name string, userID string) error {
+	if !validUserID(userID) {
+		return os.ErrNotExist
 	}
 	target := filepath.Join(s.cfg.QuarantineDir, name)
 	_, owner, err := readQuarantineRecord(target + ".rec")
-	if err != nil || (userID != "" && owner != userID) {
+	if err != nil || owner != userID {
 		return os.ErrNotExist
 	}
 	if err := os.Remove(target); err != nil {
@@ -287,19 +285,18 @@ func (s *server) deleteQuarantineSubject(name string, userIDs ...string) error {
 	return nil
 }
 
-func (s *server) recoverQuarantineSubject(name string, actors ...actor) error {
-	who := actor{}
-	if len(actors) > 0 {
-		who = actors[0]
-	}
+func (s *server) recoverQuarantineSubject(name string, who actor) error {
 	userID := who.ID
+	if !validUserID(userID) {
+		return os.ErrNotExist
+	}
 	quarantined := filepath.Join(s.cfg.QuarantineDir, name)
 	recPath := quarantined + ".rec"
 	sourceFile, owner, err := readQuarantineRecord(recPath)
 	if err != nil {
 		return err
 	}
-	if userID != "" && owner != userID {
+	if owner != userID {
 		return os.ErrNotExist
 	}
 	if sourceFile == "" {

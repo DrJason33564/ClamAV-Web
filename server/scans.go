@@ -806,30 +806,33 @@ func (s *server) scanLockBlocksManualStart() (bool, error) {
 	return true, nil
 }
 
-func (s *server) reorderQueuedBatch(id string, targetNumber int, userIDs ...string) error {
-	userID := ""
-	if len(userIDs) > 0 {
-		userID = userIDs[0]
-	}
+func (s *server) reorderQueuedBatch(id string, targetNumber int, userID string) error {
 	if id == "" {
 		return errors.New("id is required")
 	}
 	if targetNumber < 1 {
 		return errors.New("queue_number must be greater than or equal to 1")
 	}
+	if !validUserID(userID) {
+		return errors.New("queued scan not found")
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	batch := s.batches[id]
+	if batch == nil || batch.UserID != userID {
+		return errors.New("queued scan not found")
+	}
 	if id == s.activeBatchID {
 		return errors.New("running scan cannot be reordered")
 	}
 	current := indexOfString(s.queuedBatchIDs, id)
-	if current < 0 || s.batches[id] == nil || (userID != "" && s.batches[id].UserID != userID) {
+	if current < 0 {
 		return errors.New("queued scan not found")
 	}
 	owned := make([]string, 0)
 	for _, queuedID := range s.queuedBatchIDs {
-		if batch := s.batches[queuedID]; batch != nil && (userID == "" || batch.UserID == userID) {
+		if batch := s.batches[queuedID]; batch != nil && batch.UserID == userID {
 			owned = append(owned, queuedID)
 		}
 	}
@@ -844,7 +847,7 @@ func (s *server) reorderQueuedBatch(id string, targetNumber int, userIDs ...stri
 	owned[target] = id
 	n := 0
 	for i, queuedID := range s.queuedBatchIDs {
-		if batch := s.batches[queuedID]; batch != nil && (userID == "" || batch.UserID == userID) {
+		if batch := s.batches[queuedID]; batch != nil && batch.UserID == userID {
 			s.queuedBatchIDs[i] = owned[n]
 			n++
 		}
@@ -852,25 +855,28 @@ func (s *server) reorderQueuedBatch(id string, targetNumber int, userIDs ...stri
 	return nil
 }
 
-func (s *server) cancelQueuedBatch(id string, confirm string, userIDs ...string) error {
-	userID := ""
-	if len(userIDs) > 0 {
-		userID = userIDs[0]
-	}
+func (s *server) cancelQueuedBatch(id string, confirm string, userID string) error {
 	if id == "" {
 		return errors.New("id is required")
 	}
 	if confirm != "Y" {
 		return errors.New("cancel must be Y")
 	}
+	if !validUserID(userID) {
+		return errors.New("queued scan not found")
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	batch := s.batches[id]
+	if batch == nil || batch.UserID != userID {
+		return errors.New("queued scan not found")
+	}
 	if id == s.activeBatchID {
 		return errors.New("running scan cannot be canceled")
 	}
 	index := indexOfString(s.queuedBatchIDs, id)
-	if index < 0 || s.batches[id] == nil || (userID != "" && s.batches[id].UserID != userID) {
+	if index < 0 {
 		return errors.New("queued scan not found")
 	}
 	s.queuedBatchIDs = append(s.queuedBatchIDs[:index], s.queuedBatchIDs[index+1:]...)

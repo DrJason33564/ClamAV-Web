@@ -515,29 +515,29 @@ func TestScanQueueReorderAndCancelQueuedOnly(t *testing.T) {
 		activeBatchID:  "web-active",
 		queuedBatchIDs: []string{"web-one", "web-two", "web-three"},
 		batches: map[string]*scanBatch{
-			"web-active": {ID: "web-active", Status: "running"},
-			"web-one":    {ID: "web-one", Status: "queued"},
-			"web-two":    {ID: "web-two", Status: "queued"},
-			"web-three":  {ID: "web-three", Status: "queued"},
+			"web-active": {ID: "web-active", Status: "running", UserID: testAliceUserID},
+			"web-one":    {ID: "web-one", Status: "queued", UserID: testAliceUserID},
+			"web-two":    {ID: "web-two", Status: "queued", UserID: testAliceUserID},
+			"web-three":  {ID: "web-three", Status: "queued", UserID: testAliceUserID},
 		},
 	}
 
-	if err := s.reorderQueuedBatch("web-active", 1); err == nil {
+	if err := s.reorderQueuedBatch("web-active", 1, testAliceUserID); err == nil {
 		t.Fatal("expected running batch reorder to be rejected")
 	}
-	if err := s.reorderQueuedBatch("web-three", 1); err != nil {
+	if err := s.reorderQueuedBatch("web-three", 1, testAliceUserID); err != nil {
 		t.Fatal(err)
 	}
 	if got := strings.Join(s.queuedBatchIDs, ","); got != "web-three,web-one,web-two" {
 		t.Fatalf("unexpected queue after reorder: %s", got)
 	}
-	if err := s.cancelQueuedBatch("web-active", "Y"); err == nil {
+	if err := s.cancelQueuedBatch("web-active", "Y", testAliceUserID); err == nil {
 		t.Fatal("expected running batch cancel to be rejected")
 	}
-	if err := s.cancelQueuedBatch("web-one", "N"); err == nil {
+	if err := s.cancelQueuedBatch("web-one", "N", testAliceUserID); err == nil {
 		t.Fatal("expected missing cancel confirmation to be rejected")
 	}
-	if err := s.cancelQueuedBatch("web-one", "Y"); err != nil {
+	if err := s.cancelQueuedBatch("web-one", "Y", testAliceUserID); err != nil {
 		t.Fatal(err)
 	}
 	if got := strings.Join(s.queuedBatchIDs, ","); got != "web-three,web-two" {
@@ -1009,7 +1009,7 @@ func TestQuarantineSubjectsDeleteAndRecover(t *testing.T) {
 	}
 
 	s := &server{cfg: config{QuarantineDir: quarantineDir, BrowseRoots: []string{sourceDir}}}
-	subjects, err := s.readQuarantineSubjects(t.Context())
+	subjects, err := s.readQuarantineSubjects(t.Context(), testAliceUserID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1020,7 +1020,7 @@ func TestQuarantineSubjectsDeleteAndRecover(t *testing.T) {
 		t.Fatalf("unexpected quarantine subject: %#v", subjects[0])
 	}
 
-	if err := s.recoverQuarantineSubject("eicar.txt"); err != nil {
+	if err := s.recoverQuarantineSubject("eicar.txt", actor{ID: testAliceUserID}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(sourceFile); err != nil {
@@ -1040,7 +1040,7 @@ func TestQuarantineSubjectsDeleteAndRecover(t *testing.T) {
 	if err := os.WriteFile(deleteTarget+".rec", []byte("\"/scan/delete-me.txt\" alice001\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.deleteQuarantineSubject("delete-me.txt"); err != nil {
+	if err := s.deleteQuarantineSubject("delete-me.txt", testAliceUserID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(deleteTarget); !errors.Is(err, os.ErrNotExist) {
@@ -1081,7 +1081,7 @@ func TestQuarantineRecoverFallsBackAcrossDevices(t *testing.T) {
 	})
 
 	s := &server{cfg: config{QuarantineDir: quarantineDir, BrowseRoots: []string{sourceDir}}}
-	if err := s.recoverQuarantineSubject("cross-device.txt"); err != nil {
+	if err := s.recoverQuarantineSubject("cross-device.txt", actor{ID: testAliceUserID}); err != nil {
 		t.Fatal(err)
 	}
 	recovered, err := os.ReadFile(sourceFile)
