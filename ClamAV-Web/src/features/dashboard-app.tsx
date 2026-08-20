@@ -29,20 +29,37 @@ import {
 import { Separator } from "@/components/ui/separator"
 import { Spinner } from "@/components/ui/spinner"
 import { Toaster } from "@/components/ui/toast"
-import { CronPage } from "@/features/cron-page"
-import { FirstRunPage } from "@/features/first-run-page"
-import { HistoryPage } from "@/features/history-page"
-import { LoginPage } from "@/features/login-page"
-import { ManualScanPage } from "@/features/manual-scan-page"
-import { QuarantinePage } from "@/features/quarantine-page"
-import { QueuePage } from "@/features/queue-page"
-import { SettingsPage } from "@/features/settings-page"
-import { StatusPage } from "@/features/status-page"
-import { UsersPage } from "@/features/users-page"
-import { WhitelistPage } from "@/features/whitelist-page"
 import { ApiError, api } from "@/lib/api"
 import type { CurrentUser, FirstRunResponse, StatusResponse } from "@/lib/types"
 import { cn } from "@/lib/utils"
+
+const CronPage = React.lazy(async () => ({
+  default: (await import("@/features/cron-page")).CronPage,
+}))
+const HistoryPage = React.lazy(async () => ({
+  default: (await import("@/features/history-page")).HistoryPage,
+}))
+const ManualScanPage = React.lazy(async () => ({
+  default: (await import("@/features/manual-scan-page")).ManualScanPage,
+}))
+const QuarantinePage = React.lazy(async () => ({
+  default: (await import("@/features/quarantine-page")).QuarantinePage,
+}))
+const QueuePage = React.lazy(async () => ({
+  default: (await import("@/features/queue-page")).QueuePage,
+}))
+const SettingsPage = React.lazy(async () => ({
+  default: (await import("@/features/settings-page")).SettingsPage,
+}))
+const StatusPage = React.lazy(async () => ({
+  default: (await import("@/features/status-page")).StatusPage,
+}))
+const UsersPage = React.lazy(async () => ({
+  default: (await import("@/features/users-page")).UsersPage,
+}))
+const WhitelistPage = React.lazy(async () => ({
+  default: (await import("@/features/whitelist-page")).WhitelistPage,
+}))
 
 type PageKey =
   | "status"
@@ -290,26 +307,25 @@ function Dashboard() {
               </AlertDescription>
             </Alert>
           )}
-          {content}
+          <React.Suspense
+            fallback={
+              <div className="grid min-h-48 place-items-center">
+                <Spinner className="size-6" />
+              </div>
+            }
+          >
+            {content}
+          </React.Suspense>
         </main>
       </div>
     </div>
   )
 }
 
-export function App() {
-  const path = window.location.pathname.replace(/\/+$/, "") || "/"
+export function DashboardApp() {
   return (
     <Toaster>
-      {path === "/login" ? (
-        <LoginPage />
-      ) : path === "/first_run" ? (
-        <FirstRunPage />
-      ) : (
-        <Dashboard />
-      )}
+      <Dashboard />
     </Toaster>
   )
 }
-
-export default App
