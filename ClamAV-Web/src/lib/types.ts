@@ -68,6 +68,7 @@ export type AdminUsersResponse = {
 
 export type ServiceConfig = {
   history_index_refresh_interval: number
+  clamav_sleep_timer: number
   web_firstrun_completed: number
   web_login_max_tries: number
   web_login_max_tries_overall: number

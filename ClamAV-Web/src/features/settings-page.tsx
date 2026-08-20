@@ -48,6 +48,10 @@ function integerInRange(value: string, minimum: number, maximum: number) {
   )
 }
 
+function validClamAVSleepTimer(value: string) {
+  return value === "0" || integerInRange(value, 600, 9223372036)
+}
+
 function validIPAddress(address: string) {
   if (!address.includes(":")) {
     const parts = address.split(".")
@@ -103,6 +107,7 @@ export function SettingsPage({
   const [deletePassword, setDeletePassword] = React.useState("")
   const [deleteOpen, setDeleteOpen] = React.useState(false)
   const [serviceInterval, setServiceInterval] = React.useState("")
+  const [clamavSleepTimer, setClamAVSleepTimer] = React.useState("")
   const [loginMaxTries, setLoginMaxTries] = React.useState("")
   const [loginMaxTriesOverall, setLoginMaxTriesOverall] = React.useState("")
   const [loginCooldownInterval, setLoginCooldownInterval] =
@@ -111,6 +116,7 @@ export function SettingsPage({
   const [saving, setSaving] = React.useState(false)
   const intervalValid = /^[1-9]\d*$/.test(interval)
   const serviceIntervalValid = integerInRange(serviceInterval, 5, 86400)
+  const clamavSleepTimerValid = validClamAVSleepTimer(clamavSleepTimer)
   const loginMaxTriesValid = integerInRange(loginMaxTries, 1, 10000)
   const loginMaxTriesOverallValid =
     integerInRange(loginMaxTriesOverall, 1, 1000000) &&
@@ -124,6 +130,7 @@ export function SettingsPage({
   const trustedReverseProxyValid = validTrustedProxy(trustedReverseProxy)
   const serviceValid =
     serviceIntervalValid &&
+    clamavSleepTimerValid &&
     loginMaxTriesValid &&
     loginMaxTriesOverallValid &&
     loginCooldownIntervalValid &&
@@ -131,6 +138,7 @@ export function SettingsPage({
 
   const applyServiceConfig = React.useCallback((config: ServiceConfig) => {
     setServiceInterval(String(config.history_index_refresh_interval))
+    setClamAVSleepTimer(String(config.clamav_sleep_timer))
     setLoginMaxTries(String(config.web_login_max_tries))
     setLoginMaxTriesOverall(String(config.web_login_max_tries_overall))
     setLoginCooldownInterval(String(config.web_login_cooldown_interval))
@@ -217,6 +225,7 @@ export function SettingsPage({
         "/api/config",
         jsonRequest("PATCH", {
           history_index_refresh_interval: Number(serviceInterval),
+          clamav_sleep_timer: Number(clamavSleepTimer),
           web_login_max_tries: Number(loginMaxTries),
           web_login_max_tries_overall: Number(loginMaxTriesOverall),
           web_login_cooldown_interval: Number(loginCooldownInterval),
@@ -391,6 +400,25 @@ export function SettingsPage({
                         }
                       />
                       <FieldDescription>允许 5–86400 秒</FieldDescription>
+                    </Field>
+                    <Field data-invalid={!clamavSleepTimerValid}>
+                      <FieldLabel htmlFor="clamav-sleep-timer">
+                        ClamAV 定时休眠（秒）
+                      </FieldLabel>
+                      <Input
+                        id="clamav-sleep-timer"
+                        inputMode="numeric"
+                        value={clamavSleepTimer}
+                        aria-invalid={!clamavSleepTimerValid}
+                        onChange={(event) =>
+                          setClamAVSleepTimer(
+                            event.target.value.replace(/\D/g, "")
+                          )
+                        }
+                      />
+                      <FieldDescription>
+                        输入 0 关闭定时休眠，启用时至少 600 秒，默认 3600 秒
+                      </FieldDescription>
                     </Field>
                     <Field data-invalid={!loginMaxTriesValid}>
                       <FieldLabel htmlFor="login-max-tries">
