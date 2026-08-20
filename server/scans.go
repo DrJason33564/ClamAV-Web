@@ -91,6 +91,7 @@ func (s *server) startScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if sleeping {
+		s.warn("scan", "scan request rejected while ClamAV is sleeping")
 		// A rejected request never enters the in-memory queue and therefore
 		// cannot reach scan_once.sh after ClamAV has been put to sleep.
 		writeJSON(w, http.StatusConflict, startScanResponse{
@@ -149,6 +150,7 @@ func (s *server) startScan(w http.ResponseWriter, r *http.Request) {
 	batch.User = who.Username
 
 	status, message := s.enqueueBatch(batch)
+	s.info("scan", "scan batch queued", "batch_id", batch.ID, "user", batch.User, "targets", len(batch.Targets), "action", batch.Action)
 	writeJSON(w, http.StatusAccepted, startScanResponse{
 		ID:      batch.ID,
 		Status:  status,
@@ -257,9 +259,11 @@ func (s *server) handleScanReorder(w http.ResponseWriter, r *http.Request) {
 	}
 	who, _ := actorFromRequest(r)
 	if err := s.reorderQueuedBatch(strings.TrimSpace(req.ID), req.QueueNumber, who.Username); err != nil {
+		s.warn("scan", "scan queue reorder rejected", "batch_id", strings.TrimSpace(req.ID), "user", who.Username, "error", err)
 		writeJSON(w, http.StatusBadRequest, scanActionResponse{Status: "failed", Message: err.Error()})
 		return
 	}
+	s.info("scan", "scan queue reordered", "batch_id", strings.TrimSpace(req.ID), "user", who.Username, "queue_number", req.QueueNumber)
 	writeJSON(w, http.StatusOK, scanActionResponse{Status: "success", Message: "Queue reordered"})
 }
 
@@ -275,9 +279,11 @@ func (s *server) handleScanCancel(w http.ResponseWriter, r *http.Request) {
 	}
 	who, _ := actorFromRequest(r)
 	if err := s.cancelQueuedBatch(strings.TrimSpace(req.ID), strings.TrimSpace(req.Cancel), who.Username); err != nil {
+		s.warn("scan", "queued scan cancellation rejected", "batch_id", strings.TrimSpace(req.ID), "user", who.Username, "error", err)
 		writeJSON(w, http.StatusBadRequest, scanActionResponse{Status: "failed", Message: err.Error()})
 		return
 	}
+	s.info("scan", "queued scan canceled", "batch_id", strings.TrimSpace(req.ID), "user", who.Username)
 	writeJSON(w, http.StatusOK, scanActionResponse{Status: "success", Message: "Queued scan canceled"})
 }
 
@@ -289,8 +295,11 @@ func (s *server) runBatch(id string) {
 	targets := append([]string(nil), batch.Targets...)
 	action := batch.Action
 	username := batch.User
+	s.info("scan", "scan batch started", "batch_id", id, "user", username, "targets", len(targets), "action", action)
 
 	for i, target := range targets {
+		targetStarted := time.Now()
+		s.debug("scan", "scan target started", "batch_id", id, "user", username, "target", target, "position", i+1, "total", len(targets))
 		s.updateBatch(id, func(batch *scanBatch) {
 			batch.Current = target
 			batch.Message = fmt.Sprintf("Scanning %d of %d", i+1, len(targets))
@@ -310,6 +319,11 @@ func (s *server) runBatch(id string) {
 
 		state, _ := s.jobState(jobID)
 		result := jobResult(state)
+		if err != nil || result == "error" {
+			s.error("scan", "scan target failed", "batch_id", id, "job_id", jobID, "user", username, "target", target, "duration_ms", time.Since(targetStarted).Milliseconds(), "error", errString(err))
+		} else {
+			s.debug("scan", "scan target completed", "batch_id", id, "job_id", jobID, "user", username, "target", target, "result", result, "duration_ms", time.Since(targetStarted).Milliseconds())
+		}
 		s.updateBatch(id, func(batch *scanBatch) {
 			batch.Completed++
 			if result == "found" {
@@ -342,6 +356,10 @@ func (s *server) runBatch(id string) {
 			batch.Message = "All scans finished cleanly"
 		}
 	})
+	finished := s.batchSnapshot(id)
+	if finished != nil {
+		s.info("scan", "scan batch completed", "batch_id", id, "user", username, "status", finished.Status, "completed", finished.Completed, "failed", finished.Failed, "threats", finished.Threats)
+	}
 	s.finishBatch(id)
 	// Manual scans can be indexed immediately; the periodic pass remains the
 	// source of truth for cron jobs and for repairing interrupted updates.
@@ -648,6 +666,11 @@ func (s *server) runQueue() {
 
 		blocked, err := s.scanLockBlocksManualStart()
 		if err != nil || blocked {
+			if err != nil {
+				s.warn("scan", "scan queue lock check failed", "batch_id", id, "error", err)
+			} else {
+				s.debug("scan", "scan batch waiting for active scan lock", "batch_id", id)
+			}
 			s.updateQueuedBatchMessage(id, "Queued; waiting for active scan lock")
 			time.Sleep(scanQueueLockPollInterval)
 			continue

@@ -62,9 +62,11 @@ func (s *server) handleAdminUser(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.cleanDeleteUser(r.Context(), username); err != nil {
+			s.warn("users", "administrator user deletion failed", "actor", who.Username, "user", username, "error", err)
 			writeError(w, userDeletionStatus(err), err)
 			return
 		}
+		s.info("users", "administrator deleted user", "actor", who.Username, "user", username)
 		writeJSON(w, http.StatusOK, map[string]string{"status": "success"})
 	default:
 		methodNotAllowed(w)
@@ -136,6 +138,7 @@ func (s *server) patchAdminUser(w http.ResponseWriter, r *http.Request, who acto
 	}
 	now := time.Now().Unix()
 	if _, err := s.userDB.ExecContext(r.Context(), "UPDATE users SET role=?,status=?,timedock_account=?,password_hash=?,updated_at=? WHERE id=?", role, status, timeDockAccount, password, now, id); err != nil {
+		s.error("users", "update user failed", "actor", who.Username, "user", username, "error", err)
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -157,6 +160,7 @@ func (s *server) patchAdminUser(w http.ResponseWriter, r *http.Request, who acto
 			return
 		}
 	}
+	s.info("users", "user updated", "actor", who.Username, "user", username, "role", role, "status", status, "timedock_account_changed", timeDockAccountChanged, "password_changed", req.Password != nil)
 	writeJSON(w, http.StatusOK, map[string]any{"status": "success", "username": username, "role": role, "timedock_account": timeDockAccount})
 }
 
@@ -177,9 +181,11 @@ func (s *server) handleAuthAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.cleanDeleteUser(r.Context(), who.Username); err != nil {
+		s.warn("users", "self account deletion failed", "user", who.Username, "error", err)
 		writeError(w, userDeletionStatus(err), err)
 		return
 	}
+	s.info("users", "user deleted own account", "user", who.Username)
 	clearSessionCookie(w, r)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "success"})
 }

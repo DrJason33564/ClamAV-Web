@@ -106,6 +106,7 @@ func (s *server) enrichStatusSource(source any, usernames ...string) {
 }
 
 func (s *server) pingClamd(ctx context.Context) (string, string) {
+	started := time.Now()
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.CommandTimout)
 	defer cancel()
 
@@ -113,16 +114,19 @@ func (s *server) pingClamd(ctx context.Context) (string, string) {
 	out, err := cmd.CombinedOutput()
 	msg := strings.TrimSpace(string(out))
 	if ctx.Err() == context.DeadlineExceeded {
+		s.warn("status", "clamd ping timed out", "duration_ms", time.Since(started).Milliseconds())
 		return "timeout", "clamd ping timed out"
 	}
 	if err != nil {
 		if msg == "" {
 			msg = err.Error()
 		}
+		s.warn("status", "clamd ping failed", "duration_ms", time.Since(started).Milliseconds(), "error", err)
 		return "error", msg
 	}
 	if msg == "" {
 		msg = "clamd is ready"
 	}
+	s.debug("status", "clamd ping succeeded", "duration_ms", time.Since(started).Milliseconds())
 	return "ready", msg
 }

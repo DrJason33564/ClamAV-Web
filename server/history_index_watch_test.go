@@ -220,13 +220,29 @@ func TestHistoryWatcherStopsAfterRetryLimit(t *testing.T) {
 	done := make(chan struct{})
 	missingJobsDir := filepath.Join(t.TempDir(), "missing")
 	go func() {
-		watchHistoryJobFiles(ctx, missingJobsDir, make(chan historyIndexRequest, 1))
+		watchHistoryJobFiles(ctx, missingJobsDir, make(chan historyIndexRequest, 1), nil)
 		close(done)
 	}()
 	select {
 	case <-done:
 	case <-ctx.Done():
 		t.Fatal("history watcher did not stop after reaching its retry limit")
+	}
+}
+
+func TestRestartHistoryPeriodicTimerDiscardsOldDeadline(t *testing.T) {
+	oldTimer := time.NewTimer(5 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+	newTimer := restartHistoryPeriodicTimer(oldTimer, 100*time.Millisecond)
+	defer newTimer.Stop()
+	if newTimer == oldTimer {
+		t.Fatal("history timer was reset in place instead of being replaced")
+	}
+
+	select {
+	case <-oldTimer.C:
+		t.Fatal("the retired timer deadline fired after reset")
+	case <-time.After(20 * time.Millisecond):
 	}
 }
 

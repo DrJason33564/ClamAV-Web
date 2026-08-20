@@ -66,6 +66,7 @@ func (s *server) updateWhitelist(w http.ResponseWriter, r *http.Request, add boo
 		return
 	}
 	if sleeping {
+		s.warn("whitelist", "whitelist update rejected while ClamAV is sleeping", "user", who.Username)
 		// Use an explicit object so message is JSON null. whitelistResponse uses
 		// an omitempty string and would otherwise omit the field.
 		writeJSON(w, http.StatusConflict, map[string]any{
@@ -90,6 +91,7 @@ func (s *server) updateWhitelist(w http.ResponseWriter, r *http.Request, add boo
 		writeWhitelistStatus(w, http.StatusInternalServerError, "failed", "", err)
 		return
 	} else if busy {
+		s.warn("whitelist", "whitelist update rejected while scan is active", "user", who.Username)
 		writeWhitelistStatus(w, http.StatusConflict, "busy", "clamav is running", nil)
 		return
 	}
@@ -100,20 +102,24 @@ func (s *server) updateWhitelist(w http.ResponseWriter, r *http.Request, add boo
 		err = s.deleteWhitelistEntry(target, who.Username)
 	}
 	if err != nil {
+		s.warn("whitelist", "whitelist entry update failed", "user", who.Username, "path", target, "add", add, "error", err)
 		writeWhitelistStatus(w, http.StatusBadRequest, "failed", "", err)
 		return
 	}
 
 	message, err := s.runExcludeScript()
 	if err != nil {
+		s.error("whitelist", "exclude database refresh failed", "user", who.Username, "error", err)
 		writeWhitelistStatus(w, http.StatusInternalServerError, "failed", message, err)
 		return
 	}
 	reloadMessage, err := s.reloadClamdDatabase()
 	if err != nil {
+		s.error("whitelist", "ClamAV database reload failed", "user", who.Username, "error", err)
 		writeWhitelistStatus(w, http.StatusInternalServerError, "failed", reloadMessage, err)
 		return
 	}
+	s.info("whitelist", "whitelist entry updated", "user", who.Username, "path", target, "add", add)
 	if reloadMessage != "" {
 		message = strings.TrimSpace(message + "\n" + reloadMessage)
 	}
@@ -345,6 +351,7 @@ func (s *server) removeWhitelistForUser(username string) error {
 }
 
 func (s *server) runExcludeScript() (string, error) {
+	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, s.cfg.ExcludeScript)
@@ -362,10 +369,12 @@ func (s *server) runExcludeScript() (string, error) {
 	if message == "" {
 		message = "Exclude allow-list refreshed."
 	}
+	s.debug("whitelist", "exclude database refresh completed", "duration_ms", time.Since(started).Milliseconds())
 	return message, nil
 }
 
 func (s *server) reloadClamdDatabase() (string, error) {
+	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "clamdscan", "--config-file="+s.cfg.ClamdConf, "--reload")
@@ -383,6 +392,7 @@ func (s *server) reloadClamdDatabase() (string, error) {
 	if message == "" {
 		message = "ClamAV database reloaded."
 	}
+	s.debug("whitelist", "ClamAV database reload completed", "duration_ms", time.Since(started).Milliseconds())
 	return message, nil
 }
 

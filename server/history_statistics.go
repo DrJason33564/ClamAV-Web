@@ -60,6 +60,7 @@ func (s *server) handleHistoryStatisticsStart(w http.ResponseWriter, r *http.Req
 	s.historyStatisticsMu.Unlock()
 
 	go s.runHistoryStatisticsLookup(lookup.ID)
+	s.debug("history_statistics", "history statistics lookup started", "lookup_id", lookup.ID, "user", who.Username, "scope_days", scope)
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"status":    "pending",
 		"lookup_id": lookup.ID,
@@ -139,11 +140,13 @@ func (s *server) runHistoryStatisticsLookup(id string) {
 	if err != nil {
 		lookup.Status = "failed"
 		lookup.Error = err.Error()
+		s.error("history_statistics", "history statistics lookup failed", "lookup_id", id, "user", username, "error", err)
 		return
 	}
 	lookup.Status = "success"
 	lookup.Days = days
 	lookup.Total = total
+	s.debug("history_statistics", "history statistics lookup completed", "lookup_id", id, "user", username, "scope_days", scope, "total", total)
 }
 
 func parseHistoryStatisticsScope(text string) (int, error) {

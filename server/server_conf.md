@@ -13,6 +13,9 @@ WEB_LOGIN_MAX_TRIES=10
 WEB_LOGIN_MAX_TRIES_OVERALL=100
 WEB_LOGIN_COOLDOWN_INTERVAL=600
 SERVER_TRUSTED_REVERSEPROXY=
+LOG_FILE_MAX_SIZE=5242880
+LOG_FILE_NUM=5
+LOG_LEVEL=info
 ```
 
 旧配置文件未包含新增键时使用对应默认值；后续通过管理 API 保存配置时会写出全部键。
@@ -26,8 +29,9 @@ SERVER_TRUSTED_REVERSEPROXY=
 - 允许范围：`5–86400`；
 - 作用：控制运行中完整扫描 `/state/jobs/*.json` 并按需重建 `history.db` 索引的兜底间隔。
 
-服务启动时无论该值为何都会先刷新一次历史索引。运行时修改后，后台索引器会在下一轮读取
-新值，无需重启。正常情况下任务文件通过文件系统通知进行单文件增量索引；此间隔不限制该
+服务启动时无论该值为何都会先刷新一次历史索引。通过管理 API 修改后，后台索引器会停止并
+排空现存周期 timer，再立即按新间隔启动 timer，无需重启。正常情况下任务文件通过文件系统
+通知进行单文件增量索引；此间隔不限制该
 即时更新，只负责定期校验完整目录，并在监听不可用时继续发现任务变化。
 
 ## 3. 首次运行
@@ -105,7 +109,43 @@ SERVER_TRUSTED_REVERSEPROXY=192.0.2.10,2001:db8::10
 可信代理必须覆盖或可靠清理客户端传入的 `X-Forwarded-For`，否则攻击者仍可能伪造来源
 地址绕过单 IP 限制。IPv4 和 IPv6 使用规范化后的地址进行比较。
 
-## 6. 相关环境变量
+## 6. Go 后端日志
+
+Go 后端将结构化文本日志写入 `/log/clamavweb.log`。该文件与 Shell 的 `startup.log`、扫描
+日志和检出日志相互独立。轮转文件依次命名为 `clamavweb.log.1`、`clamavweb.log.2` 等。
+
+### `LOG_FILE_MAX_SIZE`
+
+- 类型：正整数，单位为字节；
+- 默认值：`5242880`（5 MiB）；
+- 允许范围：`65536–1073741824`；
+- 作用：写入下一条完整日志前，若预计超过该大小则执行轮转。单条日志本身不会被截断。
+
+### `LOG_FILE_NUM`
+
+- 类型：正整数；
+- 默认值：`5`；
+- 允许范围：`1–100`；
+- 作用：限制日志文件总数，包含当前的 `clamavweb.log`。设为 `1` 时不保留历史文件。
+
+### `LOG_LEVEL`
+
+- 类型：字符串；
+- 默认值：`info`；
+- 允许值：`debug`、`info`、`warn`、`error`；
+- 作用：设置最低写入等级。例如 `info` 会写入 info、warn 和 error。
+
+以上三项只在 Go 服务启动时读取，不通过管理 API 暴露，也不支持热加载。修改时应停止
+服务、编辑配置并重新启动。服务运行期间手工修改后又通过管理 API 保存其他配置，内存中的
+旧日志配置会被写回文件，因此不支持这种操作顺序。
+
+HTTP 的成功 GET 请求（包括状态、列表轮询和静态资源）记录为 debug；状态变更请求记录为
+info；认证拒绝记录为 warn；服务端错误记录为 error。日志保留服务端采纳的 `client_ip` 和
+直接连接来源 `peer_ip`，不对 IP 脱敏。请求体、Cookie 和 Authorization 原文不会写入。
+显式标记的秘钥及密码、token、secret 等敏感字段会统一脱敏：长度大于八个字符时保留首尾
+各四个字符，中间替换为八个星号；更短的非空值完全替换为八个星号。
+
+## 7. 相关环境变量
 
 以下项目不写入 `clamavweb.conf`，但与本文件中的安全配置相关。
 
@@ -126,7 +166,7 @@ SERVER_TRUSTED_REVERSEPROXY=192.0.2.10,2001:db8::10
 
 TLS 在反向代理终止时设置为 `true` 或 `1`，强制 session Cookie 带 `Secure` 属性。
 
-## 7. 管理 API
+## 8. 管理 API
 
 只有 admin 可以调用 `GET /api/config` 和 `PATCH /api/config`。API 使用小写 JSON 字段：
 
@@ -138,6 +178,8 @@ TLS 在反向代理终止时设置为 `true` 或 `1`，强制 session Cookie 带
 | `WEB_LOGIN_MAX_TRIES_OVERALL` | `web_login_max_tries_overall` |
 | `WEB_LOGIN_COOLDOWN_INTERVAL` | `web_login_cooldown_interval` |
 | `SERVER_TRUSTED_REVERSEPROXY` | `server_trusted_reverseproxy` |
+
+日志配置没有对应 JSON 字段；管理 API 重写配置文件时只会原样保留服务启动时读取的日志值。
 
 传入空字符串可清除可信反向代理。配置文件中的任何非法值会导致服务启动失败；管理 API
 收到非法修改时返回 `400`，原配置保持不变。

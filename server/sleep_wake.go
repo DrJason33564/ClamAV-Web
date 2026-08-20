@@ -54,6 +54,7 @@ func (s *server) handleClamAVWake(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) sleepClamAV(ctx context.Context) (string, string, int, error) {
+	s.debug("clamav_power", "ClamAV sleep requested")
 	sleeping, err := directoryLockExists(s.cfg.SleepLockDir)
 	if err != nil {
 		return "failed", "", http.StatusInternalServerError, err
@@ -73,10 +74,12 @@ func (s *server) sleepClamAV(ctx context.Context) (string, string, int, error) {
 		return "failed", "", http.StatusInternalServerError, fmt.Errorf("check active scan lock: %w", err)
 	}
 	if scanning {
+		s.warn("clamav_power", "ClamAV sleep rejected while scan is active")
 		return "failed", "", http.StatusConflict, errors.New("ClamAV cannot sleep while a scan is active")
 	}
 
 	if err := sendClamdShutdown(ctx, s.cfg.ClamdSocket, s.cfg.CommandTimout); err != nil {
+		s.error("clamav_power", "send ClamAV shutdown failed", "error", err)
 		return "failed", "", powerErrorStatus(ctx, err), fmt.Errorf("put ClamAV to sleep: %w", err)
 	}
 
@@ -88,10 +91,12 @@ func (s *server) sleepClamAV(ctx context.Context) (string, string, int, error) {
 	if err := writeClamdSleepStatus(s.cfg.StatusFile); err != nil {
 		return "failed", "", http.StatusInternalServerError, fmt.Errorf("write ClamAV sleep status: %w", err)
 	}
+	s.info("clamav_power", "ClamAV entered sleep mode")
 	return "sleeping", "ClamAV entered sleep mode.", http.StatusOK, nil
 }
 
 func (s *server) wakeClamAV(requestCtx context.Context) (string, string, int, error) {
+	s.debug("clamav_power", "ClamAV wake requested")
 	ping, _ := s.pingClamd(requestCtx)
 	alreadyAwake := ping == "ready"
 
@@ -108,16 +113,20 @@ func (s *server) wakeClamAV(requestCtx context.Context) (string, string, int, er
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
+			s.error("clamav_power", "ClamAV wake timed out", "timeout", s.cfg.WakeTimeout)
 			return "failed", "", http.StatusGatewayTimeout, errors.New("ClamAV wake timed out")
 		}
+		s.error("clamav_power", "ClamAV wake script failed", "error", err)
 		return "failed", "", http.StatusInternalServerError, fmt.Errorf("wake ClamAV: %w", err)
 	}
 
 	// startup.sh owns both the final PONG check and the sleep-lock transition.
 	// A zero exit status is therefore the complete wake result.
 	if alreadyAwake {
+		s.info("clamav_power", "ClamAV wake completed; daemon was already awake")
 		return "awake", "ClamAV is already awake.", http.StatusOK, nil
 	}
+	s.info("clamav_power", "ClamAV woke successfully")
 	return "awake", "ClamAV woke successfully.", http.StatusOK, nil
 }
 

@@ -39,6 +39,7 @@ func (s *server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 	who, _ := actorFromRequest(r)
 	path, devices, err := s.safeBrowsePath(requested, who)
 	if err != nil {
+		s.warn("browse", "browse path rejected", "user", who.Username, "path", requested, "error", err)
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -54,10 +55,10 @@ func (s *server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 
 	dirEntries, err := os.ReadDir(path)
 	if err != nil {
+		s.warn("browse", "browse directory failed", "user", who.Username, "path", path, "error", err)
 		writeError(w, http.StatusForbidden, err)
 		return
 	}
-
 	entries := make([]browseEntry, 0, len(dirEntries))
 	for _, entry := range dirEntries {
 		full := filepath.Join(path, entry.Name())
@@ -93,6 +94,7 @@ func (s *server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 		}
 		return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name)
 	})
+	s.debug("browse", "browse directory completed", "user", who.Username, "path", path, "entries", len(entries))
 
 	parent := ""
 	if parentPath := filepath.Dir(path); parentPath != path {

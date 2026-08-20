@@ -57,6 +57,7 @@ func (s *server) handleQuarantineLookupStart(w http.ResponseWriter, r *http.Requ
 	s.quarantineMu.Unlock()
 
 	go s.runQuarantineLookup(lookup.ID)
+	s.debug("quarantine", "quarantine lookup started", "lookup_id", lookup.ID, "user", who.Username)
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"status":    "pending",
 		"lookup_id": lookup.ID,
@@ -124,10 +125,12 @@ func (s *server) runQuarantineLookup(id string) {
 	if err != nil {
 		lookup.Status = "failed"
 		lookup.Error = err.Error()
+		s.error("quarantine", "quarantine lookup failed", "lookup_id", id, "user", username, "error", err)
 		return
 	}
 	lookup.Status = "success"
 	lookup.Subjects = subjects
+	s.debug("quarantine", "quarantine lookup completed", "lookup_id", id, "user", username, "subjects", len(subjects))
 }
 
 func (s *server) readQuarantineSubjects(usernames ...string) ([]quarantineSubject, error) {
@@ -184,6 +187,7 @@ func (s *server) handleQuarantineDelete(w http.ResponseWriter, r *http.Request) 
 	}
 	who, _ := actorFromRequest(r)
 	if err := s.deleteQuarantineSubject(name, who.Username); err != nil {
+		s.warn("quarantine", "quarantine subject deletion failed", "name", name, "user", who.Username, "error", err)
 		status := http.StatusInternalServerError
 		if errors.Is(err, os.ErrNotExist) {
 			status = http.StatusNotFound
@@ -191,6 +195,7 @@ func (s *server) handleQuarantineDelete(w http.ResponseWriter, r *http.Request) 
 		writeQuarantineAction(w, status, err)
 		return
 	}
+	s.info("quarantine", "quarantine subject deleted", "name", name, "user", who.Username)
 	writeQuarantineAction(w, http.StatusOK, nil)
 }
 
@@ -206,6 +211,7 @@ func (s *server) handleQuarantineRecover(w http.ResponseWriter, r *http.Request)
 	}
 	who, _ := actorFromRequest(r)
 	if err := s.recoverQuarantineSubject(name, who); err != nil {
+		s.warn("quarantine", "quarantine subject recovery failed", "name", name, "user", who.Username, "error", err)
 		status := http.StatusInternalServerError
 		if errors.Is(err, os.ErrNotExist) {
 			status = http.StatusNotFound
@@ -215,6 +221,7 @@ func (s *server) handleQuarantineRecover(w http.ResponseWriter, r *http.Request)
 		writeQuarantineAction(w, status, err)
 		return
 	}
+	s.info("quarantine", "quarantine subject recovered", "name", name, "user", who.Username)
 	writeQuarantineAction(w, http.StatusOK, nil)
 }
 

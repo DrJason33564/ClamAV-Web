@@ -38,9 +38,12 @@ func (s *server) handleFirstRunComplete(w http.ResponseWriter, r *http.Request) 
 	cfg := s.appConfig.get()
 	cfg.WebFirstRunCompleted = 2
 	if err := s.appConfig.update(cfg); err != nil {
+		s.error("config", "mark first run completed failed", "error", err)
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	who, _ := actorFromRequest(r)
+	s.info("config", "first run completed", "user", who.Username)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "success", "first_run": "completed"})
 }
 
@@ -65,10 +68,11 @@ func (s *server) handleServiceConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cfg := s.appConfig.get()
+		oldHistoryInterval := cfg.HistoryIndexRefreshInterval
+		oldLoginCfg := cfg
 		if req.HistoryIndexRefreshInterval != nil {
 			cfg.HistoryIndexRefreshInterval = *req.HistoryIndexRefreshInterval
 		}
-		oldLoginCfg := cfg
 		if req.WebLoginMaxTries != nil {
 			cfg.WebLoginMaxTries = *req.WebLoginMaxTries
 		}
@@ -87,12 +91,19 @@ func (s *server) handleServiceConfig(w http.ResponseWriter, r *http.Request) {
 			cfg.ServerTrustedReverseProxy = trustedProxies
 		}
 		if err := s.appConfig.update(cfg); err != nil {
+			s.warn("config", "service configuration update rejected", "error", err)
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 		if s.loginLimiter != nil && (oldLoginCfg.WebLoginMaxTries != cfg.WebLoginMaxTries || oldLoginCfg.WebLoginMaxTriesOverall != cfg.WebLoginMaxTriesOverall || oldLoginCfg.WebLoginCooldownInterval != cfg.WebLoginCooldownInterval) {
 			s.loginLimiter.reset()
+			s.info("auth", "login limiter state reset after configuration change")
 		}
+		if oldHistoryInterval != cfg.HistoryIndexRefreshInterval {
+			s.notifyHistoryIntervalChanged()
+		}
+		who, _ := actorFromRequest(r)
+		s.info("config", "service configuration updated", "user", who.Username)
 		writeJSON(w, http.StatusOK, s.appConfig.get())
 	default:
 		methodNotAllowed(w)

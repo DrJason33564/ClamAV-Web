@@ -89,6 +89,7 @@ func (s *server) handleResultLookupStart(w http.ResponseWriter, r *http.Request)
 	s.resultMu.Unlock()
 
 	go s.runResultLookup(lookup.ID)
+	s.debug("results", "result lookup started", "lookup_id", lookup.ID, "user", who.Username)
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"status":    "pending",
 		"lookup_id": lookup.ID,
@@ -158,11 +159,13 @@ func (s *server) runResultLookup(id string) {
 	if err != nil {
 		lookup.Status = "failed"
 		lookup.Error = err.Error()
+		s.error("results", "result lookup failed", "lookup_id", id, "user", username, "error", err)
 		return
 	}
 	lookup.Status = "success"
 	lookup.Results = results
 	lookup.Total = total
+	s.debug("results", "result lookup completed", "lookup_id", id, "user", username, "returned", len(results), "total", total)
 }
 
 func (s *server) readResultLogItems(scope resultScope, username string) ([]resultLogItem, int, error) {
@@ -288,9 +291,11 @@ func (s *server) handleDetectionResult(w http.ResponseWriter, r *http.Request) {
 	who, _ := actorFromRequest(r)
 	result, err := s.readDetectionResult(jobID, who.Username)
 	if err != nil {
+		s.error("results", "detection result lookup failed", "job_id", jobID, "user", who.Username, "error", err)
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.debug("results", "detection result lookup completed", "job_id", jobID, "user", who.Username)
 	if result == nil {
 		writeJSON(w, http.StatusOK, nil)
 		return

@@ -30,6 +30,7 @@ flowchart LR
   S --> T[/state/jobs + status.json/]
   T -->|fsnotify 增量通知| W
   S --> L[/log/]
+  W -->|structured backend log| L
   S --> Z[/quarantine/]
 ```
 
@@ -57,6 +58,7 @@ flowchart LR
 │   ├── whitelist.go           # SHA-256 allow-list
 │   ├── history_*.go           # 历史索引、查询与统计
 │   ├── quarantine.go          # 隔离查询、恢复和清理
+│   ├── internal/applog/      # Go 日志等级、脱敏、并发写入与轮转
 │   ├── api.md                 # API 契约
 │   └── server_conf.md         # 运行时服务配置说明
 └── ClamAV-Web/                # React 前端
@@ -68,7 +70,7 @@ flowchart LR
 ## 启动链路
 
 1. Docker 前端阶段在 `ClamAV-Web/` 执行 `npm ci && npm run build`。
-2. Go 阶段复制 `server/*.go` 和前端 `dist/`，以静态链接方式编译 `/server`。
+2. Go 阶段复制 `server/*.go`、`server/internal/` 和前端 `dist/`，以静态链接方式编译 `/server`。
 3. 运行阶段的 `startup.sh` 创建持久化目录和缺失配置，校验 cron，生成排除规则。
 4. `startup.sh` 启动上游 `/init`，等待 `clamd` 可 ping。
 5. 就绪后重载 cron、以后台进程启动 cron 与 Go 服务；任一受监管服务意外退出，容器结束。
@@ -98,8 +100,9 @@ flowchart LR
 | `/state/status.json` | shell | ClamAV 与最近扫描状态。 |
 | `/config/cron_scan.conf` | Go + shell | 带元数据的定时扫描规则。 |
 | `/config/exclude.conf` | Go + shell | 信任区相关的文件哈希与规则来源。 |
-| `/config/clamavweb.conf` | Go | 管理员可修改的服务配置。 |
-| `/log`、`/quarantine` | shell | 扫描/检出日志与隔离文件。 |
+| `/config/clamavweb.conf` | Go | 服务配置；日志三项只在启动时读取。 |
+| `/log/clamavweb.log*` | Go | 结构化后端日志及按大小轮转的历史文件。 |
+| `/log` 其余文件、`/quarantine` | shell | 启动/扫描/检出日志与隔离文件。 |
 
 不要绕过 API 直接修改这些文件，除非同时理解对应的锁、格式校验和重载流程。例如，cron 文件必须经 `cron.sh reload` 校验并生成 `/etc/cron.d/clamav-scheduled-scan`。
 
@@ -109,7 +112,23 @@ flowchart LR
 
 `HISTORY_INDEX_REFRESH_INTERVAL` 仍控制周期完整刷新，作为丢失文件事件或监听不可用时的可靠性兜底。完整刷新会一次性加载数据库内全部文件 mtime，在内存中与目录内容比对；mtime 未变化的 JSON 不会重新解析，数据库中不再存在的文件会被清除。
 
-监听初始化失败时按 5、10、20、40、60 秒阶梯退避，达到 60 秒后保持该间隔；连续失败 10 次会停止监听、向标准日志写入错误，并继续使用周期完整刷新。运行中的 watcher 报错会请求完整刷新，但重复请求会合并，最多每 60 秒执行一次；正常的单文件事件不受该限流影响。
+管理 API 更新该间隔后会通过容量为一的通知 channel 唤醒索引循环；索引循环停止并排空旧
+timer 后按最新配置重新计时。连续快速修改会合并通知，但每次处理都读取最后一次成功持久化
+的值。
+
+监听初始化失败时按 5、10、20、40、60 秒阶梯退避，达到 60 秒后保持该间隔；每次失败都会写入完整错误、次数与下次等待时间。连续失败 10 次会停止监听、写入 error，并继续使用周期完整刷新。运行中的 watcher 每次报错也会写入 warn 并请求完整刷新，但重复刷新请求会合并，最多每 60 秒执行一次；正常的单文件事件不受该限流影响。
+
+### 后端日志
+
+`server/internal/applog` 基于标准库 `log/slog`，是 Go 后端唯一的文件日志入口。业务模块只提交等级、消息和结构化
+字段；日志包统一负责过滤、单行转义、敏感字段兜底识别和轮转。明确的敏感值必须通过
+`applog.Secret(key, value)` 标记，业务代码不得自行拼接掩码。日志包仍会按字段名二次检查，
+防止普通键值调用意外泄漏密码、token、Cookie、Authorization 或 secret。
+
+日志配置来自 `clamavweb.conf`，只在进程启动时生效。`LOG_FILE_NUM` 包含当前文件；轮转由
+日志包互斥执行，因此 HTTP handler、扫描 worker 和历史 watcher 可以并发记录。轮转或写入
+失败时直接回退到 stderr，不能再次调用日志包形成递归。HTTP 日志中的 `peer_ip` 始终来自
+`RemoteAddr`；`client_ip` 则使用与登录限流相同的可信代理规则，并额外记录来源类型。
 
 ### 异步查询模式
 
@@ -200,7 +219,7 @@ go test ./...
 - cron 规则需要兼容带空格的目标路径、owner 与 `wake` 标志。不要直接手写 `/etc/cron.d`。
 - SQLite 结构或数据迁移应保持幂等，并兼顾已存在的持久化数据库。
 - 生产资源由 Go `embed` 提供。只修改 React 源码而不构建前端，最终镜像不会得到更新。
-- 当前 Dockerfile 在构建阶段仅复制 `server/*.go`；新增后端子包或非 Go 运行资源时，应同步审查 Dockerfile 的 COPY 规则。
+- Dockerfile 会复制 `server/*.go` 和 `server/internal/`；新增其他后端子包或非 Go 运行资源时，应同步审查 COPY 规则。
 
 ## 文档索引
 

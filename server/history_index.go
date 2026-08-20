@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -15,6 +14,8 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+
+	"clamav-scanner/internal/applog"
 )
 
 var version2JobIDPattern = regexp.MustCompile(`^(manual|cron)-[0-9]{10,19}(?:-[0-9]{3})?$`)
@@ -43,11 +44,31 @@ type historyIndexer struct {
 	db      *sql.DB
 	jobsDir string
 	mu      sync.Mutex
+	logger  *applog.Logger
+}
+
+func (h *historyIndexer) debug(message string, args ...any) {
+	if h.logger != nil {
+		h.logger.Debug(message, append([]any{"module", "history"}, args...)...)
+	}
+}
+
+func (h *historyIndexer) warn(message string, args ...any) {
+	if h.logger != nil {
+		h.logger.Warn(message, append([]any{"module", "history"}, args...)...)
+	}
+}
+
+func (h *historyIndexer) error(message string, args ...any) {
+	if h.logger != nil {
+		h.logger.Error(message, append([]any{"module", "history"}, args...)...)
+	}
 }
 
 func (h *historyIndexer) refresh(ctx context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	started := time.Now()
 	indexedMtimes, err := h.loadIndexedMtimesLocked(ctx)
 	if err != nil {
 		return err
@@ -67,14 +88,14 @@ func (h *historyIndexer) refresh(ctx context.Context) error {
 		delete(indexedMtimes, path)
 		info, err := entry.Info()
 		if err != nil {
-			log.Printf("history index: stat %s: %v", path, err)
+			h.warn("history job stat failed", "path", path, "error", err)
 			continue
 		}
 		if indexed && oldMtime == info.ModTime().UnixNano() {
 			continue
 		}
 		if err := h.indexCurrentFileLocked(ctx, path, info); err != nil {
-			log.Printf("history index: skip %s: %v", path, err)
+			h.warn("history job skipped", "path", path, "error", err)
 		}
 	}
 	for path := range indexedMtimes {
@@ -82,6 +103,7 @@ func (h *historyIndexer) refresh(ctx context.Context) error {
 			return err
 		}
 	}
+	h.debug("history index refresh completed", "duration_ms", time.Since(started).Milliseconds())
 	return nil
 }
 
@@ -197,7 +219,31 @@ func historyWatchRetryDelay(failureCount int) time.Duration {
 	return delay
 }
 
-func watchHistoryJobFiles(ctx context.Context, jobsDir string, requests chan<- historyIndexRequest) {
+// restartHistoryPeriodicTimer fully retires the previous timer before creating
+// its replacement. Draining prevents a stale tick from triggering an immediate
+// refresh on Go versions whose timer channels may already contain a value.
+func restartHistoryPeriodicTimer(timer *time.Timer, interval time.Duration) *time.Timer {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	return time.NewTimer(interval)
+}
+
+func (s *server) notifyHistoryIntervalChanged() {
+	if s.historyIntervalChanged == nil {
+		return
+	}
+	// Only the latest persisted value matters, so coalesce rapid API updates.
+	select {
+	case s.historyIntervalChanged <- struct{}{}:
+	default:
+	}
+}
+
+func watchHistoryJobFiles(ctx context.Context, jobsDir string, requests chan<- historyIndexRequest, logger *applog.Logger) {
 	consecutiveFailures := 0
 	for {
 		watcher, err := fsnotify.NewWatcher()
@@ -209,12 +255,16 @@ func watchHistoryJobFiles(ctx context.Context, jobsDir string, requests chan<- h
 				_ = watcher.Close()
 			}
 			consecutiveFailures++
+			if logger != nil {
+				logger.Warn("history index watcher initialization failed", "module", "history", "error", err, "attempt", consecutiveFailures, "max_attempts", historyWatchMaxConsecutiveRetryCount, "retry_after", historyWatchRetryDelay(consecutiveFailures))
+			}
 			if consecutiveFailures >= historyWatchMaxConsecutiveRetryCount {
-				log.Printf("[ERROR] history index watcher disabled after %d consecutive failures; periodic history refresh remains active: %v", consecutiveFailures, err)
+				if logger != nil {
+					logger.Error("history index watcher disabled; periodic refresh remains active", "module", "history", "error", err, "attempt", consecutiveFailures)
+				}
 				return
 			}
 			delay := historyWatchRetryDelay(consecutiveFailures)
-			log.Printf("history index watcher unavailable (attempt %d/%d); retrying in %s: %v", consecutiveFailures, historyWatchMaxConsecutiveRetryCount, delay, err)
 			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
@@ -225,6 +275,9 @@ func watchHistoryJobFiles(ctx context.Context, jobsDir string, requests chan<- h
 			}
 		}
 		consecutiveFailures = 0
+		if logger != nil {
+			logger.Info("history index watcher started", "module", "history", "jobs_dir", jobsDir)
+		}
 
 		watchClosed := false
 		for !watchClosed {
@@ -257,7 +310,10 @@ func watchHistoryJobFiles(ctx context.Context, jobsDir string, requests chan<- h
 					watchClosed = true
 					continue
 				}
-				log.Printf("history index watcher error: %v", watchErr)
+				if logger != nil {
+					// Every watcher error is retained verbatim for operational diagnosis.
+					logger.Warn("history index watcher reported an error", "module", "history", "error", watchErr)
+				}
 				select {
 				case requests <- historyIndexRequest{full: true}:
 				case <-ctx.Done():
@@ -272,7 +328,7 @@ func watchHistoryJobFiles(ctx context.Context, jobsDir string, requests chan<- h
 
 func (s *server) runHistoryIndexer(ctx context.Context) {
 	requests := make(chan historyIndexRequest, 128)
-	go watchHistoryJobFiles(ctx, s.history.jobsDir, requests)
+	go watchHistoryJobFiles(ctx, s.history.jobsDir, requests, s.logger)
 
 	pendingPaths := make(map[string]struct{})
 	var debounceTimer *time.Timer
@@ -282,7 +338,7 @@ func (s *server) runHistoryIndexer(ctx context.Context) {
 	var lastFullRefresh time.Time
 	watcherErrorRefreshPending := false
 	periodicTimer := time.NewTimer(time.Duration(s.appConfig.get().HistoryIndexRefreshInterval) * time.Second)
-	defer periodicTimer.Stop()
+	defer func() { periodicTimer.Stop() }()
 	defer func() {
 		if debounceTimer != nil {
 			debounceTimer.Stop()
@@ -324,7 +380,7 @@ func (s *server) runHistoryIndexer(ctx context.Context) {
 		watcherErrorRefreshPending = false
 		stopWatcherErrorTimer()
 		if err := s.history.refresh(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("history index refresh after watcher error failed: %v", err)
+			s.error("history", "history index refresh after watcher error failed", "error", err)
 		}
 	}
 	scheduleWatcherErrorRefresh := func() {
@@ -344,6 +400,10 @@ func (s *server) runHistoryIndexer(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-s.historyIntervalChanged:
+			interval := time.Duration(s.appConfig.get().HistoryIndexRefreshInterval) * time.Second
+			periodicTimer = restartHistoryPeriodicTimer(periodicTimer, interval)
+			s.debug("history", "history index periodic timer restarted", "interval", interval)
 		case request := <-requests:
 			if request.full {
 				scheduleWatcherErrorRefresh()
@@ -357,7 +417,7 @@ func (s *server) runHistoryIndexer(ctx context.Context) {
 			debounce = nil
 			for path := range paths {
 				if err := s.history.refreshFile(ctx, path); err != nil && !errors.Is(err, context.Canceled) {
-					log.Printf("history index event refresh failed for %s: %v", path, err)
+					s.error("history", "history index event refresh failed", "path", path, "error", err)
 				}
 			}
 		case <-watcherErrorRefresh:
@@ -368,13 +428,13 @@ func (s *server) runHistoryIndexer(ctx context.Context) {
 			}
 		case <-periodicTimer.C:
 			if err := s.history.refresh(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("history index refresh failed: %v", err)
+				s.error("history", "periodic history index refresh failed", "error", err)
 			} else if err == nil {
 				lastFullRefresh = time.Now()
 				watcherErrorRefreshPending = false
 				stopWatcherErrorTimer()
 			}
-			periodicTimer.Reset(time.Duration(s.appConfig.get().HistoryIndexRefreshInterval) * time.Second)
+			periodicTimer = restartHistoryPeriodicTimer(periodicTimer, time.Duration(s.appConfig.get().HistoryIndexRefreshInterval)*time.Second)
 		}
 	}
 }

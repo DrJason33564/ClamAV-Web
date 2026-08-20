@@ -59,9 +59,11 @@ func (s *server) handleCronRules(w http.ResponseWriter, r *http.Request) {
 		rules, err := s.readCronRules(who.Username)
 		s.configFileMu.Unlock()
 		if err != nil {
+			s.error("cron", "read cron rules failed", "user", who.Username, "error", err)
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		s.debug("cron", "cron rules listed", "user", who.Username, "rules", len(rules))
 		writeJSON(w, http.StatusOK, cronRulesResponse{Rules: rules})
 	case http.MethodPost:
 		var req cronRule
@@ -74,9 +76,11 @@ func (s *server) handleCronRules(w http.ResponseWriter, r *http.Request) {
 		rules, message, err := s.addCronRule(req, who)
 		s.configFileMu.Unlock()
 		if err != nil {
+			s.warn("cron", "cron rule creation failed", "user", who.Username, "error", err)
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		s.info("cron", "cron rule created", "user", who.Username, "rules", len(rules))
 		writeJSON(w, http.StatusCreated, cronRulesResponse{Rules: rules, Message: message})
 	default:
 		methodNotAllowed(w)
@@ -110,9 +114,11 @@ func (s *server) handleCronRule(w http.ResponseWriter, r *http.Request) {
 		rules, message, err := s.setCronRuleEnabled(id, req.Enabled, who)
 		s.configFileMu.Unlock()
 		if err != nil {
+			s.warn("cron", "cron rule state change failed", "rule_id", id, "user", who.Username, "enabled", req.Enabled, "error", err)
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		s.info("cron", "cron rule state changed", "rule_id", id, "user", who.Username, "enabled", req.Enabled)
 		writeJSON(w, http.StatusOK, cronRulesResponse{Rules: rules, Message: message})
 		return
 	}
@@ -135,9 +141,11 @@ func (s *server) handleCronRule(w http.ResponseWriter, r *http.Request) {
 		rules, message, err := s.updateCronRule(id, req, who)
 		s.configFileMu.Unlock()
 		if err != nil {
+			s.warn("cron", "cron rule update failed", "rule_id", id, "user", who.Username, "error", err)
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		s.info("cron", "cron rule updated", "rule_id", id, "user", who.Username)
 		writeJSON(w, http.StatusOK, cronRulesResponse{Rules: rules, Message: message})
 	case http.MethodDelete:
 		who, _ := actorFromRequest(r)
@@ -145,9 +153,11 @@ func (s *server) handleCronRule(w http.ResponseWriter, r *http.Request) {
 		rules, message, err := s.deleteCronRule(id, who.Username)
 		s.configFileMu.Unlock()
 		if err != nil {
+			s.warn("cron", "cron rule deletion failed", "rule_id", id, "user", who.Username, "error", err)
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		s.info("cron", "cron rule deleted", "rule_id", id, "user", who.Username)
 		writeJSON(w, http.StatusOK, cronRulesResponse{Rules: rules, Message: message})
 	default:
 		methodNotAllowed(w)
@@ -163,9 +173,11 @@ func (s *server) handleCronReload(w http.ResponseWriter, r *http.Request) {
 	defer s.configFileMu.Unlock()
 	message, err := s.runCronScript("reload")
 	if err != nil {
+		s.error("cron", "cron reload failed", "error", err)
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	s.info("cron", "cron rules reloaded")
 	who, _ := actorFromRequest(r)
 	rules, readErr := s.readCronRules(who.Username)
 	if readErr != nil {
@@ -574,6 +586,7 @@ func validCronAtom(atom string, min int, max int) bool {
 }
 
 func (s *server) saveCronConfigDoc(doc cronConfigDoc, usernames ...string) ([]cronRule, string, error) {
+	s.debug("cron", "saving cron configuration", "lines", len(doc.Lines))
 	dir := filepath.Dir(s.cfg.CronConfigFile)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, "", err
@@ -622,20 +635,24 @@ func (s *server) saveCronConfigDoc(doc cronConfigDoc, usernames ...string) ([]cr
 }
 
 func (s *server) runCronScript(args ...string) (string, error) {
+	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, s.cfg.CronScript, args...)
 	out, err := cmd.CombinedOutput()
 	message := cronScriptMessage(string(out))
 	if ctx.Err() == context.DeadlineExceeded {
+		s.error("cron", "cron command timed out", "args", strings.Join(args, " "), "duration_ms", time.Since(started).Milliseconds())
 		return message, errors.New("cron command timed out")
 	}
 	if err != nil {
 		if message == "" {
 			message = err.Error()
 		}
+		s.error("cron", "cron command failed", "args", strings.Join(args, " "), "duration_ms", time.Since(started).Milliseconds(), "error", err)
 		return message, errors.New(message)
 	}
+	s.debug("cron", "cron command completed", "args", strings.Join(args, " "), "duration_ms", time.Since(started).Milliseconds())
 	if len(args) > 0 && args[0] == "validate" && !strings.HasPrefix(message, "Cron config is valid") {
 		return message, errors.New(message)
 	}
@@ -759,6 +776,9 @@ func (s *server) disableCronRulesForUser(username string) error {
 		return nil
 	}
 	_, _, err = s.saveCronConfigDoc(doc, username)
+	if err == nil {
+		s.info("cron", "cron rules disabled for user", "user", username)
+	}
 	return err
 }
 
@@ -787,5 +807,8 @@ func (s *server) removeCronRulesForUser(username string) error {
 	}
 	doc.Lines = kept
 	_, _, err = s.saveCronConfigDoc(doc, username)
+	if err == nil {
+		s.info("cron", "cron rules removed for user", "user", username, "rules", len(remove)/2)
+	}
 	return err
 }

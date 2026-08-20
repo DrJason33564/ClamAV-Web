@@ -13,6 +13,7 @@ ARG TARGETOS
 ARG TARGETARCH
 COPY server/go.mod server/go.sum ./
 COPY server/*.go ./
+COPY server/internal ./internal
 COPY --from=web-builder /src/ClamAV-Web/dist ./web/dist
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/server .
 

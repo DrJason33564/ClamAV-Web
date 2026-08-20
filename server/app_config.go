@@ -22,6 +22,12 @@ const (
 	maxWebLoginMaxTries                = 10000
 	maxWebLoginMaxTriesOverall         = 1000000
 	maxWebLoginCooldownInterval        = 86400
+	defaultLogFileMaxSize              = 5 * 1024 * 1024
+	defaultLogFileNum                  = 5
+	defaultLogLevel                    = "info"
+	minLogFileMaxSize                  = 64 * 1024
+	maxLogFileMaxSize                  = 1024 * 1024 * 1024
+	maxLogFileNum                      = 100
 )
 
 type appConfig struct {
@@ -31,6 +37,11 @@ type appConfig struct {
 	WebLoginMaxTriesOverall     int    `json:"web_login_max_tries_overall"`
 	WebLoginCooldownInterval    int    `json:"web_login_cooldown_interval"`
 	ServerTrustedReverseProxy   string `json:"server_trusted_reverseproxy"`
+	// Logging is file-only configuration. These values are preserved when the
+	// administration API rewrites the file but are not exposed through JSON.
+	LogFileMaxSize int64  `json:"-"`
+	LogFileNum     int    `json:"-"`
+	LogLevel       string `json:"-"`
 }
 
 type appConfigStore struct {
@@ -53,6 +64,9 @@ func defaultAppConfig() appConfig {
 		WebLoginMaxTries:            defaultWebLoginMaxTries,
 		WebLoginMaxTriesOverall:     defaultWebLoginMaxTriesOverall,
 		WebLoginCooldownInterval:    defaultWebLoginCooldownInterval,
+		LogFileMaxSize:              defaultLogFileMaxSize,
+		LogFileNum:                  defaultLogFileNum,
+		LogLevel:                    defaultLogLevel,
 	}
 }
 
@@ -148,6 +162,16 @@ func parseAppConfig(content string) (appConfig, error) {
 				return appConfig{}, err
 			}
 			cfg.ServerTrustedReverseProxy = trustedProxies
+		case "LOG_FILE_MAX_SIZE":
+			if err := parseAppConfigInt64(key, value, &cfg.LogFileMaxSize); err != nil {
+				return appConfig{}, err
+			}
+		case "LOG_FILE_NUM":
+			if err := parseAppConfigInt(key, value, &cfg.LogFileNum); err != nil {
+				return appConfig{}, err
+			}
+		case "LOG_LEVEL":
+			cfg.LogLevel = strings.ToLower(value)
 		default:
 			return appConfig{}, fmt.Errorf("unsupported clamavweb config key %q", key)
 		}
@@ -163,6 +187,18 @@ func parseAppConfigInt(key, value string, target *int) error {
 		return fmt.Errorf("invalid value for %s: value is empty", key)
 	}
 	n, err := strconv.Atoi(value)
+	if err != nil {
+		return fmt.Errorf("invalid value for %s: %w", key, err)
+	}
+	*target = n
+	return nil
+}
+
+func parseAppConfigInt64(key, value string, target *int64) error {
+	if value == "" {
+		return fmt.Errorf("invalid value for %s: value is empty", key)
+	}
+	n, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
 		return fmt.Errorf("invalid value for %s: %w", key, err)
 	}
@@ -188,6 +224,17 @@ func validateAppConfig(cfg appConfig) error {
 	}
 	if _, err := normalizeTrustedReverseProxyList(cfg.ServerTrustedReverseProxy); err != nil {
 		return err
+	}
+	if cfg.LogFileMaxSize < minLogFileMaxSize || cfg.LogFileMaxSize > maxLogFileMaxSize {
+		return fmt.Errorf("LOG_FILE_MAX_SIZE must be between %d and %d bytes", minLogFileMaxSize, maxLogFileMaxSize)
+	}
+	if cfg.LogFileNum < 1 || cfg.LogFileNum > maxLogFileNum {
+		return fmt.Errorf("LOG_FILE_NUM must be between 1 and %d", maxLogFileNum)
+	}
+	switch cfg.LogLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		return errors.New("LOG_LEVEL must be debug, info, warn, or error")
 	}
 	return nil
 }
@@ -220,7 +267,7 @@ func writeAppConfigFile(path string, cfg appConfig) error {
 	}
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
-	content := fmt.Sprintf("HISTORY_INDEX_REFRESH_INTERVAL=%d\nWEB_FIRSTRUN_COMPLETED=%d\nWEB_LOGIN_MAX_TRIES=%d\nWEB_LOGIN_MAX_TRIES_OVERALL=%d\nWEB_LOGIN_COOLDOWN_INTERVAL=%d\nSERVER_TRUSTED_REVERSEPROXY=%s\n", cfg.HistoryIndexRefreshInterval, cfg.WebFirstRunCompleted, cfg.WebLoginMaxTries, cfg.WebLoginMaxTriesOverall, cfg.WebLoginCooldownInterval, cfg.ServerTrustedReverseProxy)
+	content := fmt.Sprintf("HISTORY_INDEX_REFRESH_INTERVAL=%d\nWEB_FIRSTRUN_COMPLETED=%d\nWEB_LOGIN_MAX_TRIES=%d\nWEB_LOGIN_MAX_TRIES_OVERALL=%d\nWEB_LOGIN_COOLDOWN_INTERVAL=%d\nSERVER_TRUSTED_REVERSEPROXY=%s\nLOG_FILE_MAX_SIZE=%d\nLOG_FILE_NUM=%d\nLOG_LEVEL=%s\n", cfg.HistoryIndexRefreshInterval, cfg.WebFirstRunCompleted, cfg.WebLoginMaxTries, cfg.WebLoginMaxTriesOverall, cfg.WebLoginCooldownInterval, cfg.ServerTrustedReverseProxy, cfg.LogFileMaxSize, cfg.LogFileNum, cfg.LogLevel)
 	if _, err := tmp.WriteString(content); err != nil {
 		_ = tmp.Close()
 		return err

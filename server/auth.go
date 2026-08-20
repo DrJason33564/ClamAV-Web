@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -89,9 +88,11 @@ func (s *server) requireAuth(next http.Handler) http.Handler {
 			return
 		}
 		if isUnsafeMethod(r.Method) && !sameOriginRequest(r) {
+			s.warn("auth", "cross-origin request rejected", "method", r.Method, "path", r.URL.Path, "user", who.Username)
 			writeError(w, http.StatusForbidden, errors.New("cross-origin request rejected"))
 			return
 		}
+		setRequestLogActor(r, who.Username)
 		w.Header().Set("Cache-Control", "no-store")
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), actorContextKey{}, who)))
 	})
@@ -258,9 +259,11 @@ func (s *server) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
+		s.error("users", "create user transaction failed", "user", req.Username, "error", err)
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.info("users", "user created", "user", req.Username, "role", role, "timedock_account_set", timeDockAccount != "", "password_set", encoded != nil)
 	writeJSON(w, http.StatusCreated, map[string]any{"status": "success", "username": req.Username, "role": role, "timedock_account": timeDockAccount, "password_set": encoded != nil})
 }
 
@@ -276,6 +279,7 @@ func (s *server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	clientIP := requestClientIP(r, appCfg.ServerTrustedReverseProxy)
 	if allowed, retryAfter := s.loginLimiter.allow(clientIP, now, appCfg); !allowed {
+		s.warn("auth", "login rate limit rejected request", "client_ip", clientIP, "retry_after_seconds", retryAfterSeconds(retryAfter))
 		w.Header().Set("Retry-After", retryAfterSeconds(retryAfter))
 		writeError(w, http.StatusTooManyRequests, errors.New("too many login attempts; try again later"))
 		return
@@ -296,6 +300,7 @@ func (s *server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		_ = verifyPassword(req.Password, dummyPasswordHash)
 	}
 	if !valid {
+		s.warn("auth", "login failed", "client_ip", clientIP, "user", req.Username, "reason", "invalid_credentials")
 		writeError(w, http.StatusUnauthorized, errors.New("invalid username or password"))
 		return
 	}
@@ -310,6 +315,7 @@ func (s *server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setSessionCookie(w, r, token, sessionNow.Add(sessionAbsoluteTTL))
+	s.info("auth", "login succeeded", "client_ip", clientIP, "user", username, "role", role)
 	writeJSON(w, http.StatusOK, map[string]any{"status": "success", "username": username, "role": role})
 }
 
@@ -330,6 +336,9 @@ func (s *server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 		_, _ = s.userDB.ExecContext(r.Context(), "UPDATE sessions SET revoked_at=? WHERE token_hash=?", time.Now().Unix(), hash[:])
 	}
 	clearSessionCookie(w, r)
+	if who, err := actorFromRequest(r); err == nil {
+		s.info("auth", "logout succeeded", "user", who.Username)
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "success"})
 }
 
@@ -401,6 +410,7 @@ func (s *server) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clearSessionCookie(w, r)
+	s.info("auth", "password changed and sessions revoked", "user", who.Username)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "success"})
 }
 
@@ -492,18 +502,15 @@ func (s *server) runSessionJanitor(ctx context.Context) {
 			// Keep recently revoked rows briefly for operational diagnosis, but
 			// expired credentials do not need to grow the database indefinitely.
 			cutoff := now.Add(-24 * time.Hour).Unix()
-			_, _ = s.userDB.ExecContext(ctx, `DELETE FROM sessions
+			result, err := s.userDB.ExecContext(ctx, `DELETE FROM sessions
 WHERE absolute_expires_at<? OR idle_expires_at<? OR (revoked_at IS NOT NULL AND revoked_at<?)`, now.Unix(), now.Unix(), cutoff)
+			if err != nil {
+				s.error("auth", "session janitor failed", "error", err)
+			} else if deleted, err := result.RowsAffected(); err == nil {
+				s.debug("auth", "session janitor completed", "deleted", deleted)
+			}
 		}
 	}
-}
-
-func logRequests(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		next.ServeHTTP(w, r)
-		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond))
-	})
 }
 
 // scanInteger is shared by the administration handlers to decode path IDs

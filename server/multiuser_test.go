@@ -273,6 +273,9 @@ func TestAppConfigRoundTrip(t *testing.T) {
 	cfg.WebLoginMaxTriesOverall = 120
 	cfg.WebLoginCooldownInterval = 300
 	cfg.ServerTrustedReverseProxy = "192.0.2.10,2001:db8::10"
+	cfg.LogFileMaxSize = 8 * 1024 * 1024
+	cfg.LogFileNum = 9
+	cfg.LogLevel = "debug"
 	if err := store.update(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -295,6 +298,9 @@ func TestAppConfigRejectsInvalidLoginAndProxySettings(t *testing.T) {
 		"invalid trusted proxy":   func(cfg *appConfig) { cfg.ServerTrustedReverseProxy = "proxy.example.com" },
 		"trusted proxy with port": func(cfg *appConfig) { cfg.ServerTrustedReverseProxy = "192.0.2.1:8080" },
 		"empty proxy list item":   func(cfg *appConfig) { cfg.ServerTrustedReverseProxy = "192.0.2.1,,192.0.2.2" },
+		"small log file":          func(cfg *appConfig) { cfg.LogFileMaxSize = minLogFileMaxSize - 1 },
+		"zero log files":          func(cfg *appConfig) { cfg.LogFileNum = 0 },
+		"invalid log level":       func(cfg *appConfig) { cfg.LogLevel = "verbose" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := base
@@ -308,11 +314,13 @@ func TestAppConfigRejectsInvalidLoginAndProxySettings(t *testing.T) {
 
 func TestServiceConfigUpdatesLoginLimitsAndTrustedProxy(t *testing.T) {
 	s := newDatabaseTestServer(t)
+	s.historyIntervalChanged = make(chan struct{}, 1)
 	if allowed, _ := s.loginLimiter.allow("192.0.2.1", time.Now(), s.appConfig.get()); !allowed {
 		t.Fatal("failed to seed login limiter")
 	}
 	request := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(`{
-  "web_login_max_tries": 5,
+	  "history_index_refresh_interval": 120,
+	  "web_login_max_tries": 5,
   "web_login_max_tries_overall": 50,
   "web_login_cooldown_interval": 120,
   "server_trusted_reverseproxy": "192.0.2.10, 2001:db8::10"
@@ -329,6 +337,16 @@ func TestServiceConfigUpdatesLoginLimitsAndTrustedProxy(t *testing.T) {
 	}
 	if len(s.loginLimiter.byIP) != 0 {
 		t.Fatal("changing login limits should reset in-memory limiter state")
+	}
+	select {
+	case <-s.historyIntervalChanged:
+	default:
+		t.Fatal("changing the history refresh interval did not notify the indexer")
+	}
+	for _, key := range []string{"log_file_max_size", "log_file_num", "log_level"} {
+		if strings.Contains(response.Body.String(), key) {
+			t.Fatalf("file-only log setting %q leaked through the API: %s", key, response.Body.String())
+		}
 	}
 }
 

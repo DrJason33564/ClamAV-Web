@@ -117,7 +117,7 @@ docker run -d \
 | `/config` | 定时规则、信任区、服务配置 |
 | `/data` | 用户、会话和历史索引 SQLite 数据库 |
 | `/state` | 扫描任务 JSON、状态文件和锁 |
-| `/log` | 启动、cron、扫描与检出日志 |
+| `/log` | Go 后端、启动、cron、扫描与检出日志 |
 
 ## 🔐 安全与权限
 
@@ -142,8 +142,11 @@ docker run -d \
 | `SCAN_WAIT_MAX_SECONDS` | `0` | 定时任务最大等待时间；`0` 为不限制。 |
 | `USER_DATABASE_FILE` | `/data/users.db` | 用户与 session 数据库。 |
 | `HISTORY_DATABASE_FILE` | `/data/history.db` | 历史任务索引数据库。 |
+| `LOG_FILE_MAX_SIZE` | `5242880` | `/log/clamavweb.log` 单文件最大字节数。 |
+| `LOG_FILE_NUM` | `5` | Go 后端日志文件总数（包含当前文件）。 |
+| `LOG_LEVEL` | `info` | Go 后端最低日志等级。 |
 
-运行时服务配置保存在 `/config/clamavweb.conf`，可由管理员在界面中调整登录限制和历史索引间隔。配置项范围、默认值及反向代理规则见 [server/server_conf.md](server/server_conf.md)。
+服务配置保存在 `/config/clamavweb.conf`，管理员可在界面中调整登录限制和历史索引间隔；日志配置需手工修改并重启服务，不通过界面或 API 暴露。配置项范围、默认值及反向代理规则见 [server/server_conf.md](server/server_conf.md)。
 
 ## 📖 使用要点
 

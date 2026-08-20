@@ -39,9 +39,11 @@ func (s *server) handleResultsClean(w http.ResponseWriter, r *http.Request) {
 	who, _ := actorFromRequest(r)
 	deleted, err := s.cleanUserResults(r.Context(), who.Username)
 	if err != nil {
+		s.error("cleanup", "result cleanup failed", "user", who.Username, "deleted", deleted, "error", err)
 		writeCleanResponse(w, http.StatusInternalServerError, "failed", deleted, err)
 		return
 	}
+	s.info("cleanup", "result cleanup completed", "user", who.Username, "deleted", deleted)
 	writeCleanResponse(w, http.StatusOK, "success", deleted, nil)
 }
 
@@ -57,9 +59,11 @@ func (s *server) handleQuarantineClean(w http.ResponseWriter, r *http.Request) {
 	who, _ := actorFromRequest(r)
 	deleted, err := s.cleanUserQuarantine(who.Username)
 	if err != nil {
+		s.error("cleanup", "quarantine cleanup failed", "user", who.Username, "deleted", deleted, "error", err)
 		writeCleanResponse(w, http.StatusInternalServerError, "failed", deleted, err)
 		return
 	}
+	s.info("cleanup", "quarantine cleanup completed", "user", who.Username, "deleted", deleted)
 	writeCleanResponse(w, http.StatusOK, "success", deleted, nil)
 }
 
@@ -145,6 +149,7 @@ func (s *server) cleanUserQuarantine(username string) (int, error) {
 }
 
 func (s *server) cleanDeleteUser(ctx context.Context, username string) error {
+	s.debug("users", "user deletion started", "user", username)
 	s.accountDeleteMu.Lock()
 	defer s.accountDeleteMu.Unlock()
 	var id int64
@@ -223,6 +228,11 @@ func (s *server) cleanDeleteUser(ctx context.Context, username string) error {
 		return err
 	}
 	_, err := s.userDB.ExecContext(ctx, "DELETE FROM users WHERE id=?", id)
+	if err == nil {
+		s.debug("users", "user deletion resources cleaned", "user", username)
+	} else {
+		s.error("users", "user deletion failed", "user", username, "error", err)
+	}
 	return err
 }
 
