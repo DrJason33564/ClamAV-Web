@@ -13,7 +13,7 @@ func TestCronScriptRendersWakeFlag(t *testing.T) {
 	configFile := filepath.Join(tmp, "cron_scan.conf")
 	cronFile := filepath.Join(tmp, "clamav-scheduled-scan")
 	rules := strings.Join([]string{
-		`15 2 * * 0 "/scan/My Folder" remove admin Y`,
+		`15 2 * * 0 "/scan/My Folder" remove admin001 Y`,
 		`30 3 * * * /scan warn alice001 N`,
 	}, "\n") + "\n"
 	if err := os.WriteFile(configFile, []byte(rules), 0o600); err != nil {

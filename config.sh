@@ -109,7 +109,7 @@ split_cron_config_line() {
 
             if [ "$#" -ne 4 ]; then
                 config_invalid "target" "$line_no" "$line"
-                config_log "[ERROR] Wrap paths containing spaces in double quotes, for example: \"/scan/My Folder\" move admin Y"
+                config_log "[ERROR] Wrap paths containing spaces in double quotes, for example: \"/scan/My Folder\" move admin001 Y"
                 return 1
             fi
             CRON_TARGET="$1"

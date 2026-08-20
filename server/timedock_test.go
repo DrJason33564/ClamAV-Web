@@ -112,7 +112,7 @@ func TestAdminCreateUserSetsTimeDockAccountAndListResult(t *testing.T) {
 func TestTimeDockBrowseKeepsDeviceLevelAndFiltersAccounts(t *testing.T) {
 	root := makeTimeDockTree(t)
 	s := &server{cfg: config{BrowseRoots: []string{root}, IsTimeDock: true}}
-	who := actor{Username: "alice", TimeDockAccount: "Jason"}
+	who := actor{ID: testAliceUserID, Username: "alice", TimeDockAccount: "Jason"}
 
 	rootResponse := browseTimeDock(t, s, root, who)
 	if got := browseNames(rootResponse); got != "extdev,usb1,usb2" {
@@ -126,7 +126,7 @@ func TestTimeDockBrowseKeepsDeviceLevelAndFiltersAccounts(t *testing.T) {
 	if got := browseNames(accountResponse); got != "documents" {
 		t.Fatalf("unexpected account entries: %s", got)
 	}
-	caseSensitive := browseTimeDock(t, s, root, actor{Username: "alice", TimeDockAccount: "jason"})
+	caseSensitive := browseTimeDock(t, s, root, actor{ID: testAliceUserID, Username: "alice", TimeDockAccount: "jason"})
 	if len(caseSensitive.Entries) != 0 {
 		t.Fatalf("expected account folder matching to be case-sensitive: %#v", caseSensitive.Entries)
 	}
@@ -151,7 +151,7 @@ func TestTimeDockBrowseKeepsDeviceLevelAndFiltersAccounts(t *testing.T) {
 func TestTimeDockPathProtectionAcrossAPIs(t *testing.T) {
 	root := makeTimeDockTree(t)
 	s := &server{cfg: config{BrowseRoots: []string{root}, IsTimeDock: true}}
-	who := actor{Username: "alice", TimeDockAccount: "Jason"}
+	who := actor{ID: testAliceUserID, Username: "alice", TimeDockAccount: "Jason"}
 	allowed := filepath.Join(root, "usb1", "Jason", "documents")
 	denied := filepath.Join(root, "usb1", "James")
 

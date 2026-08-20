@@ -483,6 +483,7 @@ func TestWhitelistAddDeleteAndBusyLock(t *testing.T) {
 
 func TestReadResultLogItems(t *testing.T) {
 	tmp := t.TempDir()
+	// Keep one legacy v2 fixture to verify the v3 index ignores username-owned jobs.
 	files := map[string]string{
 		"manual-1783431402.json": `{"version":3,"job_id":"manual-1783431402","type":"manual","status":"finished","result":"found","action":"warn","started_at":1783431402,"finished_at":1783431410,"user_id":"alice001"}`,
 		"cron-1783407661.json":   `{"version":3,"job_id":"cron-1783407661","type":"cron","status":"finished","result":"clean","action":"remove","started_at":1783407661,"finished_at":1783407670,"user_id":"alice001"}`,

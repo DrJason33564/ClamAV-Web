@@ -181,6 +181,7 @@ func TestLoginLimitUsesIPInsteadOfUsername(t *testing.T) {
 
 func TestHistoryIndexIsVersion3AndOwnerScoped(t *testing.T) {
 	s := newDatabaseTestServer(t)
+	// Keep one legacy v2 fixture to verify username-owned jobs are rejected.
 	jobs := map[string]string{
 		"manual-1783433000.json": `{"version":3,"job_id":"manual-1783433000","type":"manual","status":"finished","result":"clean","action":"warn","started_at":1783433000,"finished_at":1783433010,"user_id":"alice001"}`,
 		"cron-1783432000.json":   `{"version":3,"job_id":"cron-1783432000","type":"cron","status":"finished","result":"found","action":"move","started_at":1783432000,"finished_at":1783432010,"user_id":"bob00002"}`,

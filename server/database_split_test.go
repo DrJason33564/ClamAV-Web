@@ -29,6 +29,7 @@ func TestUserAndHistorySchemasAreSeparated(t *testing.T) {
 	if !sqliteTableExists(t, historyDB, "history_jobs") || sqliteTableExists(t, userDB, "history_jobs") {
 		t.Fatal("expected history_jobs to exist only in the history database")
 	}
+	// Database migration versions are independent of the version 3 job JSON schema.
 	for name, db := range map[string]*sql.DB{"user": userDB, "history": historyDB} {
 		var version int
 		if err := db.QueryRow("SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil || version != 2 {
