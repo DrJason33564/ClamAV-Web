@@ -41,6 +41,7 @@ type server struct {
 	loginLimiter             *loginLimiter
 	logger                   *applog.Logger
 	historyIntervalChanged   chan struct{}
+	clamavSleepTimer         *clamavSleepTimerState
 }
 
 func main() {
@@ -114,6 +115,7 @@ func run() error {
 		loginLimiter:             newLoginLimiter(),
 		logger:                   logger,
 		historyIntervalChanged:   make(chan struct{}, 1),
+		clamavSleepTimer:         newClamAVSleepTimerState(),
 	}
 	s.history = &historyIndexer{db: historyDB, jobsDir: cfg.JobsDir, logger: logger}
 	if err := s.history.refresh(context.Background()); err != nil {
@@ -124,6 +126,7 @@ func run() error {
 	go s.runHistoryIndexer(ctx)
 	go s.runSessionJanitor(ctx)
 	go s.loginLimiter.runJanitor(ctx)
+	go s.runClamAVSleepTimer(ctx)
 
 	mux := http.NewServeMux()
 	mux.Handle("/", frontendHandler())

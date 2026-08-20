@@ -16,6 +16,8 @@ const (
 	defaultHistoryIndexRefreshInterval = 60
 	minHistoryIndexRefreshInterval     = 5
 	maxHistoryIndexRefreshInterval     = 86400
+	defaultClamAVSleepTimer            = 3600
+	minClamAVSleepTimer                = 600
 	defaultWebLoginMaxTries            = 10
 	defaultWebLoginMaxTriesOverall     = 100
 	defaultWebLoginCooldownInterval    = 600
@@ -30,8 +32,12 @@ const (
 	maxLogFileNum                      = 100
 )
 
+// Largest whole-second interval representable by time.Duration.
+const maxClamAVSleepTimerSeconds int64 = 9223372036
+
 type appConfig struct {
 	HistoryIndexRefreshInterval int    `json:"history_index_refresh_interval"`
+	ClamAVSleepTimer            int    `json:"clamav_sleep_timer"`
 	WebFirstRunCompleted        int    `json:"web_firstrun_completed"`
 	WebLoginMaxTries            int    `json:"web_login_max_tries"`
 	WebLoginMaxTriesOverall     int    `json:"web_login_max_tries_overall"`
@@ -61,6 +67,7 @@ func newAppConfigStore(path string) (*appConfigStore, error) {
 func defaultAppConfig() appConfig {
 	return appConfig{
 		HistoryIndexRefreshInterval: defaultHistoryIndexRefreshInterval,
+		ClamAVSleepTimer:            defaultClamAVSleepTimer,
 		WebLoginMaxTries:            defaultWebLoginMaxTries,
 		WebLoginMaxTriesOverall:     defaultWebLoginMaxTriesOverall,
 		WebLoginCooldownInterval:    defaultWebLoginCooldownInterval,
@@ -140,6 +147,10 @@ func parseAppConfig(content string) (appConfig, error) {
 			if err := parseAppConfigInt(key, value, &cfg.HistoryIndexRefreshInterval); err != nil {
 				return appConfig{}, err
 			}
+		case "CLAMAV_SLEEP_TIMER":
+			if err := parseAppConfigInt(key, value, &cfg.ClamAVSleepTimer); err != nil {
+				return appConfig{}, err
+			}
 		case "WEB_FIRSTRUN_COMPLETED":
 			if err := parseAppConfigInt(key, value, &cfg.WebFirstRunCompleted); err != nil {
 				return appConfig{}, err
@@ -210,6 +221,12 @@ func validateAppConfig(cfg appConfig) error {
 	if cfg.HistoryIndexRefreshInterval < minHistoryIndexRefreshInterval || cfg.HistoryIndexRefreshInterval > maxHistoryIndexRefreshInterval {
 		return fmt.Errorf("HISTORY_INDEX_REFRESH_INTERVAL must be between %d and %d", minHistoryIndexRefreshInterval, maxHistoryIndexRefreshInterval)
 	}
+	if cfg.ClamAVSleepTimer != 0 && cfg.ClamAVSleepTimer < minClamAVSleepTimer {
+		return fmt.Errorf("CLAMAV_SLEEP_TIMER must be 0 or at least %d seconds", minClamAVSleepTimer)
+	}
+	if int64(cfg.ClamAVSleepTimer) > maxClamAVSleepTimerSeconds {
+		return errors.New("CLAMAV_SLEEP_TIMER is too large")
+	}
 	if cfg.WebFirstRunCompleted != 0 && cfg.WebFirstRunCompleted != 2 {
 		return errors.New("WEB_FIRSTRUN_COMPLETED must be 0 or 2")
 	}
@@ -267,7 +284,7 @@ func writeAppConfigFile(path string, cfg appConfig) error {
 	}
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
-	content := fmt.Sprintf("HISTORY_INDEX_REFRESH_INTERVAL=%d\nWEB_FIRSTRUN_COMPLETED=%d\nWEB_LOGIN_MAX_TRIES=%d\nWEB_LOGIN_MAX_TRIES_OVERALL=%d\nWEB_LOGIN_COOLDOWN_INTERVAL=%d\nSERVER_TRUSTED_REVERSEPROXY=%s\nLOG_FILE_MAX_SIZE=%d\nLOG_FILE_NUM=%d\nLOG_LEVEL=%s\n", cfg.HistoryIndexRefreshInterval, cfg.WebFirstRunCompleted, cfg.WebLoginMaxTries, cfg.WebLoginMaxTriesOverall, cfg.WebLoginCooldownInterval, cfg.ServerTrustedReverseProxy, cfg.LogFileMaxSize, cfg.LogFileNum, cfg.LogLevel)
+	content := fmt.Sprintf("HISTORY_INDEX_REFRESH_INTERVAL=%d\nCLAMAV_SLEEP_TIMER=%d\nWEB_FIRSTRUN_COMPLETED=%d\nWEB_LOGIN_MAX_TRIES=%d\nWEB_LOGIN_MAX_TRIES_OVERALL=%d\nWEB_LOGIN_COOLDOWN_INTERVAL=%d\nSERVER_TRUSTED_REVERSEPROXY=%s\nLOG_FILE_MAX_SIZE=%d\nLOG_FILE_NUM=%d\nLOG_LEVEL=%s\n", cfg.HistoryIndexRefreshInterval, cfg.ClamAVSleepTimer, cfg.WebFirstRunCompleted, cfg.WebLoginMaxTries, cfg.WebLoginMaxTriesOverall, cfg.WebLoginCooldownInterval, cfg.ServerTrustedReverseProxy, cfg.LogFileMaxSize, cfg.LogFileNum, cfg.LogLevel)
 	if _, err := tmp.WriteString(content); err != nil {
 		_ = tmp.Close()
 		return err

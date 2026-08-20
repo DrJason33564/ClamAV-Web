@@ -377,7 +377,16 @@ func (s *server) startScanScript(args []string) (string, func() (string, error),
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	if err := cmd.Start(); err != nil {
+	// Serialize the process start with ClamAV power transitions. Once Start
+	// succeeds, bumping the timer generation prevents a simultaneous stale
+	// expiry from shutting clamd down underneath the new manual scan.
+	s.clamavPowerMu.Lock()
+	err = cmd.Start()
+	if err == nil {
+		s.notifyClamAVSleepTimerChanged("manual_scan_started")
+	}
+	s.clamavPowerMu.Unlock()
+	if err != nil {
 		return "", nil, err
 	}
 

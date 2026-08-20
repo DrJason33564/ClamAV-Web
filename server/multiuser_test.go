@@ -268,6 +268,7 @@ func TestAppConfigRoundTrip(t *testing.T) {
 	}
 	cfg := store.get()
 	cfg.HistoryIndexRefreshInterval = 120
+	cfg.ClamAVSleepTimer = 0
 	cfg.WebFirstRunCompleted = 2
 	cfg.WebLoginMaxTries = 12
 	cfg.WebLoginMaxTriesOverall = 120
@@ -287,6 +288,23 @@ func TestAppConfigRoundTrip(t *testing.T) {
 	if err != nil || parsed != cfg {
 		t.Fatalf("config did not round trip: %#v err=%v", parsed, err)
 	}
+	if !strings.Contains(string(data), "CLAMAV_SLEEP_TIMER=0\n") {
+		t.Fatalf("disabled sleep timer was not written as zero: %s", data)
+	}
+}
+
+func TestAppConfigSleepTimerDefaultsAndZeroValue(t *testing.T) {
+	cfg, err := parseAppConfig("")
+	if err != nil || cfg.ClamAVSleepTimer != defaultClamAVSleepTimer {
+		t.Fatalf("missing sleep timer did not use default: %#v err=%v", cfg, err)
+	}
+	if _, err := parseAppConfig("CLAMAV_SLEEP_TIMER=\n"); err == nil {
+		t.Fatal("empty sleep timer configuration was accepted")
+	}
+	cfg, err = parseAppConfig("CLAMAV_SLEEP_TIMER=0\n")
+	if err != nil || cfg.ClamAVSleepTimer != 0 {
+		t.Fatalf("zero sleep timer did not disable scheduling: %#v err=%v", cfg, err)
+	}
 }
 
 func TestAppConfigRejectsInvalidLoginAndProxySettings(t *testing.T) {
@@ -301,6 +319,7 @@ func TestAppConfigRejectsInvalidLoginAndProxySettings(t *testing.T) {
 		"small log file":          func(cfg *appConfig) { cfg.LogFileMaxSize = minLogFileMaxSize - 1 },
 		"zero log files":          func(cfg *appConfig) { cfg.LogFileNum = 0 },
 		"invalid log level":       func(cfg *appConfig) { cfg.LogLevel = "verbose" },
+		"short sleep timer":       func(cfg *appConfig) { cfg.ClamAVSleepTimer = minClamAVSleepTimer - 1 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := base
@@ -315,11 +334,13 @@ func TestAppConfigRejectsInvalidLoginAndProxySettings(t *testing.T) {
 func TestServiceConfigUpdatesLoginLimitsAndTrustedProxy(t *testing.T) {
 	s := newDatabaseTestServer(t)
 	s.historyIntervalChanged = make(chan struct{}, 1)
+	s.clamavSleepTimer = newClamAVSleepTimerState()
 	if allowed, _ := s.loginLimiter.allow("192.0.2.1", time.Now(), s.appConfig.get()); !allowed {
 		t.Fatal("failed to seed login limiter")
 	}
 	request := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(`{
 	  "history_index_refresh_interval": 120,
+	  "clamav_sleep_timer": 600,
 	  "web_login_max_tries": 5,
   "web_login_max_tries_overall": 50,
   "web_login_cooldown_interval": 120,
@@ -332,7 +353,7 @@ func TestServiceConfigUpdatesLoginLimitsAndTrustedProxy(t *testing.T) {
 		t.Fatalf("config update failed: %d %s", response.Code, response.Body.String())
 	}
 	cfg := s.appConfig.get()
-	if cfg.WebLoginMaxTries != 5 || cfg.WebLoginMaxTriesOverall != 50 || cfg.WebLoginCooldownInterval != 120 || cfg.ServerTrustedReverseProxy != "192.0.2.10,2001:db8::10" {
+	if cfg.ClamAVSleepTimer != 600 || cfg.WebLoginMaxTries != 5 || cfg.WebLoginMaxTriesOverall != 50 || cfg.WebLoginCooldownInterval != 120 || cfg.ServerTrustedReverseProxy != "192.0.2.10,2001:db8::10" {
 		t.Fatalf("unexpected updated config: %#v", cfg)
 	}
 	if len(s.loginLimiter.byIP) != 0 {
@@ -343,10 +364,52 @@ func TestServiceConfigUpdatesLoginLimitsAndTrustedProxy(t *testing.T) {
 	default:
 		t.Fatal("changing the history refresh interval did not notify the indexer")
 	}
+	select {
+	case <-s.clamavSleepTimer.changed:
+	default:
+		t.Fatal("changing the ClamAV sleep timer did not notify the scheduler")
+	}
 	for _, key := range []string{"log_file_max_size", "log_file_num", "log_level"} {
 		if strings.Contains(response.Body.String(), key) {
 			t.Fatalf("file-only log setting %q leaked through the API: %s", key, response.Body.String())
 		}
+	}
+}
+
+func TestServiceConfigSleepTimerUsesZeroToDisable(t *testing.T) {
+	s := newDatabaseTestServer(t)
+	s.clamavSleepTimer = newClamAVSleepTimerState()
+	actorCtx := context.WithValue(context.Background(), actorContextKey{}, actor{Username: "admin", Role: "admin"})
+
+	emptyRequest := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(`{"clamav_sleep_timer":""}`)).WithContext(actorCtx)
+	emptyResponse := httptest.NewRecorder()
+	s.handleServiceConfig(emptyResponse, emptyRequest)
+	if emptyResponse.Code != http.StatusBadRequest {
+		t.Fatalf("empty string should be rejected, got %d %s", emptyResponse.Code, emptyResponse.Body.String())
+	}
+	if s.appConfig.get().ClamAVSleepTimer != defaultClamAVSleepTimer {
+		t.Fatal("rejected empty string changed the sleep timer")
+	}
+
+	zeroRequest := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(`{"clamav_sleep_timer":0}`)).WithContext(actorCtx)
+	zeroResponse := httptest.NewRecorder()
+	s.handleServiceConfig(zeroResponse, zeroRequest)
+	if zeroResponse.Code != http.StatusOK {
+		t.Fatalf("zero sleep timer update failed: %d %s", zeroResponse.Code, zeroResponse.Body.String())
+	}
+	if s.appConfig.get().ClamAVSleepTimer != 0 {
+		t.Fatal("zero API value did not disable the sleep timer")
+	}
+	body := decodeMap(t, zeroResponse)
+	if timer, ok := body["clamav_sleep_timer"].(float64); !ok || timer != 0 {
+		t.Fatalf("disabled sleep timer response was not numeric zero: %#v", body["clamav_sleep_timer"])
+	}
+	data, err := os.ReadFile(s.appConfig.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "CLAMAV_SLEEP_TIMER=0\n") {
+		t.Fatalf("disabled timer was not persisted as zero: %s", data)
 	}
 }
 

@@ -8,6 +8,7 @@
 
 ```ini
 HISTORY_INDEX_REFRESH_INTERVAL=60
+CLAMAV_SLEEP_TIMER=3600
 WEB_FIRSTRUN_COMPLETED=0
 WEB_LOGIN_MAX_TRIES=10
 WEB_LOGIN_MAX_TRIES_OVERALL=100
@@ -34,7 +35,27 @@ LOG_LEVEL=info
 通知进行单文件增量索引；此间隔不限制该
 即时更新，只负责定期校验完整目录，并在监听不可用时继续发现任务变化。
 
-## 3. 首次运行
+## 3. ClamAV 定时休眠
+
+### `CLAMAV_SLEEP_TIMER`
+
+- 类型：整数，单位为秒；
+- 默认值：`3600`（一小时）；
+- 允许值：`0`，或不小于 `600`；
+- 作用：ClamAV 空闲达到指定时间后，调用与手动休眠接口相同的安全休眠逻辑。
+
+配置项缺失时使用默认值；配置文件写成 `CLAMAV_SLEEP_TIMER=0` 时关闭定时休眠。管理 API
+同样使用 `clamav_sleep_timer: 0` 表示关闭。空值、空字符串和 `1–599` 都会被拒绝。
+
+Go 服务启动时开始计时。每个手动扫描进程成功启动、管理员手动唤醒 ClamAV 或通过管理 API
+修改该值后，都会停止并排空旧 timer，再按最新配置重新计时。手动或定时休眠成功后计时暂停，
+直到 ClamAV 再次被手动唤醒。cron 扫描不直接重置 Go 定时器，但定时器到期时仍会通过现有
+跨进程扫描锁检查避免在 cron 扫描期间休眠。
+
+定时器到期时如果手动扫描正在排队或运行，或者现有休眠逻辑发现扫描锁，当前休眠会被延后，
+并按完整间隔重新计时。临时休眠错误同样会记录日志并按完整间隔重试，不会进入快速重试循环。
+
+## 4. 首次运行
 
 ### `WEB_FIRSTRUN_COMPLETED`
 
@@ -48,7 +69,7 @@ LOG_LEVEL=info
 `ADMIN_REGISTER_TOKEN` 创建首位管理员；值为 `2` 时不会因为用户表意外为空而重新开放
 匿名注册。
 
-## 4. 登录请求限制
+## 5. 登录请求限制
 
 登录统计窗口固定为十分钟。所有获准进入登录处理流程的请求都会计数，包括登录成功、密码
 错误、用户名不存在和请求体错误。处于冷却状态的请求直接返回 `429`，不会查询用户数据库、
@@ -84,7 +105,7 @@ LOG_LEVEL=info
 `Retry-After` 头。管理员通过 `/api/config` 修改以上任一登录限制后，当前计数和冷却状态
 会被清空，使新配置立即生效。
 
-## 5. 可信反向代理
+## 6. 可信反向代理
 
 ### `SERVER_TRUSTED_REVERSEPROXY`
 
@@ -109,7 +130,7 @@ SERVER_TRUSTED_REVERSEPROXY=192.0.2.10,2001:db8::10
 可信代理必须覆盖或可靠清理客户端传入的 `X-Forwarded-For`，否则攻击者仍可能伪造来源
 地址绕过单 IP 限制。IPv4 和 IPv6 使用规范化后的地址进行比较。
 
-## 6. Go 后端日志
+## 7. Go 后端日志
 
 Go 后端将结构化文本日志写入 `/log/clamavweb.log`。该文件与 Shell 的 `startup.log`、扫描
 日志和检出日志相互独立。轮转文件依次命名为 `clamavweb.log.1`、`clamavweb.log.2` 等。
@@ -145,7 +166,7 @@ info；认证拒绝记录为 warn；服务端错误记录为 error。日志保�
 显式标记的秘钥及密码、token、secret 等敏感字段会统一脱敏：长度大于八个字符时保留首尾
 各四个字符，中间替换为八个星号；更短的非空值完全替换为八个星号。
 
-## 7. 相关环境变量
+## 8. 相关环境变量
 
 以下项目不写入 `clamavweb.conf`，但与本文件中的安全配置相关。
 
@@ -166,13 +187,14 @@ info；认证拒绝记录为 warn；服务端错误记录为 error。日志保�
 
 TLS 在反向代理终止时设置为 `true` 或 `1`，强制 session Cookie 带 `Secure` 属性。
 
-## 8. 管理 API
+## 9. 管理 API
 
 只有 admin 可以调用 `GET /api/config` 和 `PATCH /api/config`。API 使用小写 JSON 字段：
 
 | 配置文件键 | JSON 字段 |
 |---|---|
 | `HISTORY_INDEX_REFRESH_INTERVAL` | `history_index_refresh_interval` |
+| `CLAMAV_SLEEP_TIMER` | `clamav_sleep_timer`（`0` 表示关闭） |
 | `WEB_FIRSTRUN_COMPLETED` | `web_firstrun_completed`（只读，不接受 PATCH） |
 | `WEB_LOGIN_MAX_TRIES` | `web_login_max_tries` |
 | `WEB_LOGIN_MAX_TRIES_OVERALL` | `web_login_max_tries_overall` |

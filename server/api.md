@@ -339,6 +339,7 @@ WEB_FIRSTRUN_COMPLETED=2
 ```json
 {
   "history_index_refresh_interval": 60,
+  "clamav_sleep_timer": 3600,
   "web_firstrun_completed": 2,
   "web_login_max_tries": 10,
   "web_login_max_tries_overall": 100,
@@ -354,6 +355,7 @@ WEB_FIRSTRUN_COMPLETED=2
 ```json
 {
   "history_index_refresh_interval": 120,
+  "clamav_sleep_timer": 3600,
   "web_login_max_tries": 10,
   "web_login_max_tries_overall": 100,
   "web_login_cooldown_interval": 600,
@@ -361,8 +363,9 @@ WEB_FIRSTRUN_COMPLETED=2
 }
 ```
 
-历史刷新间隔允许范围为 5–86400 秒。登录限制和可信反代字段的范围、默认值及安全要求见
-[`server_conf.md`](server_conf.md)。修改任一登录限制会清空当前登录计数与冷却状态；可信
+历史刷新间隔允许范围为 5–86400 秒。`clamav_sleep_timer` 为 `0` 时关闭定时休眠，启用时
+必须是至少 600 的整数；空字符串不被接受。修改后立即重启对应计时器。登录限制和可信反代字段的范围、默认值及安全要求
+见 [`server_conf.md`](server_conf.md)。修改任一登录限制会清空当前登录计数与冷却状态；可信
 反代修改立即应用。传入空字符串可取消可信反代。
 
 ### `POST /api/clamav/sleep`
@@ -382,6 +385,9 @@ WEB_FIRSTRUN_COMPLETED=2
 ```
 
 sleep/wake 均为幂等操作。
+
+定时休眠使用同一套 sleep 逻辑。服务启动、手动扫描成功启动及手动唤醒后会开始或重置计时；
+休眠成功后暂停计时。扫描正在运行时不会强制关闭 ClamAV，定时器会在完整间隔后重试。
 
 ## 6. 文件浏览
 

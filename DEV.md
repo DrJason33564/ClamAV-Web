@@ -100,7 +100,7 @@ flowchart LR
 | `/state/status.json` | shell | ClamAV 与最近扫描状态。 |
 | `/config/cron_scan.conf` | Go + shell | 带元数据的定时扫描规则。 |
 | `/config/exclude.conf` | Go + shell | 信任区相关的文件哈希与规则来源。 |
-| `/config/clamavweb.conf` | Go | 服务配置；日志三项只在启动时读取。 |
+| `/config/clamavweb.conf` | Go | 服务配置；日志三项只在启动时读取，其他管理项支持 API 更新。 |
 | `/log/clamavweb.log*` | Go | 结构化后端日志及按大小轮转的历史文件。 |
 | `/log` 其余文件、`/quarantine` | shell | 启动/扫描/检出日志与隔离文件。 |
 
@@ -117,6 +117,17 @@ timer 后按最新配置重新计时。连续快速修改会合并通知，但�
 的值。
 
 监听初始化失败时按 5、10、20、40、60 秒阶梯退避，达到 60 秒后保持该间隔；每次失败都会写入完整错误、次数与下次等待时间。连续失败 10 次会停止监听、写入 error，并继续使用周期完整刷新。运行中的 watcher 每次报错也会写入 warn 并请求完整刷新，但重复刷新请求会合并，最多每 60 秒执行一次；正常的单文件事件不受该限流影响。
+
+### ClamAV 定时休眠
+
+`sleep_wake.go` 独占自动休眠 timer。服务启动、配置变更、手动唤醒和每个手动扫描子进程成功
+启动时，只通过容量为一的通知 channel 请求重置；业务 goroutine 不直接操作 timer。调度器
+同时维护同步递增的 generation，到期并获得 `clamavPowerMu` 后再次核对 generation，避免旧
+到期事件关闭刚开始扫描的 clamd。
+
+到期休眠复用 `sleepClamAV`，因此仍受跨进程扫描锁保护。内存手动队列中存在等待或运行任务
+时也会延后休眠。成功休眠后 timer 暂停；扫描冲突或临时错误按完整配置间隔重新计时。
+`CLAMAV_SLEEP_TIMER=0` 表示关闭；管理 API 使用数值 `0` 表达相同状态，不接受空字符串。
 
 ### 后端日志
 

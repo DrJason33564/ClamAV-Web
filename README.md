@@ -142,11 +142,12 @@ docker run -d \
 | `SCAN_WAIT_MAX_SECONDS` | `0` | 定时任务最大等待时间；`0` 为不限制。 |
 | `USER_DATABASE_FILE` | `/data/users.db` | 用户与 session 数据库。 |
 | `HISTORY_DATABASE_FILE` | `/data/history.db` | 历史任务索引数据库。 |
+| `CLAMAV_SLEEP_TIMER` | `3600` | ClamAV 自动休眠间隔（秒）；配置文件或 API 设为 `0` 可关闭。 |
 | `LOG_FILE_MAX_SIZE` | `5242880` | `/log/clamavweb.log` 单文件最大字节数。 |
 | `LOG_FILE_NUM` | `5` | Go 后端日志文件总数（包含当前文件）。 |
 | `LOG_LEVEL` | `info` | Go 后端最低日志等级。 |
 
-服务配置保存在 `/config/clamavweb.conf`，管理员可在界面中调整登录限制和历史索引间隔；日志配置需手工修改并重启服务，不通过界面或 API 暴露。配置项范围、默认值及反向代理规则见 [server/server_conf.md](server/server_conf.md)。
+服务配置保存在 `/config/clamavweb.conf`，管理 API 可调整登录限制、历史索引间隔和 ClamAV 自动休眠时间，供前端设置页接入；日志配置需手工修改并重启服务，不通过界面或 API 暴露。配置项范围、默认值及反向代理规则见 [server/server_conf.md](server/server_conf.md)。
 
 ## 📖 使用要点
 

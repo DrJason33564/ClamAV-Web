@@ -148,13 +148,16 @@ func TestRunScanScriptReadsJobID(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := &server{cfg: config{ScanScript: script}}
+	s := &server{cfg: config{ScanScript: script}, clamavSleepTimer: newClamAVSleepTimerState()}
 	jobID, output, err := s.runScanScript([]string{"--type", "manual", "--target", "/scan", "--action", "warn"})
 	if err != nil {
 		t.Fatalf("runScanScript returned error: %v output=%q", err, output)
 	}
 	if jobID != "manual-20260707123456" {
 		t.Fatalf("unexpected job id: %q", jobID)
+	}
+	if generation := s.clamavSleepTimer.currentGeneration(); generation != 1 {
+		t.Fatalf("manual scan start did not reset sleep timer: generation=%d", generation)
 	}
 }
 

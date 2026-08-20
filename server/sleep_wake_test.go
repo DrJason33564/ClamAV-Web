@@ -180,6 +180,141 @@ func TestWakeClamAVDelegatesStaleLockCleanupToStartupScript(t *testing.T) {
 	}
 }
 
+func TestClamAVSleepTimerExpires(t *testing.T) {
+	tmp := t.TempDir()
+	shutdownReceived := make(chan struct{})
+	app, err := newAppConfigStore(filepath.Join(tmp, "clamavweb.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The test-only duration unit turns the configured value into milliseconds;
+	// production always uses seconds and retains the 600-second validation.
+	app.mu.Lock()
+	app.cfg.ClamAVSleepTimer = 1
+	app.mu.Unlock()
+	s := &server{
+		cfg:              config{SleepLockDir: filepath.Join(tmp, "sleep.lock")},
+		appConfig:        app,
+		clamavSleepTimer: newClamAVSleepTimerState(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.runClamAVSleepTimerWithAction(ctx, time.Millisecond, func(context.Context) (string, string, int, error) {
+		if err := createDirectoryLock(s.cfg.SleepLockDir); err != nil {
+			return "failed", "", http.StatusInternalServerError, err
+		}
+		close(shutdownReceived)
+		return "sleeping", "ClamAV entered sleep mode.", http.StatusOK, nil
+	})
+
+	select {
+	case <-shutdownReceived:
+	case <-time.After(time.Second):
+		t.Fatal("sleep timer did not send ClamAV shutdown")
+	}
+	if exists, err := directoryLockExists(s.cfg.SleepLockDir); err != nil || !exists {
+		t.Fatalf("sleep timer did not create sleep lock: exists=%v err=%v", exists, err)
+	}
+}
+
+func TestDisabledClamAVSleepTimerDoesNotStart(t *testing.T) {
+	tmp := t.TempDir()
+	app, err := newAppConfigStore(filepath.Join(tmp, "clamavweb.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.mu.Lock()
+	app.cfg.ClamAVSleepTimer = 0
+	app.mu.Unlock()
+	s := &server{
+		cfg:              config{SleepLockDir: filepath.Join(tmp, "sleep.lock")},
+		appConfig:        app,
+		clamavSleepTimer: newClamAVSleepTimerState(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go s.runClamAVSleepTimerWithUnit(ctx, time.Millisecond)
+	time.Sleep(25 * time.Millisecond)
+	cancel()
+	if exists, err := directoryLockExists(s.cfg.SleepLockDir); err != nil || exists {
+		t.Fatalf("disabled sleep timer changed power state: exists=%v err=%v", exists, err)
+	}
+}
+
+func TestClamAVSleepTimerResetDiscardsOldDeadline(t *testing.T) {
+	tmp := t.TempDir()
+	app, err := newAppConfigStore(filepath.Join(tmp, "clamavweb.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.mu.Lock()
+	app.cfg.ClamAVSleepTimer = 1
+	app.mu.Unlock()
+	s := &server{
+		cfg:              config{SleepLockDir: filepath.Join(tmp, "sleep.lock")},
+		appConfig:        app,
+		clamavSleepTimer: newClamAVSleepTimerState(),
+	}
+	fired := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.runClamAVSleepTimerWithAction(ctx, 200*time.Millisecond, func(context.Context) (string, string, int, error) {
+		close(fired)
+		return "sleeping", "", http.StatusOK, nil
+	})
+
+	time.Sleep(50 * time.Millisecond)
+	s.notifyClamAVSleepTimerChanged("test_reset")
+	select {
+	case <-fired:
+		t.Fatal("retired sleep timer deadline fired after reset")
+	case <-time.After(120 * time.Millisecond):
+	}
+	select {
+	case <-fired:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("replacement sleep timer did not fire")
+	}
+}
+
+func TestClamAVSleepTimerDefersForQueuedManualScan(t *testing.T) {
+	tmp := t.TempDir()
+	app, err := newAppConfigStore(filepath.Join(tmp, "clamavweb.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.mu.Lock()
+	app.cfg.ClamAVSleepTimer = 1
+	app.mu.Unlock()
+	s := &server{
+		cfg:              config{SleepLockDir: filepath.Join(tmp, "sleep.lock")},
+		appConfig:        app,
+		clamavSleepTimer: newClamAVSleepTimerState(),
+		queuedBatchIDs:   []string{"web-pending"},
+	}
+	fired := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.runClamAVSleepTimerWithAction(ctx, 20*time.Millisecond, func(context.Context) (string, string, int, error) {
+		fired <- struct{}{}
+		return "sleeping", "", http.StatusOK, nil
+	})
+
+	select {
+	case <-fired:
+		t.Fatal("sleep timer fired while a manual scan was queued")
+	case <-time.After(70 * time.Millisecond):
+	}
+	s.mu.Lock()
+	s.queuedBatchIDs = nil
+	s.mu.Unlock()
+	s.notifyClamAVSleepTimerChanged("queue_cleared")
+	select {
+	case <-fired:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("sleep timer did not resume after the manual queue cleared")
+	}
+}
+
 func withFakeClamdscan(t *testing.T, ready bool) {
 	t.Helper()
 	binDir := t.TempDir()

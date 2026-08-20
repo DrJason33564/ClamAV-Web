@@ -58,6 +58,7 @@ func (s *server) handleServiceConfig(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPatch, http.MethodPut:
 		var req struct {
 			HistoryIndexRefreshInterval *int    `json:"history_index_refresh_interval"`
+			ClamAVSleepTimer            *int    `json:"clamav_sleep_timer"`
 			WebLoginMaxTries            *int    `json:"web_login_max_tries"`
 			WebLoginMaxTriesOverall     *int    `json:"web_login_max_tries_overall"`
 			WebLoginCooldownInterval    *int    `json:"web_login_cooldown_interval"`
@@ -69,9 +70,13 @@ func (s *server) handleServiceConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		cfg := s.appConfig.get()
 		oldHistoryInterval := cfg.HistoryIndexRefreshInterval
+		oldClamAVSleepTimer := cfg.ClamAVSleepTimer
 		oldLoginCfg := cfg
 		if req.HistoryIndexRefreshInterval != nil {
 			cfg.HistoryIndexRefreshInterval = *req.HistoryIndexRefreshInterval
+		}
+		if req.ClamAVSleepTimer != nil {
+			cfg.ClamAVSleepTimer = *req.ClamAVSleepTimer
 		}
 		if req.WebLoginMaxTries != nil {
 			cfg.WebLoginMaxTries = *req.WebLoginMaxTries
@@ -101,6 +106,9 @@ func (s *server) handleServiceConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if oldHistoryInterval != cfg.HistoryIndexRefreshInterval {
 			s.notifyHistoryIntervalChanged()
+		}
+		if oldClamAVSleepTimer != cfg.ClamAVSleepTimer {
+			s.notifyClamAVSleepTimerChanged("configuration_updated")
 		}
 		who, _ := actorFromRequest(r)
 		s.info("config", "service configuration updated", "user", who.Username)
