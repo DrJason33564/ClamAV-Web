@@ -603,7 +603,9 @@ TimeDock 模式下，新增和删除请求中的路径都必须位于当前用�
 
 ### `POST /api/results/lookups?scope=1-20`
 
-创建当前用户的异步历史查询：
+创建当前用户的异步历史查询。`scope` 必须显式提供为闭区间，单次最多包含 500 条；例如
+`1-500` 和 `501-1000` 合法，空值、`all` 和 `1-501` 返回 `400`。分页范围不影响响应中的
+完整任务总数。
 
 ```json
 {
@@ -650,6 +652,11 @@ TimeDock 模式下，新增和删除请求中的路径都必须位于当前用�
 | `updated_at` | string | lookup 最近一次状态更新时间，RFC3339 格式。 |
 
 接口状态码：`202` 对应 `pending`，`200` 对应 `success`，`500` 对应 `failed`；lookup 不存在或不属于当前用户时返回 `404`。
+
+结果、统计和隔离区 lookup 共用当前用户最多两个 pending 查询的配额；达到上限时创建接口
+返回 `429`。每个用户最多保留 10 个 lookup，超出时淘汰最旧的非 pending 条目。查询执行
+最多 30 秒，terminal 状态保留 15 分钟；服务退出和账户删除会取消尚未结束的查询。后台
+清理器每分钟运行一次，创建新查询时也会顺带清理过期条目。
 
 ### `POST /api/results/statistics/lookups?scope=N`
 
@@ -707,7 +714,7 @@ lookup。
 | `started_at` | string | lookup 创建时间，RFC3339 格式。 |
 | `updated_at` | string | lookup 最近一次状态更新时间，RFC3339 格式。 |
 
-统计直接从 `history.db` 的 `history_jobs` 表读取，始终包含当前用户名条件。接口按日和
+统计直接从 `history.db` 的 `history_jobs` 表读取，始终包含当前 `users.id` 条件。接口按日和
 结果在 SQLite 中聚合，不读取任务 JSON。异常结果归入 `unknown`。状态码为：等待时
 `202`、成功时 `200`、失败时 `500`；lookup 不存在或属于其他用户时返回 `404`。
 
@@ -752,7 +759,8 @@ lookup。
 
 ### `POST /api/quarantine/lookups`
 
-创建当前用户的异步隔离区查询。
+创建当前用户的异步隔离区查询。隔离区不使用 `scope`，查询会分批读取目录并返回该用户的
+完整隔离条目列表，但仍受上述共享 pending 配额、30 秒执行超时和 lookup 保留规则约束。
 
 ### `GET /api/quarantine/lookups/{lookup_id}`
 

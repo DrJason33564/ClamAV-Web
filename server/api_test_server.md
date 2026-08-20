@@ -169,12 +169,13 @@ curl -u test:anything \
 
 ### 历史扫描结果
 
-`POST /api/results/lookups` 每次创建一个新的查询 ID，并以 `202 Accepted` 返回
-`status: pending`。测试服务同时为该查询生成 1–5 秒的随机准备时间。
+`POST /api/results/lookups?scope=1-20` 校验与正式服务相同的数字范围后，每次创建一个新的
+查询 ID，并以 `202 Accepted` 返回 `status: pending`。测试服务同时为该查询生成 1–5 秒的
+随机准备时间。
 
 ```sh
 curl -u test:anything -X POST \
-  http://localhost:8081/api/results/lookups
+  'http://localhost:8081/api/results/lookups?scope=1-20'
 ```
 
 使用响应中的 `lookup_id` 轮询 `GET /api/results/lookups/{lookup_id}`：
@@ -233,7 +234,7 @@ pending。准备完成后，轮询 GET 接口会返回 `200 OK`、`status: succe
 | `GET` | `/api/whitelist` | 返回三个固定白名单条目。 |
 | `POST` | `/api/whitelist` | 返回成功及固定条目，不新增白名单。 |
 | `DELETE` | `/api/whitelist` | 返回成功及固定条目，不删除白名单。 |
-| `POST` | `/api/results/lookups` | 创建查询并返回新的 ID 和 pending 状态。 |
+| `POST` | `/api/results/lookups?scope=1-20` | 校验数字范围后创建查询并返回新的 ID 和 pending 状态。 |
 | `GET` | `/api/results/lookups/{lookup_id}` | 1–5 秒内返回 pending，随后返回 20 条示例结果。 |
 | `POST` | `/api/results/statistics/lookups?scope=N` | 校验 `scope` 后创建统计查询并返回 pending。 |
 | `GET` | `/api/results/statistics/lookups/{lookup_id}` | 1–5 秒内返回 pending，随后返回按日统计的示例结果。 |

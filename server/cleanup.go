@@ -194,27 +194,9 @@ func (s *server) cleanDeleteUser(ctx context.Context, username string) error {
 		return err
 	}
 	_, _ = s.userDB.ExecContext(ctx, "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL", now, id)
-	s.resultMu.Lock()
-	for lookupID, lookup := range s.resultLookups {
-		if lookup.UserID == id {
-			delete(s.resultLookups, lookupID)
-		}
-	}
-	s.resultMu.Unlock()
-	s.historyStatisticsMu.Lock()
-	for lookupID, lookup := range s.historyStatisticsLookups {
-		if lookup.UserID == id {
-			delete(s.historyStatisticsLookups, lookupID)
-		}
-	}
-	s.historyStatisticsMu.Unlock()
-	s.quarantineMu.Lock()
-	for lookupID, lookup := range s.quarantineLookups {
-		if lookup.UserID == id {
-			delete(s.quarantineLookups, lookupID)
-		}
-	}
-	s.quarantineMu.Unlock()
+	// Cancel workers before deleting their in-memory state so account cleanup
+	// cannot race a lookup that is still reading the user's assets.
+	s.removeLookupsForUser(id)
 	if err := s.removeCronRulesForUser(id); err != nil {
 		return err
 	}

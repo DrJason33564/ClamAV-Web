@@ -41,6 +41,8 @@ type server struct {
 	historyStatisticsLookups map[string]*historyStatisticsLookup
 	quarantineMu             sync.RWMutex
 	quarantineLookups        map[string]*quarantineLookup
+	lookupLifecycleMu        sync.Mutex
+	lookupRuntime            *lookupRuntime
 	clamavPowerMu            sync.Mutex
 	configFileMu             sync.Mutex
 	accountDeleteMu          sync.Mutex
@@ -134,10 +136,13 @@ func run() error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	s.lookupRuntime = newLookupRuntime(ctx)
+	defer s.lookupRuntime.stopAndWait()
 	go s.runHistoryIndexer(ctx)
 	go s.runSessionJanitor(ctx)
 	go s.loginLimiter.runJanitor(ctx)
 	go s.runClamAVSleepTimer(ctx)
+	go s.runLookupJanitor(ctx)
 
 	mux := http.NewServeMux()
 	mux.Handle("/", frontendHandler())

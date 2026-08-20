@@ -11,7 +11,6 @@ import (
 
 const (
 	maxHistoryStatisticsScope = 31
-	historyStatisticsTimeout  = 30 * time.Second
 )
 
 type historyStatisticsDay struct {
@@ -54,12 +53,20 @@ func (s *server) handleHistoryStatisticsStart(w http.ResponseWriter, r *http.Req
 		UserID:    who.ID,
 	}
 
-	s.historyStatisticsMu.Lock()
-	s.cleanupHistoryStatisticsLookupsLocked(now.Add(-15 * time.Minute))
-	s.historyStatisticsLookups[lookup.ID] = lookup
-	s.historyStatisticsMu.Unlock()
-
-	go s.runHistoryStatisticsLookup(lookup.ID)
+	if !s.startLookup(who.ID, lookup.ID, func() {
+		s.historyStatisticsMu.Lock()
+		s.historyStatisticsLookups[lookup.ID] = lookup
+		s.historyStatisticsMu.Unlock()
+	}, func() {
+		s.historyStatisticsMu.Lock()
+		delete(s.historyStatisticsLookups, lookup.ID)
+		s.historyStatisticsMu.Unlock()
+	}, func(ctx context.Context) {
+		s.runHistoryStatisticsLookup(ctx, lookup.ID)
+	}) {
+		writeError(w, http.StatusTooManyRequests, errors.New("too many pending lookups for this user"))
+		return
+	}
 	s.debug("history_statistics", "history statistics lookup started", "lookup_id", lookup.ID, "user", who.Username, "scope_days", scope)
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"status":    "pending",
@@ -113,7 +120,7 @@ func (s *server) handleHistoryStatisticsLookup(w http.ResponseWriter, r *http.Re
 	}
 }
 
-func (s *server) runHistoryStatisticsLookup(id string) {
+func (s *server) runHistoryStatisticsLookup(ctx context.Context, id string) {
 	s.historyStatisticsMu.RLock()
 	lookup, ok := s.historyStatisticsLookups[id]
 	if !ok {
@@ -126,9 +133,10 @@ func (s *server) runHistoryStatisticsLookup(id string) {
 	asOf := lookup.StartedAt.In(time.Local)
 	s.historyStatisticsMu.RUnlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), historyStatisticsTimeout)
-	defer cancel()
 	days, total, err := s.readHistoryStatistics(ctx, scope, userID, asOf)
+	if errors.Is(err, context.Canceled) {
+		return
+	}
 
 	s.historyStatisticsMu.Lock()
 	defer s.historyStatisticsMu.Unlock()
@@ -234,12 +242,4 @@ func historyStatisticsResponse(lookup historyStatisticsLookup) map[string]any {
 		response[date] = counts
 	}
 	return response
-}
-
-func (s *server) cleanupHistoryStatisticsLookupsLocked(before time.Time) {
-	for id, lookup := range s.historyStatisticsLookups {
-		if lookup.UpdatedAt.Before(before) {
-			delete(s.historyStatisticsLookups, id)
-		}
-	}
 }

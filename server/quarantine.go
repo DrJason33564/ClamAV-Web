@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -51,12 +53,20 @@ func (s *server) handleQuarantineLookupStart(w http.ResponseWriter, r *http.Requ
 	}
 	who, _ := actorFromRequest(r)
 	lookup.UserID = who.ID
-	s.quarantineMu.Lock()
-	s.cleanupQuarantineLookupsLocked(time.Now().Add(-15 * time.Minute))
-	s.quarantineLookups[lookup.ID] = lookup
-	s.quarantineMu.Unlock()
-
-	go s.runQuarantineLookup(lookup.ID)
+	if !s.startLookup(who.ID, lookup.ID, func() {
+		s.quarantineMu.Lock()
+		s.quarantineLookups[lookup.ID] = lookup
+		s.quarantineMu.Unlock()
+	}, func() {
+		s.quarantineMu.Lock()
+		delete(s.quarantineLookups, lookup.ID)
+		s.quarantineMu.Unlock()
+	}, func(ctx context.Context) {
+		s.runQuarantineLookup(ctx, lookup.ID)
+	}) {
+		writeError(w, http.StatusTooManyRequests, errors.New("too many pending lookups for this user"))
+		return
+	}
 	s.debug("quarantine", "quarantine lookup started", "lookup_id", lookup.ID, "user", who.Username)
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"status":    "pending",
@@ -105,7 +115,7 @@ func (s *server) handleQuarantineLookup(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
-func (s *server) runQuarantineLookup(id string) {
+func (s *server) runQuarantineLookup(ctx context.Context, id string) {
 	s.quarantineMu.RLock()
 	lookup, ok := s.quarantineLookups[id]
 	if !ok {
@@ -114,7 +124,10 @@ func (s *server) runQuarantineLookup(id string) {
 	}
 	userID := lookup.UserID
 	s.quarantineMu.RUnlock()
-	subjects, err := s.readQuarantineSubjects(userID)
+	subjects, err := s.readQuarantineSubjects(ctx, userID)
+	if errors.Is(err, context.Canceled) {
+		return
+	}
 	s.quarantineMu.Lock()
 	defer s.quarantineMu.Unlock()
 	lookup, ok = s.quarantineLookups[id]
@@ -133,46 +146,60 @@ func (s *server) runQuarantineLookup(id string) {
 	s.debug("quarantine", "quarantine lookup completed", "lookup_id", id, "user_id", userID, "subjects", len(subjects))
 }
 
-func (s *server) readQuarantineSubjects(userIDs ...string) ([]quarantineSubject, error) {
+func (s *server) readQuarantineSubjects(ctx context.Context, userIDs ...string) ([]quarantineSubject, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	userID := ""
 	if len(userIDs) > 0 {
 		userID = userIDs[0]
 	}
-	entries, err := os.ReadDir(s.cfg.QuarantineDir)
+	directory, err := os.Open(s.cfg.QuarantineDir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	subjects := make([]quarantineSubject, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || entry.Name() == clamavQuarantineLockName || strings.HasSuffix(entry.Name(), ".rec") {
-			continue
+	defer directory.Close()
+	subjects := make([]quarantineSubject, 0)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		sourceFile, owner, err := readQuarantineRecord(filepath.Join(s.cfg.QuarantineDir, entry.Name()+".rec"))
-		if err != nil {
-			// Legacy and malformed records have no safe owner and are intentionally
-			// invisible rather than being assigned to an administrator.
-			continue
+		// Read in bounded batches so cancellation does not wait for the entire
+		// quarantine directory to be materialized in memory first.
+		entries, readErr := directory.ReadDir(128)
+		for _, entry := range entries {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if entry.IsDir() || entry.Name() == clamavQuarantineLockName || strings.HasSuffix(entry.Name(), ".rec") {
+				continue
+			}
+			sourceFile, owner, err := readQuarantineRecord(filepath.Join(s.cfg.QuarantineDir, entry.Name()+".rec"))
+			if err != nil {
+				// Legacy and malformed records have no safe owner and are intentionally
+				// invisible rather than being assigned to an administrator.
+				continue
+			}
+			if userID != "" && owner != userID {
+				continue
+			}
+			subjects = append(subjects, quarantineSubject{
+				Name:       entry.Name(),
+				SourceFile: sourceFile,
+			})
 		}
-		if userID != "" && owner != userID {
-			continue
+		if errors.Is(readErr, io.EOF) {
+			break
 		}
-		subjects = append(subjects, quarantineSubject{
-			Name:       entry.Name(),
-			SourceFile: sourceFile,
-		})
+		if readErr != nil {
+			return nil, readErr
+		}
 	}
+	sort.Slice(subjects, func(i, j int) bool { return subjects[i].Name < subjects[j].Name })
 	return subjects, nil
-}
-
-func (s *server) cleanupQuarantineLookupsLocked(before time.Time) {
-	for id, lookup := range s.quarantineLookups {
-		if lookup.UpdatedAt.Before(before) {
-			delete(s.quarantineLookups, id)
-		}
-	}
 }
 
 func (s *server) handleQuarantineDelete(w http.ResponseWriter, r *http.Request) {

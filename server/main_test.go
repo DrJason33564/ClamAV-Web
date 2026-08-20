@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -13,6 +14,128 @@ import (
 	"testing"
 	"time"
 )
+
+func TestLookupRuntimeLimitsPendingAcrossTypesAndStopsWorkers(t *testing.T) {
+	runtime := newLookupRuntime(context.Background())
+	finished := make(chan string, 3)
+	work := func(id string) func(context.Context) {
+		return func(ctx context.Context) {
+			deadline, ok := ctx.Deadline()
+			if !ok || time.Until(deadline) > lookupExecutionTimeout || time.Until(deadline) < lookupExecutionTimeout-time.Second {
+				t.Errorf("unexpected lookup deadline: %v ok=%v", deadline, ok)
+			}
+			<-ctx.Done()
+			finished <- id
+		}
+	}
+
+	if !runtime.start("result-1", testAliceUserID, work("result-1")) ||
+		!runtime.start("statistics-1", testAliceUserID, work("statistics-1")) {
+		t.Fatal("expected the first two lookups for one user to start")
+	}
+	if runtime.start("quarantine-1", testAliceUserID, work("quarantine-1")) {
+		t.Fatal("expected a third pending lookup for the same user to be rejected")
+	}
+	if !runtime.start("quarantine-2", testBobUserID, work("quarantine-2")) {
+		t.Fatal("expected another user to have an independent pending allowance")
+	}
+
+	runtime.stopAndWait()
+	if len(finished) != 3 {
+		t.Fatalf("expected shutdown to cancel and wait for three workers, got %d", len(finished))
+	}
+	if runtime.start("result-after-stop", testAliceUserID, work("result-after-stop")) {
+		t.Fatal("expected stopped runtime to reject new work")
+	}
+}
+
+func TestLookupCleanupAndRetentionApplyAcrossTypes(t *testing.T) {
+	now := time.Now()
+	s := &server{
+		resultLookups: map[string]*resultLookup{
+			"expired-result":       {ID: "expired-result", Status: "success", UserID: testAliceUserID, StartedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-lookupRetention - time.Second)},
+			"timed-out-publishing": {ID: "timed-out-publishing", Status: "pending", UserID: testAliceUserID, StartedAt: now.Add(-lookupExecutionTimeout - time.Second), UpdatedAt: now.Add(-lookupExecutionTimeout - time.Second)},
+		},
+		historyStatisticsLookups: map[string]*historyStatisticsLookup{
+			"stale-pending": {ID: "stale-pending", Status: "pending", UserID: testAliceUserID, StartedAt: now.Add(-lookupExecutionTimeout - lookupCleanupInterval - time.Second), UpdatedAt: now.Add(-lookupExecutionTimeout - lookupCleanupInterval - time.Second)},
+		},
+		quarantineLookups: map[string]*quarantineLookup{
+			"recent-quarantine": {ID: "recent-quarantine", Status: "success", UserID: testAliceUserID, StartedAt: now, UpdatedAt: now},
+		},
+		lookupRuntime: newLookupRuntime(context.Background()),
+	}
+	defer s.lookupRuntime.stopAndWait()
+
+	s.cleanupLookups(now)
+	if len(s.resultLookups) != 1 || s.resultLookups["timed-out-publishing"] == nil || len(s.historyStatisticsLookups) != 0 || len(s.quarantineLookups) != 1 {
+		t.Fatalf("unexpected lookup cleanup result: results=%d statistics=%d quarantine=%d", len(s.resultLookups), len(s.historyStatisticsLookups), len(s.quarantineLookups))
+	}
+
+	for index := 0; index < maxRetainedLookupsPerUser; index++ {
+		id := "retained-" + strconv.Itoa(index)
+		s.resultLookups[id] = &resultLookup{ID: id, Status: "success", UserID: testBobUserID, StartedAt: now, UpdatedAt: now.Add(time.Duration(index) * time.Second)}
+	}
+	started := make(chan struct{})
+	if !s.startLookup(testBobUserID, "newest", func() {
+		s.quarantineMu.Lock()
+		s.quarantineLookups["newest"] = &quarantineLookup{ID: "newest", Status: "pending", UserID: testBobUserID, StartedAt: now, UpdatedAt: now}
+		s.quarantineMu.Unlock()
+	}, func() {
+		s.quarantineMu.Lock()
+		delete(s.quarantineLookups, "newest")
+		s.quarantineMu.Unlock()
+	}, func(ctx context.Context) {
+		close(started)
+		<-ctx.Done()
+	}) {
+		t.Fatal("expected a new lookup to evict the oldest completed entry")
+	}
+	<-started
+	if _, ok := s.resultLookups["retained-0"]; ok {
+		t.Fatal("expected the oldest completed lookup to be evicted")
+	}
+	if got := len(s.lookupRecordsLocked(testBobUserID)); got != maxRetainedLookupsPerUser {
+		t.Fatalf("expected retained lookup count to remain capped at %d, got %d", maxRetainedLookupsPerUser, got)
+	}
+}
+
+func TestRemoveLookupsForUserCancelsAndWaitsForWorkers(t *testing.T) {
+	s := &server{
+		resultLookups:            make(map[string]*resultLookup),
+		historyStatisticsLookups: make(map[string]*historyStatisticsLookup),
+		quarantineLookups:        make(map[string]*quarantineLookup),
+		lookupRuntime:            newLookupRuntime(context.Background()),
+	}
+	defer s.lookupRuntime.stopAndWait()
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	if !s.startLookup(testAliceUserID, "result-cancel", func() {
+		s.resultMu.Lock()
+		s.resultLookups["result-cancel"] = &resultLookup{ID: "result-cancel", Status: "pending", UserID: testAliceUserID, StartedAt: time.Now(), UpdatedAt: time.Now()}
+		s.resultMu.Unlock()
+	}, func() {
+		s.resultMu.Lock()
+		delete(s.resultLookups, "result-cancel")
+		s.resultMu.Unlock()
+	}, func(ctx context.Context) {
+		close(started)
+		<-ctx.Done()
+		close(finished)
+	}) {
+		t.Fatal("expected lookup to start")
+	}
+	<-started
+
+	s.removeLookupsForUser(testAliceUserID)
+	select {
+	case <-finished:
+	default:
+		t.Fatal("expected user lookup removal to wait for worker cancellation")
+	}
+	if len(s.resultLookups) != 0 {
+		t.Fatalf("expected user lookup state to be removed, got %#v", s.resultLookups)
+	}
+}
 
 func TestNewHTTPServerAppliesConnectionLimits(t *testing.T) {
 	handler := http.NewServeMux()
@@ -523,7 +646,7 @@ func TestReadResultLogItems(t *testing.T) {
 	if err := s.history.refresh(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	items, total, err := s.readResultLogItems(resultScope{All: true}, testAliceUserID)
+	items, total, err := s.readResultLogItems(t.Context(), resultScope{All: true}, testAliceUserID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -543,7 +666,7 @@ func TestReadResultLogItems(t *testing.T) {
 		t.Fatalf("unexpected third item: %#v", items[2])
 	}
 
-	scoped, scopedTotal, err := s.readResultLogItems(resultScope{Start: 1, End: 2}, testAliceUserID)
+	scoped, scopedTotal, err := s.readResultLogItems(t.Context(), resultScope{Start: 1, End: 2}, testAliceUserID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -559,13 +682,6 @@ func TestReadResultLogItems(t *testing.T) {
 }
 
 func TestParseResultScope(t *testing.T) {
-	all, err := parseResultScope("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !all.All {
-		t.Fatalf("expected default scope to be all, got %#v", all)
-	}
 	scoped, err := parseResultScope("2-5")
 	if err != nil {
 		t.Fatal(err)
@@ -575,6 +691,14 @@ func TestParseResultScope(t *testing.T) {
 	}
 	if _, err := parseResultScope("5-2"); err == nil {
 		t.Fatal("expected invalid range to be rejected")
+	}
+	for _, invalid := range []string{"", "all", "1-501"} {
+		if _, err := parseResultScope(invalid); err == nil {
+			t.Fatalf("expected scope %q to be rejected", invalid)
+		}
+	}
+	if _, err := parseResultScope("501-1000"); err != nil {
+		t.Fatalf("expected a later 500-item page to be accepted: %v", err)
 	}
 }
 
@@ -767,7 +891,7 @@ func TestQuarantineSubjectsDeleteAndRecover(t *testing.T) {
 	}
 
 	s := &server{cfg: config{QuarantineDir: quarantineDir}}
-	subjects, err := s.readQuarantineSubjects()
+	subjects, err := s.readQuarantineSubjects(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}

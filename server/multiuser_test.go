@@ -31,15 +31,18 @@ func newDatabaseTestServer(t *testing.T) *server {
 		t.Fatal(err)
 	}
 	s := &server{
-		cfg:               config{JobsDir: filepath.Join(tmp, "jobs"), LogDir: filepath.Join(tmp, "log"), AdminRegisterToken: "test-admin-token"},
-		userDB:            userDB,
-		historyDB:         historyDB,
-		appConfig:         app,
-		batches:           map[string]*scanBatch{},
-		resultLookups:     map[string]*resultLookup{},
-		quarantineLookups: map[string]*quarantineLookup{},
-		loginLimiter:      newLoginLimiter(),
+		cfg:                      config{JobsDir: filepath.Join(tmp, "jobs"), LogDir: filepath.Join(tmp, "log"), AdminRegisterToken: "test-admin-token"},
+		userDB:                   userDB,
+		historyDB:                historyDB,
+		appConfig:                app,
+		batches:                  map[string]*scanBatch{},
+		resultLookups:            map[string]*resultLookup{},
+		historyStatisticsLookups: map[string]*historyStatisticsLookup{},
+		quarantineLookups:        map[string]*quarantineLookup{},
+		loginLimiter:             newLoginLimiter(),
 	}
+	s.lookupRuntime = newLookupRuntime(t.Context())
+	t.Cleanup(s.lookupRuntime.stopAndWait)
 	if err := os.MkdirAll(s.cfg.JobsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +198,7 @@ func TestHistoryIndexIsVersion3AndOwnerScoped(t *testing.T) {
 	if err := s.history.refresh(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	items, total, err := s.readResultLogItems(resultScope{All: true}, testAliceUserID)
+	items, total, err := s.readResultLogItems(t.Context(), resultScope{All: true}, testAliceUserID)
 	if err != nil || total != 1 || len(items) != 1 || items[0].ID != "manual-1783433000" {
 		t.Fatalf("unexpected owner-scoped history: total=%d items=%#v err=%v", total, items, err)
 	}
@@ -229,7 +232,7 @@ func TestQuarantineRecordsAreOwnerScoped(t *testing.T) {
 		}
 	}
 	s := &server{cfg: config{QuarantineDir: tmp}}
-	items, err := s.readQuarantineSubjects(testAliceUserID)
+	items, err := s.readQuarantineSubjects(t.Context(), testAliceUserID)
 	if err != nil || len(items) != 1 || items[0].Name != "a.dat" {
 		t.Fatalf("unexpected quarantine view: %#v err=%v", items, err)
 	}
@@ -307,7 +310,7 @@ func TestRecreatedUsernameDoesNotInheritAssets(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if items, total, err := s.readResultLogItems(resultScope{All: true}, recreatedUserID); err != nil || total != 0 || len(items) != 0 {
+	if items, total, err := s.readResultLogItems(t.Context(), resultScope{All: true}, recreatedUserID); err != nil || total != 0 || len(items) != 0 {
 		t.Fatalf("recreated user inherited history: total=%d items=%#v err=%v", total, items, err)
 	}
 	if rules, err := s.readCronRules(recreatedUserID); err != nil || len(rules) != 0 {
@@ -316,11 +319,11 @@ func TestRecreatedUsernameDoesNotInheritAssets(t *testing.T) {
 	if entries, err := s.readWhitelistEntries(recreatedUserID); err != nil || len(entries) != 0 {
 		t.Fatalf("recreated user inherited whitelist entries: %#v err=%v", entries, err)
 	}
-	if subjects, err := s.readQuarantineSubjects(recreatedUserID); err != nil || len(subjects) != 0 {
+	if subjects, err := s.readQuarantineSubjects(t.Context(), recreatedUserID); err != nil || len(subjects) != 0 {
 		t.Fatalf("recreated user inherited quarantine subjects: %#v err=%v", subjects, err)
 	}
 
-	if _, total, _ := s.readResultLogItems(resultScope{All: true}, testAliceUserID); total != 1 {
+	if _, total, _ := s.readResultLogItems(t.Context(), resultScope{All: true}, testAliceUserID); total != 1 {
 		t.Fatal("old history fixture was not retained")
 	}
 	if rules, _ := s.readCronRules(testAliceUserID); len(rules) != 1 {
@@ -329,7 +332,7 @@ func TestRecreatedUsernameDoesNotInheritAssets(t *testing.T) {
 	if entries, _ := s.readWhitelistEntries(testAliceUserID); len(entries) != 1 {
 		t.Fatal("old whitelist fixture was not retained")
 	}
-	if subjects, _ := s.readQuarantineSubjects(testAliceUserID); len(subjects) != 1 {
+	if subjects, _ := s.readQuarantineSubjects(t.Context(), testAliceUserID); len(subjects) != 1 {
 		t.Fatal("old quarantine fixture was not retained")
 	}
 }

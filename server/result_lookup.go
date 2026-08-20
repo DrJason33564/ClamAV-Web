@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,8 @@ import (
 )
 
 var resultJobIDPattern = version3JobIDPattern
+
+const maxResultLookupItems = 500
 
 type resultLookup struct {
 	ID        string          `json:"lookup_id"`
@@ -83,12 +86,20 @@ func (s *server) handleResultLookupStart(w http.ResponseWriter, r *http.Request)
 		scope:     scope,
 		UserID:    who.ID,
 	}
-	s.resultMu.Lock()
-	s.cleanupResultLookupsLocked(time.Now().Add(-15 * time.Minute))
-	s.resultLookups[lookup.ID] = lookup
-	s.resultMu.Unlock()
-
-	go s.runResultLookup(lookup.ID)
+	if !s.startLookup(who.ID, lookup.ID, func() {
+		s.resultMu.Lock()
+		s.resultLookups[lookup.ID] = lookup
+		s.resultMu.Unlock()
+	}, func() {
+		s.resultMu.Lock()
+		delete(s.resultLookups, lookup.ID)
+		s.resultMu.Unlock()
+	}, func(ctx context.Context) {
+		s.runResultLookup(ctx, lookup.ID)
+	}) {
+		writeError(w, http.StatusTooManyRequests, errors.New("too many pending lookups for this user"))
+		return
+	}
 	s.debug("results", "result lookup started", "lookup_id", lookup.ID, "user", who.Username)
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"status":    "pending",
@@ -137,7 +148,7 @@ func (s *server) handleResultLookup(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *server) runResultLookup(id string) {
+func (s *server) runResultLookup(ctx context.Context, id string) {
 	s.resultMu.RLock()
 	lookup, ok := s.resultLookups[id]
 	if !ok {
@@ -148,7 +159,10 @@ func (s *server) runResultLookup(id string) {
 	userID := lookup.UserID
 	s.resultMu.RUnlock()
 
-	results, total, err := s.readResultLogItems(scope, userID)
+	results, total, err := s.readResultLogItems(ctx, scope, userID)
+	if errors.Is(err, context.Canceled) {
+		return
+	}
 	s.resultMu.Lock()
 	defer s.resultMu.Unlock()
 	lookup, ok = s.resultLookups[id]
@@ -168,9 +182,9 @@ func (s *server) runResultLookup(id string) {
 	s.debug("results", "result lookup completed", "lookup_id", id, "user_id", userID, "returned", len(results), "total", total)
 }
 
-func (s *server) readResultLogItems(scope resultScope, userID string) ([]resultLogItem, int, error) {
+func (s *server) readResultLogItems(ctx context.Context, scope resultScope, userID string) ([]resultLogItem, int, error) {
 	var total int
-	if err := s.historyDB.QueryRow("SELECT COUNT(*) FROM history_jobs WHERE user_id=?", userID).Scan(&total); err != nil {
+	if err := s.historyDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM history_jobs WHERE user_id=?", userID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	query := "SELECT job_id,job_type,started_at,result,action FROM history_jobs WHERE user_id=? ORDER BY started_at DESC,job_id DESC"
@@ -179,7 +193,7 @@ func (s *server) readResultLogItems(scope resultScope, userID string) ([]resultL
 		query += " LIMIT ? OFFSET ?"
 		args = append(args, scope.End-scope.Start+1, scope.Start-1)
 	}
-	rows, err := s.historyDB.Query(query, args...)
+	rows, err := s.historyDB.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, total, err
 	}
@@ -202,11 +216,11 @@ func (s *server) readResultLogItems(scope resultScope, userID string) ([]resultL
 func parseResultScope(scopeText string) (resultScope, error) {
 	scopeText = strings.TrimSpace(scopeText)
 	if scopeText == "" || scopeText == "all" {
-		return resultScope{All: true}, nil
+		return resultScope{}, errors.New("scope must be a numeric range like 1-20")
 	}
 	startText, endText, ok := strings.Cut(scopeText, "-")
 	if !ok {
-		return resultScope{}, errors.New("scope must be all or a numeric range like 1-10")
+		return resultScope{}, errors.New("scope must be a numeric range like 1-20")
 	}
 	start, err := strconv.Atoi(strings.TrimSpace(startText))
 	if err != nil || start < 1 {
@@ -215,6 +229,9 @@ func parseResultScope(scopeText string) (resultScope, error) {
 	end, err := strconv.Atoi(strings.TrimSpace(endText))
 	if err != nil || end < start {
 		return resultScope{}, errors.New("scope end must be greater than or equal to start")
+	}
+	if end-start+1 > maxResultLookupItems {
+		return resultScope{}, errors.New("scope cannot include more than 500 results")
 	}
 	return resultScope{Start: start, End: end}, nil
 }
@@ -260,14 +277,6 @@ func (s *server) readJobResult(jobID string) (any, error) {
 		return text, nil
 	default:
 		return nil, nil
-	}
-}
-
-func (s *server) cleanupResultLookupsLocked(before time.Time) {
-	for id, lookup := range s.resultLookups {
-		if lookup.UpdatedAt.Before(before) {
-			delete(s.resultLookups, id)
-		}
 	}
 }
 

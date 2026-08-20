@@ -77,7 +77,11 @@ func TestHistoryStatisticsLookupStartsPendingAndIsUserBound(t *testing.T) {
 	s := &server{
 		historyDB:                db,
 		historyStatisticsLookups: make(map[string]*historyStatisticsLookup),
+		resultLookups:            make(map[string]*resultLookup),
+		quarantineLookups:        make(map[string]*quarantineLookup),
 	}
+	s.lookupRuntime = newLookupRuntime(t.Context())
+	defer s.lookupRuntime.stopAndWait()
 
 	request := httptest.NewRequest(http.MethodPost, "/api/results/statistics/lookups?scope=2", nil)
 	request = request.WithContext(context.WithValue(request.Context(), actorContextKey{}, actor{ID: testAliceUserID, Username: "alice"}))

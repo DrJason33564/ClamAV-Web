@@ -433,6 +433,10 @@ func (api *templateAPI) templateResultLookupStart(w http.ResponseWriter, r *http
 	if !templateMethod(w, r, http.MethodPost) {
 		return
 	}
+	if _, err := parseResultScope(r.URL.Query().Get("scope")); err != nil {
+		writeTemplateJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
 	id, state := api.createLookup("result")
 	api.mu.Lock()
 	api.resultLookups[id] = state
@@ -815,11 +819,11 @@ func TestTemplateAPIResponses(t *testing.T) {
 	})
 
 	t.Run("lookups start pending and return twenty items when ready", func(t *testing.T) {
-		response, start := request(http.MethodPost, "/api/results/lookups")
+		response, start := request(http.MethodPost, "/api/results/lookups?scope=1-20")
 		if response.Code != http.StatusAccepted || start["status"] != "pending" {
 			t.Fatalf("unexpected lookup start: %d %#v", response.Code, start)
 		}
-		_, secondStart := request(http.MethodPost, "/api/results/lookups")
+		_, secondStart := request(http.MethodPost, "/api/results/lookups?scope=1-20")
 		if start["lookup_id"] == secondStart["lookup_id"] {
 			t.Fatalf("expected each lookup to have a new id, got %q", start["lookup_id"])
 		}
@@ -856,8 +860,11 @@ func TestTemplateAPIResponses(t *testing.T) {
 
 	t.Run("lookups remain pending until their delay expires", func(t *testing.T) {
 		slowHandler := newTemplateAPIHandlerWithDelay(func() time.Duration { return time.Hour })
-		for _, lookupPath := range []string{"/api/results/lookups", "/api/quarantine/lookups"} {
-			startRequest := httptest.NewRequest(http.MethodPost, lookupPath, nil)
+		for _, lookup := range []struct{ startPath, pollPath string }{
+			{"/api/results/lookups?scope=1-20", "/api/results/lookups"},
+			{"/api/quarantine/lookups", "/api/quarantine/lookups"},
+		} {
+			startRequest := httptest.NewRequest(http.MethodPost, lookup.startPath, nil)
 			startRequest.SetBasicAuth("any-user", "any-password")
 			startResponse := httptest.NewRecorder()
 			slowHandler.ServeHTTP(startResponse, startRequest)
@@ -866,10 +873,10 @@ func TestTemplateAPIResponses(t *testing.T) {
 				t.Fatal(err)
 			}
 			if startResponse.Code != http.StatusAccepted || start["status"] != "pending" {
-				t.Fatalf("unexpected lookup start for %s: %d %#v", lookupPath, startResponse.Code, start)
+				t.Fatalf("unexpected lookup start for %s: %d %#v", lookup.startPath, startResponse.Code, start)
 			}
 
-			pollRequest := httptest.NewRequest(http.MethodGet, lookupPath+"/"+start["lookup_id"].(string), nil)
+			pollRequest := httptest.NewRequest(http.MethodGet, lookup.pollPath+"/"+start["lookup_id"].(string), nil)
 			pollRequest.SetBasicAuth("any-user", "any-password")
 			pollResponse := httptest.NewRecorder()
 			slowHandler.ServeHTTP(pollResponse, pollRequest)
@@ -878,7 +885,7 @@ func TestTemplateAPIResponses(t *testing.T) {
 				t.Fatal(err)
 			}
 			if pollResponse.Code != http.StatusAccepted || poll["status"] != "pending" {
-				t.Fatalf("unexpected pending poll for %s: %d %#v", lookupPath, pollResponse.Code, poll)
+				t.Fatalf("unexpected pending poll for %s: %d %#v", lookup.startPath, pollResponse.Code, poll)
 			}
 		}
 	})
@@ -900,7 +907,7 @@ func TestTemplateAPIResponses(t *testing.T) {
 	})
 
 	t.Run("every documented API route responds", func(t *testing.T) {
-		_, resultStart := request(http.MethodPost, "/api/results/lookups")
+		_, resultStart := request(http.MethodPost, "/api/results/lookups?scope=1-20")
 		_, statisticsStart := request(http.MethodPost, "/api/results/statistics/lookups?scope=3")
 		_, quarantineStart := request(http.MethodPost, "/api/quarantine/lookups")
 		routes := []struct {
@@ -925,7 +932,7 @@ func TestTemplateAPIResponses(t *testing.T) {
 			{http.MethodGet, "/api/whitelist", http.StatusOK},
 			{http.MethodPost, "/api/whitelist", http.StatusOK},
 			{http.MethodDelete, "/api/whitelist", http.StatusOK},
-			{http.MethodPost, "/api/results/lookups", http.StatusAccepted},
+			{http.MethodPost, "/api/results/lookups?scope=1-20", http.StatusAccepted},
 			{http.MethodGet, "/api/results/lookups/" + resultStart["lookup_id"].(string), http.StatusOK},
 			{http.MethodPost, "/api/results/statistics/lookups?scope=3", http.StatusAccepted},
 			{http.MethodGet, "/api/results/statistics/lookups/" + statisticsStart["lookup_id"].(string), http.StatusOK},
