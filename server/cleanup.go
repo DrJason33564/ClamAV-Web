@@ -37,7 +37,7 @@ func (s *server) handleResultsClean(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	who, _ := actorFromRequest(r)
-	deleted, err := s.cleanUserResults(r.Context(), who.Username)
+	deleted, err := s.cleanUserResults(r.Context(), who.ID)
 	if err != nil {
 		s.error("cleanup", "result cleanup failed", "user", who.Username, "deleted", deleted, "error", err)
 		writeCleanResponse(w, http.StatusInternalServerError, "failed", deleted, err)
@@ -57,7 +57,7 @@ func (s *server) handleQuarantineClean(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	who, _ := actorFromRequest(r)
-	deleted, err := s.cleanUserQuarantine(who.Username)
+	deleted, err := s.cleanUserQuarantine(who.ID)
 	if err != nil {
 		s.error("cleanup", "quarantine cleanup failed", "user", who.Username, "deleted", deleted, "error", err)
 		writeCleanResponse(w, http.StatusInternalServerError, "failed", deleted, err)
@@ -87,11 +87,11 @@ func (s *server) cleanAllResults() (int, error) {
 	return deletedLogs + deletedJobs, err
 }
 
-func (s *server) cleanUserResults(ctx context.Context, username string) (int, error) {
+func (s *server) cleanUserResults(ctx context.Context, userID string) (int, error) {
 	if s.history != nil {
 		_ = s.history.refresh(ctx)
 	}
-	rows, err := s.historyDB.QueryContext(ctx, "SELECT job_id,json_file FROM history_jobs WHERE user=?", username)
+	rows, err := s.historyDB.QueryContext(ctx, "SELECT job_id,json_file FROM history_jobs WHERE user_id=?", userID)
 	if err != nil {
 		return 0, err
 	}
@@ -116,13 +116,13 @@ func (s *server) cleanUserResults(ctx context.Context, username string) (int, er
 			}
 		}
 	}
-	if _, err := s.historyDB.ExecContext(ctx, "DELETE FROM history_jobs WHERE user=?", username); err != nil {
+	if _, err := s.historyDB.ExecContext(ctx, "DELETE FROM history_jobs WHERE user_id=?", userID); err != nil {
 		return deleted, err
 	}
 	return deleted, nil
 }
 
-func (s *server) cleanUserQuarantine(username string) (int, error) {
+func (s *server) cleanUserQuarantine(userID string) (int, error) {
 	entries, err := os.ReadDir(s.cfg.QuarantineDir)
 	if errors.Is(err, os.ErrNotExist) {
 		return 0, nil
@@ -137,10 +137,10 @@ func (s *server) cleanUserQuarantine(username string) (int, error) {
 		}
 		target := filepath.Join(s.cfg.QuarantineDir, entry.Name())
 		_, owner, err := readQuarantineRecord(target + ".rec")
-		if err != nil || owner != username {
+		if err != nil || owner != userID {
 			continue
 		}
-		if err := s.deleteQuarantineSubject(entry.Name(), username); err != nil {
+		if err := s.deleteQuarantineSubject(entry.Name(), userID); err != nil {
 			return deleted, err
 		}
 		deleted++
@@ -152,7 +152,7 @@ func (s *server) cleanDeleteUser(ctx context.Context, username string) error {
 	s.debug("users", "user deletion started", "user", username)
 	s.accountDeleteMu.Lock()
 	defer s.accountDeleteMu.Unlock()
-	var id int64
+	var id string
 	var role, status string
 	if err := s.userDB.QueryRowContext(ctx, "SELECT id,role,status FROM users WHERE username=?", username).Scan(&id, &role, &status); err != nil {
 		return err
@@ -167,7 +167,7 @@ func (s *server) cleanDeleteUser(ctx context.Context, username string) error {
 	if s.history != nil {
 		_ = s.history.refresh(ctx)
 		var activeJobs int
-		if err := s.historyDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM history_jobs WHERE user=? AND status IN ('waiting','running')", username).Scan(&activeJobs); err != nil {
+		if err := s.historyDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM history_jobs WHERE user_id=? AND status IN ('waiting','running')", id).Scan(&activeJobs); err != nil {
 			return err
 		}
 		if activeJobs > 0 {
@@ -175,13 +175,13 @@ func (s *server) cleanDeleteUser(ctx context.Context, username string) error {
 		}
 	}
 	s.mu.Lock()
-	if active := s.batches[s.activeBatchID]; active != nil && active.User == username {
+	if active := s.batches[s.activeBatchID]; active != nil && active.UserID == id {
 		s.mu.Unlock()
 		return errUserBusy
 	}
 	kept := s.queuedBatchIDs[:0]
 	for _, batchID := range s.queuedBatchIDs {
-		if batch := s.batches[batchID]; batch != nil && batch.User == username {
+		if batch := s.batches[batchID]; batch != nil && batch.UserID == id {
 			delete(s.batches, batchID)
 			continue
 		}
@@ -196,35 +196,35 @@ func (s *server) cleanDeleteUser(ctx context.Context, username string) error {
 	_, _ = s.userDB.ExecContext(ctx, "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL", now, id)
 	s.resultMu.Lock()
 	for lookupID, lookup := range s.resultLookups {
-		if lookup.User == username {
+		if lookup.UserID == id {
 			delete(s.resultLookups, lookupID)
 		}
 	}
 	s.resultMu.Unlock()
 	s.historyStatisticsMu.Lock()
 	for lookupID, lookup := range s.historyStatisticsLookups {
-		if lookup.User == username {
+		if lookup.UserID == id {
 			delete(s.historyStatisticsLookups, lookupID)
 		}
 	}
 	s.historyStatisticsMu.Unlock()
 	s.quarantineMu.Lock()
 	for lookupID, lookup := range s.quarantineLookups {
-		if lookup.User == username {
+		if lookup.UserID == id {
 			delete(s.quarantineLookups, lookupID)
 		}
 	}
 	s.quarantineMu.Unlock()
-	if err := s.removeCronRulesForUser(username); err != nil {
+	if err := s.removeCronRulesForUser(id); err != nil {
 		return err
 	}
-	if err := s.removeWhitelistForUser(username); err != nil {
+	if err := s.removeWhitelistForUser(id); err != nil {
 		return err
 	}
-	if _, err := s.cleanUserQuarantine(username); err != nil {
+	if _, err := s.cleanUserQuarantine(id); err != nil {
 		return err
 	}
-	if _, err := s.cleanUserResults(ctx, username); err != nil {
+	if _, err := s.cleanUserResults(ctx, id); err != nil {
 		return err
 	}
 	_, err := s.userDB.ExecContext(ctx, "DELETE FROM users WHERE id=?", id)

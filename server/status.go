@@ -31,7 +31,7 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		if json.Unmarshal(data, &decoded) == nil {
 			source = decoded
 			who, _ := actorFromRequest(r)
-			s.enrichStatusSource(source, who.Username)
+			s.enrichStatusSource(source, who.ID)
 		} else {
 			source = string(data)
 		}
@@ -52,10 +52,10 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *server) enrichStatusSource(source any, usernames ...string) {
-	username := ""
-	if len(usernames) > 0 {
-		username = usernames[0]
+func (s *server) enrichStatusSource(source any, userIDs ...string) {
+	userID := ""
+	if len(userIDs) > 0 {
+		userID = userIDs[0]
 	}
 	root, ok := source.(map[string]any)
 	if !ok {
@@ -65,17 +65,17 @@ func (s *server) enrichStatusSource(source any, usernames ...string) {
 	if !ok {
 		return
 	}
-	if activeID, _ := scan["active_job_id"].(string); activeID != "" && username != "" {
+	if activeID, _ := scan["active_job_id"].(string); activeID != "" && userID != "" {
 		state, _ := s.jobState(activeID)
 		job, _ := state.(map[string]any)
-		if owner, _ := job["user"].(string); owner != username {
+		if owner, _ := job["user_id"].(string); owner != userID {
 			scan["active_job_id"] = nil
 		}
 	}
 	jobID, _ := scan["last_job_id"].(string)
-	if s.historyDB != nil && username != "" {
+	if s.historyDB != nil && userID != "" {
 		var status, result string
-		err := s.historyDB.QueryRow("SELECT job_id,status,result FROM history_jobs WHERE user=? ORDER BY started_at DESC,job_id DESC LIMIT 1", username).Scan(&jobID, &status, &result)
+		err := s.historyDB.QueryRow("SELECT job_id,status,result FROM history_jobs WHERE user_id=? ORDER BY started_at DESC,job_id DESC LIMIT 1", userID).Scan(&jobID, &status, &result)
 		if err != nil {
 			scan["last_job_id"] = nil
 			scan["last_job_status"] = nil

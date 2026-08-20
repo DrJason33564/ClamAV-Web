@@ -37,7 +37,8 @@ type scanBatch struct {
 	Failed     int        `json:"failed"`
 	Threats    int        `json:"threats"`
 	LastError  string     `json:"last_error,omitempty"`
-	User       string     `json:"-"`
+	UserID     string     `json:"-"`
+	Username   string     `json:"-"`
 }
 
 type startScanRequest struct {
@@ -147,10 +148,11 @@ func (s *server) startScan(w http.ResponseWriter, r *http.Request) {
 		Targets: targets,
 		Message: "Queued",
 	}
-	batch.User = who.Username
+	batch.UserID = who.ID
+	batch.Username = who.Username
 
 	status, message := s.enqueueBatch(batch)
-	s.info("scan", "scan batch queued", "batch_id", batch.ID, "user", batch.User, "targets", len(batch.Targets), "action", batch.Action)
+	s.info("scan", "scan batch queued", "batch_id", batch.ID, "user_id", batch.UserID, "user", batch.Username, "targets", len(batch.Targets), "action", batch.Action)
 	writeJSON(w, http.StatusAccepted, startScanResponse{
 		ID:      batch.ID,
 		Status:  status,
@@ -173,7 +175,7 @@ func (s *server) enqueueBatch(batch *scanBatch) (string, string) {
 
 func (s *server) listScans(w http.ResponseWriter, r *http.Request) {
 	who, _ := actorFromRequest(r)
-	items, err := s.listQueueItems(r.URL.Query().Get("scope"), who.Username)
+	items, err := s.listQueueItems(r.URL.Query().Get("scope"), who.ID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -181,10 +183,10 @@ func (s *server) listScans(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, items)
 }
 
-func (s *server) listQueueItems(scope string, usernames ...string) ([]scanQueueItem, error) {
-	username := ""
-	if len(usernames) > 0 {
-		username = usernames[0]
+func (s *server) listQueueItems(scope string, userIDs ...string) ([]scanQueueItem, error) {
+	userID := ""
+	if len(userIDs) > 0 {
+		userID = userIDs[0]
 	}
 	start, end, all, err := parseScanScope(scope)
 	if err != nil {
@@ -196,14 +198,14 @@ func (s *server) listQueueItems(scope string, usernames ...string) ([]scanQueueI
 
 	items := make([]scanQueueItem, 0, len(s.queuedBatchIDs)+1)
 	if all || start == 1 {
-		if active := s.cloneBatchLocked(s.activeBatchID); active != nil && (username == "" || active.User == username) {
+		if active := s.cloneBatchLocked(s.activeBatchID); active != nil && (userID == "" || active.UserID == userID) {
 			items = append(items, queueItem(active, 0))
 		}
 	}
 	queueNumber := 0
 	for _, id := range s.queuedBatchIDs {
 		batch := s.cloneBatchLocked(id)
-		if batch == nil || (username != "" && batch.User != username) {
+		if batch == nil || (userID != "" && batch.UserID != userID) {
 			continue
 		}
 		queueNumber++
@@ -258,7 +260,7 @@ func (s *server) handleScanReorder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	who, _ := actorFromRequest(r)
-	if err := s.reorderQueuedBatch(strings.TrimSpace(req.ID), req.QueueNumber, who.Username); err != nil {
+	if err := s.reorderQueuedBatch(strings.TrimSpace(req.ID), req.QueueNumber, who.ID); err != nil {
 		s.warn("scan", "scan queue reorder rejected", "batch_id", strings.TrimSpace(req.ID), "user", who.Username, "error", err)
 		writeJSON(w, http.StatusBadRequest, scanActionResponse{Status: "failed", Message: err.Error()})
 		return
@@ -278,7 +280,7 @@ func (s *server) handleScanCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	who, _ := actorFromRequest(r)
-	if err := s.cancelQueuedBatch(strings.TrimSpace(req.ID), strings.TrimSpace(req.Cancel), who.Username); err != nil {
+	if err := s.cancelQueuedBatch(strings.TrimSpace(req.ID), strings.TrimSpace(req.Cancel), who.ID); err != nil {
 		s.warn("scan", "queued scan cancellation rejected", "batch_id", strings.TrimSpace(req.ID), "user", who.Username, "error", err)
 		writeJSON(w, http.StatusBadRequest, scanActionResponse{Status: "failed", Message: err.Error()})
 		return
@@ -294,8 +296,9 @@ func (s *server) runBatch(id string) {
 	}
 	targets := append([]string(nil), batch.Targets...)
 	action := batch.Action
-	username := batch.User
-	s.info("scan", "scan batch started", "batch_id", id, "user", username, "targets", len(targets), "action", action)
+	userID := batch.UserID
+	username := batch.Username
+	s.info("scan", "scan batch started", "batch_id", id, "user_id", userID, "user", username, "targets", len(targets), "action", action)
 
 	for i, target := range targets {
 		targetStarted := time.Now()
@@ -305,7 +308,7 @@ func (s *server) runBatch(id string) {
 			batch.Message = fmt.Sprintf("Scanning %d of %d", i+1, len(targets))
 		})
 
-		args := []string{"--type", "manual", "--user", username, "--target", target, "--action", action}
+		args := []string{"--type", "manual", "--user", userID, "--target", target, "--action", action}
 		jobID, waitScan, err := s.startScanScript(args)
 		if jobID != "" {
 			s.updateBatch(id, func(batch *scanBatch) {
@@ -704,16 +707,16 @@ func (s *server) nextQueuedBatchID() (string, bool) {
 			continue
 		}
 		valid = append(valid, id)
-		if !seenUsers[batch.User] {
-			seenUsers[batch.User] = true
-			users = append(users, batch.User)
+		if !seenUsers[batch.UserID] {
+			seenUsers[batch.UserID] = true
+			users = append(users, batch.UserID)
 		}
 	}
 	s.queuedBatchIDs = valid
 	if len(users) > 0 {
 		selected := users[randomIndex(len(users))]
 		for _, id := range s.queuedBatchIDs {
-			if s.batches[id].User == selected {
+			if s.batches[id].UserID == selected {
 				return id, true
 			}
 		}
@@ -809,10 +812,10 @@ func (s *server) scanLockBlocksManualStart() (bool, error) {
 	return true, nil
 }
 
-func (s *server) reorderQueuedBatch(id string, targetNumber int, usernames ...string) error {
-	username := ""
-	if len(usernames) > 0 {
-		username = usernames[0]
+func (s *server) reorderQueuedBatch(id string, targetNumber int, userIDs ...string) error {
+	userID := ""
+	if len(userIDs) > 0 {
+		userID = userIDs[0]
 	}
 	if id == "" {
 		return errors.New("id is required")
@@ -827,12 +830,12 @@ func (s *server) reorderQueuedBatch(id string, targetNumber int, usernames ...st
 		return errors.New("running scan cannot be reordered")
 	}
 	current := indexOfString(s.queuedBatchIDs, id)
-	if current < 0 || s.batches[id] == nil || (username != "" && s.batches[id].User != username) {
+	if current < 0 || s.batches[id] == nil || (userID != "" && s.batches[id].UserID != userID) {
 		return errors.New("queued scan not found")
 	}
 	owned := make([]string, 0)
 	for _, queuedID := range s.queuedBatchIDs {
-		if batch := s.batches[queuedID]; batch != nil && (username == "" || batch.User == username) {
+		if batch := s.batches[queuedID]; batch != nil && (userID == "" || batch.UserID == userID) {
 			owned = append(owned, queuedID)
 		}
 	}
@@ -847,7 +850,7 @@ func (s *server) reorderQueuedBatch(id string, targetNumber int, usernames ...st
 	owned[target] = id
 	n := 0
 	for i, queuedID := range s.queuedBatchIDs {
-		if batch := s.batches[queuedID]; batch != nil && (username == "" || batch.User == username) {
+		if batch := s.batches[queuedID]; batch != nil && (userID == "" || batch.UserID == userID) {
 			s.queuedBatchIDs[i] = owned[n]
 			n++
 		}
@@ -855,10 +858,10 @@ func (s *server) reorderQueuedBatch(id string, targetNumber int, usernames ...st
 	return nil
 }
 
-func (s *server) cancelQueuedBatch(id string, confirm string, usernames ...string) error {
-	username := ""
-	if len(usernames) > 0 {
-		username = usernames[0]
+func (s *server) cancelQueuedBatch(id string, confirm string, userIDs ...string) error {
+	userID := ""
+	if len(userIDs) > 0 {
+		userID = userIDs[0]
 	}
 	if id == "" {
 		return errors.New("id is required")
@@ -873,7 +876,7 @@ func (s *server) cancelQueuedBatch(id string, confirm string, usernames ...strin
 		return errors.New("running scan cannot be canceled")
 	}
 	index := indexOfString(s.queuedBatchIDs, id)
-	if index < 0 || s.batches[id] == nil || (username != "" && s.batches[id].User != username) {
+	if index < 0 || s.batches[id] == nil || (userID != "" && s.batches[id].UserID != userID) {
 		return errors.New("queued scan not found")
 	}
 	s.queuedBatchIDs = append(s.queuedBatchIDs[:index], s.queuedBatchIDs[index+1:]...)

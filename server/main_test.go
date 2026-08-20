@@ -308,7 +308,7 @@ func TestCronConfigPreservesCommentsAndDisabledRule(t *testing.T) {
 	body := strings.Join([]string{
 		"# user readable header",
 		"# scanner-cron-rule id=abc123def456gh78 enabled=true",
-		"30 3 * * * /scan/docs warn alice Y",
+		"30 3 * * * /scan/docs warn alice001 Y",
 		"# user note",
 		"",
 	}, "\n")
@@ -343,7 +343,7 @@ func TestCronConfigPreservesCommentsAndDisabledRule(t *testing.T) {
 	if !strings.Contains(text, "# scanner-cron-rule id=abc123def456gh78 enabled=false") {
 		t.Fatalf("expected metadata to be disabled, got:\n%s", text)
 	}
-	if !strings.Contains(text, "# 30 3 * * * /scan/docs warn alice Y") {
+	if !strings.Contains(text, "# 30 3 * * * /scan/docs warn alice001 Y") {
 		t.Fatalf("expected rule line to be commented, got:\n%s", text)
 	}
 }
@@ -361,23 +361,23 @@ func TestValidateCronRuleFields(t *testing.T) {
 }
 
 func TestCronRuleWakeColumn(t *testing.T) {
-	wakeRule, err := parseCronRuleLine(`15 2 * * 0 "/scan/My Folder" remove admin Y`)
+	wakeRule, err := parseCronRuleLine(`15 2 * * 0 "/scan/My Folder" remove admin001 Y`)
 	if err != nil || !wakeRule.Wake {
 		t.Fatalf("expected Y to enable wake, rule=%#v err=%v", wakeRule, err)
 	}
 	wakeRule.Enabled = true
-	if got := cronConfigLine(wakeRule); got != `15 2 * * 0 "/scan/My Folder" remove admin Y` {
+	if got := cronConfigLine(wakeRule); got != `15 2 * * 0 "/scan/My Folder" remove admin001 Y` {
 		t.Fatalf("unexpected serialized wake rule: %q", got)
 	}
 
-	noWakeRule, err := parseCronRuleLine("0 3 * * * /scan warn alice N")
+	noWakeRule, err := parseCronRuleLine("0 3 * * * /scan warn alice001 N")
 	if err != nil || noWakeRule.Wake {
 		t.Fatalf("expected N to disable wake, rule=%#v err=%v", noWakeRule, err)
 	}
-	if _, err := parseCronRuleLine("0 3 * * * /scan warn alice maybe"); err == nil {
+	if _, err := parseCronRuleLine("0 3 * * * /scan warn alice001 maybe"); err == nil {
 		t.Fatal("expected an invalid wake column to be rejected")
 	}
-	if _, err := parseCronRuleLine("0 3 * * * /scan warn alice"); err == nil {
+	if _, err := parseCronRuleLine("0 3 * * * /scan warn alice001"); err == nil {
 		t.Fatal("expected a missing wake column to be rejected")
 	}
 }
@@ -394,8 +394,8 @@ func TestWhitelistEntriesParseQuotedPaths(t *testing.T) {
 	excludeConfig := filepath.Join(tmp, "exclude.conf")
 	body := strings.Join([]string{
 		"# trusted paths",
-		"/scan/trusted alice",
-		"\"/scan/file with space.zip\" alice",
+		"/scan/trusted alice001",
+		"\"/scan/file with space.zip\" alice001",
 		"/scan/invalid path extra",
 	}, "\n")
 	if err := os.WriteFile(excludeConfig, []byte(body), 0o644); err != nil {
@@ -452,7 +452,7 @@ func TestWhitelistAddDeleteAndBusyLock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.addWhitelistEntry(target, "alice"); err != nil {
+	if err := s.addWhitelistEntry(target, testAliceUserID); err != nil {
 		t.Fatal(err)
 	}
 	content, err := os.ReadFile(excludeConfig)
@@ -469,7 +469,7 @@ func TestWhitelistAddDeleteAndBusyLock(t *testing.T) {
 	if message != "refreshed" {
 		t.Fatalf("unexpected script message: %q", message)
 	}
-	if err := s.deleteWhitelistEntry(target, "alice"); err != nil {
+	if err := s.deleteWhitelistEntry(target, testAliceUserID); err != nil {
 		t.Fatal(err)
 	}
 	entries, err := s.readWhitelistEntries()
@@ -484,11 +484,11 @@ func TestWhitelistAddDeleteAndBusyLock(t *testing.T) {
 func TestReadResultLogItems(t *testing.T) {
 	tmp := t.TempDir()
 	files := map[string]string{
-		"manual-1783431402.json": `{"version":2,"job_id":"manual-1783431402","type":"manual","status":"finished","result":"found","action":"warn","started_at":1783431402,"finished_at":1783431410,"user":"alice"}`,
-		"cron-1783407661.json":   `{"version":2,"job_id":"cron-1783407661","type":"cron","status":"finished","result":"clean","action":"remove","started_at":1783407661,"finished_at":1783407670,"user":"alice"}`,
-		"manual-1783432800.json": `{"version":2,"job_id":"manual-1783432800","type":"manual","status":"running","result":"unknown","action":"move","started_at":1783432800,"finished_at":null,"user":"alice"}`,
-		"manual-bad.json":        `{"version":2,"job_id":"manual-bad","user":"alice"}`,
-		"manual-1783432900.json": `{"version":1,"job_id":"manual-1783432900","user":"alice"}`,
+		"manual-1783431402.json": `{"version":3,"job_id":"manual-1783431402","type":"manual","status":"finished","result":"found","action":"warn","started_at":1783431402,"finished_at":1783431410,"user_id":"alice001"}`,
+		"cron-1783407661.json":   `{"version":3,"job_id":"cron-1783407661","type":"cron","status":"finished","result":"clean","action":"remove","started_at":1783407661,"finished_at":1783407670,"user_id":"alice001"}`,
+		"manual-1783432800.json": `{"version":3,"job_id":"manual-1783432800","type":"manual","status":"running","result":"unknown","action":"move","started_at":1783432800,"finished_at":null,"user_id":"alice001"}`,
+		"manual-bad.json":        `{"version":3,"job_id":"manual-bad","user_id":"alice001"}`,
+		"manual-1783432900.json": `{"version":2,"job_id":"manual-1783432900","user":"alice"}`,
 	}
 	for name, body := range files {
 		if err := os.WriteFile(filepath.Join(tmp, name), []byte(body), 0o644); err != nil {
@@ -506,7 +506,7 @@ func TestReadResultLogItems(t *testing.T) {
 	if err := s.history.refresh(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	items, total, err := s.readResultLogItems(resultScope{All: true}, "alice")
+	items, total, err := s.readResultLogItems(resultScope{All: true}, testAliceUserID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -526,7 +526,7 @@ func TestReadResultLogItems(t *testing.T) {
 		t.Fatalf("unexpected third item: %#v", items[2])
 	}
 
-	scoped, scopedTotal, err := s.readResultLogItems(resultScope{Start: 1, End: 2}, "alice")
+	scoped, scopedTotal, err := s.readResultLogItems(resultScope{Start: 1, End: 2}, testAliceUserID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -739,7 +739,7 @@ func TestQuarantineSubjectsDeleteAndRecover(t *testing.T) {
 	if err := os.WriteFile(quarantined, []byte("infected"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(quarantined+".rec", []byte("\""+sourceFile+"\" alice\n"), 0o644); err != nil {
+	if err := os.WriteFile(quarantined+".rec", []byte("\""+sourceFile+"\" alice001\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(quarantineDir, "orphan.rec"), []byte("\"/scan/orphan\"\n"), 0o644); err != nil {
@@ -778,7 +778,7 @@ func TestQuarantineSubjectsDeleteAndRecover(t *testing.T) {
 	if err := os.WriteFile(deleteTarget, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(deleteTarget+".rec", []byte("\"/scan/delete-me.txt\" alice\n"), 0o644); err != nil {
+	if err := os.WriteFile(deleteTarget+".rec", []byte("\"/scan/delete-me.txt\" alice001\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.deleteQuarantineSubject("delete-me.txt"); err != nil {
@@ -809,7 +809,7 @@ func TestQuarantineRecoverFallsBackAcrossDevices(t *testing.T) {
 	if err := os.WriteFile(quarantined, content, 0o640); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(quarantined+".rec", []byte("\""+sourceFile+"\" alice\n"), 0o644); err != nil {
+	if err := os.WriteFile(quarantined+".rec", []byte("\""+sourceFile+"\" alice001\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

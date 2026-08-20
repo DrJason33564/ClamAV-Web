@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-var resultJobIDPattern = version2JobIDPattern
+var resultJobIDPattern = version3JobIDPattern
 
 type resultLookup struct {
 	ID        string          `json:"lookup_id"`
@@ -24,7 +24,7 @@ type resultLookup struct {
 	StartedAt time.Time       `json:"started_at"`
 	UpdatedAt time.Time       `json:"updated_at"`
 	scope     resultScope
-	User      string `json:"-"`
+	UserID    string `json:"-"`
 }
 
 type resultLogItem struct {
@@ -81,7 +81,7 @@ func (s *server) handleResultLookupStart(w http.ResponseWriter, r *http.Request)
 		StartedAt: time.Now(),
 		UpdatedAt: time.Now(),
 		scope:     scope,
-		User:      who.Username,
+		UserID:    who.ID,
 	}
 	s.resultMu.Lock()
 	s.cleanupResultLookupsLocked(time.Now().Add(-15 * time.Minute))
@@ -116,7 +116,7 @@ func (s *server) handleResultLookup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	who, _ := actorFromRequest(r)
-	if lookup.User != who.Username {
+	if lookup.UserID != who.ID {
 		s.resultMu.RUnlock()
 		http.NotFound(w, r)
 		return
@@ -145,10 +145,10 @@ func (s *server) runResultLookup(id string) {
 		return
 	}
 	scope := lookup.scope
-	username := lookup.User
+	userID := lookup.UserID
 	s.resultMu.RUnlock()
 
-	results, total, err := s.readResultLogItems(scope, username)
+	results, total, err := s.readResultLogItems(scope, userID)
 	s.resultMu.Lock()
 	defer s.resultMu.Unlock()
 	lookup, ok = s.resultLookups[id]
@@ -159,22 +159,22 @@ func (s *server) runResultLookup(id string) {
 	if err != nil {
 		lookup.Status = "failed"
 		lookup.Error = err.Error()
-		s.error("results", "result lookup failed", "lookup_id", id, "user", username, "error", err)
+		s.error("results", "result lookup failed", "lookup_id", id, "user_id", userID, "error", err)
 		return
 	}
 	lookup.Status = "success"
 	lookup.Results = results
 	lookup.Total = total
-	s.debug("results", "result lookup completed", "lookup_id", id, "user", username, "returned", len(results), "total", total)
+	s.debug("results", "result lookup completed", "lookup_id", id, "user_id", userID, "returned", len(results), "total", total)
 }
 
-func (s *server) readResultLogItems(scope resultScope, username string) ([]resultLogItem, int, error) {
+func (s *server) readResultLogItems(scope resultScope, userID string) ([]resultLogItem, int, error) {
 	var total int
-	if err := s.historyDB.QueryRow("SELECT COUNT(*) FROM history_jobs WHERE user=?", username).Scan(&total); err != nil {
+	if err := s.historyDB.QueryRow("SELECT COUNT(*) FROM history_jobs WHERE user_id=?", userID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	query := "SELECT job_id,job_type,started_at,result,action FROM history_jobs WHERE user=? ORDER BY started_at DESC,job_id DESC"
-	args := []any{username}
+	query := "SELECT job_id,job_type,started_at,result,action FROM history_jobs WHERE user_id=? ORDER BY started_at DESC,job_id DESC"
+	args := []any{userID}
 	if !scope.All {
 		query += " LIMIT ? OFFSET ?"
 		args = append(args, scope.End-scope.Start+1, scope.Start-1)
@@ -192,7 +192,7 @@ func (s *server) readResultLogItems(scope resultScope, username string) ([]resul
 			return nil, total, err
 		}
 		// Preserve the existing API date representation while job IDs and stored
-		// timestamps use Unix time in version 2.
+		// timestamps use Unix time in version 3.
 		item.Date = time.Unix(startedAt, 0).Format("20060102150405")
 		items = append(items, item)
 	}
@@ -289,7 +289,7 @@ func (s *server) handleDetectionResult(w http.ResponseWriter, r *http.Request) {
 	}
 
 	who, _ := actorFromRequest(r)
-	result, err := s.readDetectionResult(jobID, who.Username)
+	result, err := s.readDetectionResult(jobID, who.ID)
 	if err != nil {
 		s.error("results", "detection result lookup failed", "job_id", jobID, "user", who.Username, "error", err)
 		writeError(w, http.StatusInternalServerError, err)
@@ -303,11 +303,11 @@ func (s *server) handleDetectionResult(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-func (s *server) readDetectionResult(jobID string, usernames ...string) (*detectionLookupResponse, error) {
-	if len(usernames) > 0 {
-		username := usernames[0]
+func (s *server) readDetectionResult(jobID string, userIDs ...string) (*detectionLookupResponse, error) {
+	if len(userIDs) > 0 {
+		userID := userIDs[0]
 		var jsonFile string
-		if err := s.historyDB.QueryRow("SELECT json_file FROM history_jobs WHERE job_id=? AND user=?", jobID, username).Scan(&jsonFile); err != nil {
+		if err := s.historyDB.QueryRow("SELECT json_file FROM history_jobs WHERE job_id=? AND user_id=?", jobID, userID).Scan(&jsonFile); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil, nil
 			}

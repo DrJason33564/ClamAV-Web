@@ -27,7 +27,7 @@ type cronRule struct {
 	Target  string `json:"target"`
 	Action  string `json:"action"`
 	Wake    bool   `json:"wake"`
-	User    string `json:"-"`
+	UserID  string `json:"-"`
 	Line    int    `json:"line,omitempty"`
 }
 
@@ -56,7 +56,7 @@ func (s *server) handleCronRules(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		who, _ := actorFromRequest(r)
 		s.configFileMu.Lock()
-		rules, err := s.readCronRules(who.Username)
+		rules, err := s.readCronRules(who.ID)
 		s.configFileMu.Unlock()
 		if err != nil {
 			s.error("cron", "read cron rules failed", "user", who.Username, "error", err)
@@ -150,7 +150,7 @@ func (s *server) handleCronRule(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		who, _ := actorFromRequest(r)
 		s.configFileMu.Lock()
-		rules, message, err := s.deleteCronRule(id, who.Username)
+		rules, message, err := s.deleteCronRule(id, who.ID)
 		s.configFileMu.Unlock()
 		if err != nil {
 			s.warn("cron", "cron rule deletion failed", "rule_id", id, "user", who.Username, "error", err)
@@ -179,7 +179,7 @@ func (s *server) handleCronReload(w http.ResponseWriter, r *http.Request) {
 	}
 	s.info("cron", "cron rules reloaded")
 	who, _ := actorFromRequest(r)
-	rules, readErr := s.readCronRules(who.Username)
+	rules, readErr := s.readCronRules(who.ID)
 	if readErr != nil {
 		writeError(w, http.StatusInternalServerError, readErr)
 		return
@@ -200,10 +200,10 @@ type cronConfigDoc struct {
 	Blocks []cronRuleBlock
 }
 
-func (s *server) readCronRules(usernames ...string) ([]cronRule, error) {
-	username := ""
-	if len(usernames) > 0 {
-		username = usernames[0]
+func (s *server) readCronRules(userIDs ...string) ([]cronRule, error) {
+	userID := ""
+	if len(userIDs) > 0 {
+		userID = userIDs[0]
 	}
 	doc, err := s.readCronConfigDoc()
 	if err != nil {
@@ -211,7 +211,7 @@ func (s *server) readCronRules(usernames ...string) ([]cronRule, error) {
 	}
 	rules := make([]cronRule, 0, len(doc.Blocks))
 	for _, block := range doc.Blocks {
-		if username != "" && block.Rule.User != username {
+		if userID != "" && block.Rule.UserID != userID {
 			continue
 		}
 		rules = append(rules, block.Rule)
@@ -304,7 +304,7 @@ func parseCronRuleLine(line string) (cronRule, error) {
 
 	fields := strings.Fields(line)
 	if len(fields) < 9 {
-		return cronRule{}, errors.New("expected minute hour day month weekday target action owner wake")
+		return cronRule{}, errors.New("expected minute hour day month weekday target action owner_user_id wake")
 	}
 	rule := cronRule{
 		Minute:  fields[0],
@@ -321,11 +321,11 @@ func parseCronRuleLine(line string) (cronRule, error) {
 	}
 	actionFields := strings.Fields(rest)
 	if len(actionFields) != 3 {
-		return cronRule{}, errors.New("expected exactly one action, one owner and one wake flag")
+		return cronRule{}, errors.New("expected exactly one action, one owner user ID and one wake flag")
 	}
 	rule.Target = target
 	rule.Action = actionFields[0]
-	rule.User = actionFields[1]
+	rule.UserID = actionFields[1]
 	switch actionFields[2] {
 	case "Y":
 		rule.Wake = true
@@ -334,8 +334,8 @@ func parseCronRuleLine(line string) (cronRule, error) {
 	default:
 		return cronRule{}, errors.New("wake flag must be Y or N")
 	}
-	if !usernamePattern.MatchString(rule.User) {
-		return cronRule{}, errors.New("invalid rule owner")
+	if !validUserID(rule.UserID) {
+		return cronRule{}, errors.New("invalid rule owner user ID")
 	}
 	return rule, nil
 }
@@ -378,11 +378,11 @@ func uncommentCronRuleLine(line string) string {
 }
 
 func (s *server) addCronRule(req cronRule, actors ...actor) ([]cronRule, string, error) {
-	who := actor{Username: req.User}
+	who := actor{ID: req.UserID}
 	if len(actors) > 0 {
 		who = actors[0]
 	}
-	username := who.Username
+	userID := who.ID
 	doc, err := s.readCronConfigDoc()
 	if err != nil {
 		return nil, "", err
@@ -392,18 +392,18 @@ func (s *server) addCronRule(req cronRule, actors ...actor) ([]cronRule, string,
 		return nil, "", err
 	}
 	rule.ID = uniqueCronRuleID(doc.Blocks)
-	rule.User = username
+	rule.UserID = userID
 	doc.Lines = append(doc.Lines, cronMetaLine(rule), cronConfigLine(rule))
-	return s.saveCronConfigDoc(doc, username)
+	return s.saveCronConfigDoc(doc, userID)
 }
 
 func (s *server) updateCronRule(id string, req cronRule, actors ...actor) ([]cronRule, string, error) {
-	who := actor{Username: req.User}
+	who := actor{ID: req.UserID}
 	if len(actors) > 0 {
 		who = actors[0]
 	}
-	username := who.Username
-	doc, block, err := s.findCronRuleBlock(id, username)
+	userID := who.ID
+	doc, block, err := s.findCronRuleBlock(id, userID)
 	if err != nil {
 		return nil, "", err
 	}
@@ -412,10 +412,10 @@ func (s *server) updateCronRule(id string, req cronRule, actors ...actor) ([]cro
 		return nil, "", err
 	}
 	rule.ID = id
-	rule.User = username
+	rule.UserID = userID
 	doc.Lines[block.MetaIndex] = cronMetaLine(rule)
 	doc.Lines[block.RuleIndex] = cronConfigLine(rule)
-	return s.saveCronConfigDoc(doc, username)
+	return s.saveCronConfigDoc(doc, userID)
 }
 
 func (s *server) setCronRuleEnabled(id string, enabled bool, actors ...actor) ([]cronRule, string, error) {
@@ -423,8 +423,8 @@ func (s *server) setCronRuleEnabled(id string, enabled bool, actors ...actor) ([
 	if len(actors) > 0 {
 		who = actors[0]
 	}
-	username := who.Username
-	doc, block, err := s.findCronRuleBlock(id, username)
+	userID := who.ID
+	doc, block, err := s.findCronRuleBlock(id, userID)
 	if err != nil {
 		return nil, "", err
 	}
@@ -437,26 +437,26 @@ func (s *server) setCronRuleEnabled(id string, enabled bool, actors ...actor) ([
 	rule.Enabled = enabled
 	doc.Lines[block.MetaIndex] = cronMetaLine(rule)
 	doc.Lines[block.RuleIndex] = cronConfigLine(rule)
-	return s.saveCronConfigDoc(doc, username)
+	return s.saveCronConfigDoc(doc, userID)
 }
 
-func (s *server) deleteCronRule(id string, usernames ...string) ([]cronRule, string, error) {
-	username := ""
-	if len(usernames) > 0 {
-		username = usernames[0]
+func (s *server) deleteCronRule(id string, userIDs ...string) ([]cronRule, string, error) {
+	userID := ""
+	if len(userIDs) > 0 {
+		userID = userIDs[0]
 	}
-	doc, block, err := s.findCronRuleBlock(id, username)
+	doc, block, err := s.findCronRuleBlock(id, userID)
 	if err != nil {
 		return nil, "", err
 	}
 	doc.Lines = append(doc.Lines[:block.MetaIndex], doc.Lines[block.RuleIndex+1:]...)
-	return s.saveCronConfigDoc(doc, username)
+	return s.saveCronConfigDoc(doc, userID)
 }
 
-func (s *server) findCronRuleBlock(id string, usernames ...string) (cronConfigDoc, cronRuleBlock, error) {
-	username := ""
-	if len(usernames) > 0 {
-		username = usernames[0]
+func (s *server) findCronRuleBlock(id string, userIDs ...string) (cronConfigDoc, cronRuleBlock, error) {
+	userID := ""
+	if len(userIDs) > 0 {
+		userID = userIDs[0]
 	}
 	if !validCronRuleID(id) {
 		return cronConfigDoc{}, cronRuleBlock{}, errors.New("invalid rule id")
@@ -466,7 +466,7 @@ func (s *server) findCronRuleBlock(id string, usernames ...string) (cronConfigDo
 		return cronConfigDoc{}, cronRuleBlock{}, err
 	}
 	for _, block := range doc.Blocks {
-		if block.Rule.ID == id && (username == "" || block.Rule.User == username) {
+		if block.Rule.ID == id && (userID == "" || block.Rule.UserID == userID) {
 			return doc, block, nil
 		}
 	}
@@ -585,7 +585,7 @@ func validCronAtom(atom string, min int, max int) bool {
 	return err == nil && value >= min && value <= max
 }
 
-func (s *server) saveCronConfigDoc(doc cronConfigDoc, usernames ...string) ([]cronRule, string, error) {
+func (s *server) saveCronConfigDoc(doc cronConfigDoc, userIDs ...string) ([]cronRule, string, error) {
 	s.debug("cron", "saving cron configuration", "lines", len(doc.Lines))
 	dir := filepath.Dir(s.cfg.CronConfigFile)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -627,7 +627,7 @@ func (s *server) saveCronConfigDoc(doc cronConfigDoc, usernames ...string) ([]cr
 	if err != nil {
 		return nil, "", err
 	}
-	rules, err := s.readCronRules(usernames...)
+	rules, err := s.readCronRules(userIDs...)
 	if err != nil {
 		return nil, "", err
 	}
@@ -696,7 +696,7 @@ func cronConfigLine(rule cronRule) string {
 		rule.Weekday,
 		quoteCronTarget(rule.Target),
 		rule.Action,
-		rule.User,
+		rule.UserID,
 		wake,
 	)
 	if !rule.Enabled {
@@ -754,7 +754,7 @@ func validCronRuleID(id string) bool {
 	return true
 }
 
-func (s *server) disableCronRulesForUser(username string) error {
+func (s *server) disableCronRulesForUser(userID string) error {
 	s.configFileMu.Lock()
 	defer s.configFileMu.Unlock()
 	doc, err := s.readCronConfigDoc()
@@ -763,7 +763,7 @@ func (s *server) disableCronRulesForUser(username string) error {
 	}
 	changed := false
 	for _, block := range doc.Blocks {
-		if block.Rule.User != username || !block.Rule.Enabled {
+		if block.Rule.UserID != userID || !block.Rule.Enabled {
 			continue
 		}
 		rule := block.Rule
@@ -775,14 +775,14 @@ func (s *server) disableCronRulesForUser(username string) error {
 	if !changed {
 		return nil
 	}
-	_, _, err = s.saveCronConfigDoc(doc, username)
+	_, _, err = s.saveCronConfigDoc(doc, userID)
 	if err == nil {
-		s.info("cron", "cron rules disabled for user", "user", username)
+		s.info("cron", "cron rules disabled for user", "user_id", userID)
 	}
 	return err
 }
 
-func (s *server) removeCronRulesForUser(username string) error {
+func (s *server) removeCronRulesForUser(userID string) error {
 	s.configFileMu.Lock()
 	defer s.configFileMu.Unlock()
 	doc, err := s.readCronConfigDoc()
@@ -791,7 +791,7 @@ func (s *server) removeCronRulesForUser(username string) error {
 	}
 	remove := map[int]bool{}
 	for _, block := range doc.Blocks {
-		if block.Rule.User == username {
+		if block.Rule.UserID == userID {
 			remove[block.MetaIndex] = true
 			remove[block.RuleIndex] = true
 		}
@@ -806,9 +806,9 @@ func (s *server) removeCronRulesForUser(username string) error {
 		}
 	}
 	doc.Lines = kept
-	_, _, err = s.saveCronConfigDoc(doc, username)
+	_, _, err = s.saveCronConfigDoc(doc, userID)
 	if err == nil {
-		s.info("cron", "cron rules removed for user", "user", username, "rules", len(remove)/2)
+		s.info("cron", "cron rules removed for user", "user_id", userID, "rules", len(remove)/2)
 	}
 	return err
 }

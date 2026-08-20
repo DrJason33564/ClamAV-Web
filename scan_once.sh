@@ -15,7 +15,7 @@ LOG_SCRIPT="${LOG_SCRIPT:-/log.sh}"
 . "$LOG_SCRIPT"
 
 usage() {
-    echo "Usage: $0 [--id <job_id>] --type <manual|cron> -u <username> --target <path> --action <warn|move|remove> [--wait] [--wake]" >&2
+    echo "Usage: $0 [--id <job_id>] --type <manual|cron> -u <user_id> --target <path> --action <warn|move|remove> [--wait] [--wake]" >&2
 }
 
 json_escape() {
@@ -66,10 +66,10 @@ write_job_state() {
 
     cat > "$tmp_job" <<EOF_JOB
 {
-  "version": 2,
+  "version": 3,
   "job_id": "$(json_escape "$JOB_ID")",
   "type": "$(json_escape "$JOB_TYPE")",
-  "user": "$(json_escape "$JOB_USER")",
+  "user_id": "$(json_escape "$JOB_USER_ID")",
   "status": "$status",
   "target": "$(json_escape "$TARGET")",
   "action": "$ACTION",
@@ -130,7 +130,7 @@ log_scan_header() {
     log "[INFO] Scan started: $TARGET"
     log "[INFO] Job id: $JOB_ID"
     log "[INFO] Job type: $JOB_TYPE"
-    log "[INFO] Job owner: $JOB_USER"
+    log "[INFO] Job owner ID: $JOB_USER_ID"
     log_scan_action
     SCAN_HEADER_LOGGED=1
 }
@@ -338,7 +338,7 @@ quarantine_detected_file() {
         rm -f "$QUARANTINE_RECORD" 2>/dev/null || true
         return 1
     fi
-    if ! printf '"%s" %s\n' "$quarantine_source" "$JOB_USER" > "$quarantine_tmp_record"; then
+    if ! printf '"%s" %s\n' "$quarantine_source" "$JOB_USER_ID" > "$quarantine_tmp_record"; then
         log "[ERROR] Quarantine failed: cannot write temporary metadata for: $quarantine_source"
         rm -f "$quarantine_tmp_record" "$QUARANTINE_RECORD" 2>/dev/null || true
         return 1
@@ -496,7 +496,7 @@ acquire_scan_lock() {
 
 JOB_ID=""
 JOB_TYPE=""
-JOB_USER=""
+JOB_USER_ID=""
 TARGET=""
 ACTION=""
 WAIT_FOR_LOCK=0
@@ -516,7 +516,7 @@ while [ "$#" -gt 0 ]; do
             ;;
         -u|--user)
             [ "$#" -ge 2 ] || { usage; exit 2; }
-            JOB_USER="$2"
+            JOB_USER_ID="$2"
             shift 2
             ;;
         --target)
@@ -545,19 +545,27 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$JOB_TYPE" ] || { usage; exit 2; }
-[ -n "$JOB_USER" ] || { usage; exit 2; }
+[ -n "$JOB_USER_ID" ] || { usage; exit 2; }
 [ -n "$TARGET" ] || { usage; exit 2; }
 
-case "$JOB_USER" in
-    ''|*[!A-Za-z0-9._-]*)
-        echo "Unsupported job owner: $JOB_USER" >&2
+case "$JOB_USER_ID" in
+    *[!a-z0-9]*)
+        echo "Unsupported job owner ID: $JOB_USER_ID" >&2
         exit 2
         ;;
 esac
-if [ "${#JOB_USER}" -gt 64 ]; then
-    echo "Unsupported job owner: $JOB_USER" >&2
+if [ "${#JOB_USER_ID}" -ne 8 ]; then
+    echo "Unsupported job owner ID: $JOB_USER_ID" >&2
     exit 2
 fi
+case "$JOB_USER_ID" in
+    *[a-z]*) ;;
+    *) echo "Unsupported job owner ID: $JOB_USER_ID" >&2; exit 2 ;;
+esac
+case "$JOB_USER_ID" in
+    *[0-9]*) ;;
+    *) echo "Unsupported job owner ID: $JOB_USER_ID" >&2; exit 2 ;;
+esac
 
 case "$JOB_TYPE" in
     manual|cron)

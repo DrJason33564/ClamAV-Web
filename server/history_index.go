@@ -18,7 +18,7 @@ import (
 	"clamav-scanner/internal/applog"
 )
 
-var version2JobIDPattern = regexp.MustCompile(`^(manual|cron)-[0-9]{10,19}(?:-[0-9]{3})?$`)
+var version3JobIDPattern = regexp.MustCompile(`^(manual|cron)-[0-9]{10,19}(?:-[0-9]{3})?$`)
 
 var (
 	historyIndexEventDebounce            = 150 * time.Millisecond
@@ -37,7 +37,7 @@ type indexedJobDocument struct {
 	Action     string `json:"action"`
 	StartedAt  int64  `json:"started_at"`
 	FinishedAt *int64 `json:"finished_at"`
-	User       string `json:"user"`
+	UserID     string `json:"user_id"`
 }
 
 type historyIndexer struct {
@@ -174,29 +174,29 @@ func (h *historyIndexer) indexFile(ctx context.Context, path, name string, mtime
 	if err := json.Unmarshal(data, &job); err != nil {
 		return err
 	}
-	if job.Version != 2 {
+	if job.Version != 3 {
 		return fmt.Errorf("unsupported job version %d", job.Version)
 	}
-	if !version2JobIDPattern.MatchString(job.JobID) || name != job.JobID+".json" {
-		return errors.New("job id and filename do not match the version 2 format")
+	if !version3JobIDPattern.MatchString(job.JobID) || name != job.JobID+".json" {
+		return errors.New("job id and filename do not match the version 3 format")
 	}
 	if job.Type != "manual" && job.Type != "cron" || !strings.HasPrefix(job.JobID, job.Type+"-") {
 		return errors.New("invalid job type")
 	}
-	if !usernamePattern.MatchString(job.User) || job.StartedAt <= 0 {
+	if !validUserID(job.UserID) || job.StartedAt <= 0 {
 		return errors.New("invalid job owner or start timestamp")
 	}
 	if job.Action != "warn" && job.Action != "move" && job.Action != "remove" {
 		return errors.New("invalid job action")
 	}
 	_, err = h.db.ExecContext(ctx, `
-INSERT INTO history_jobs(job_id,job_type,status,result,action,started_at,finished_at,user,json_file,file_mtime_ns,indexed_at)
+INSERT INTO history_jobs(job_id,job_type,status,result,action,started_at,finished_at,user_id,json_file,file_mtime_ns,indexed_at)
 VALUES(?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(job_id) DO UPDATE SET
  job_type=excluded.job_type,status=excluded.status,result=excluded.result,action=excluded.action,
- started_at=excluded.started_at,finished_at=excluded.finished_at,user=excluded.user,json_file=excluded.json_file,
+ started_at=excluded.started_at,finished_at=excluded.finished_at,user_id=excluded.user_id,json_file=excluded.json_file,
  file_mtime_ns=excluded.file_mtime_ns,indexed_at=excluded.indexed_at`,
-		job.JobID, job.Type, job.Status, job.Result, job.Action, job.StartedAt, job.FinishedAt, job.User, path, mtimeNS, time.Now().Unix())
+		job.JobID, job.Type, job.Status, job.Result, job.Action, job.StartedAt, job.FinishedAt, job.UserID, path, mtimeNS, time.Now().Unix())
 	return err
 }
 

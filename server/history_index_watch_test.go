@@ -43,8 +43,8 @@ func TestHistoryIndexerWatchesOnlyChangedJobFiles(t *testing.T) {
 	unannouncedID := "cron-1783500000"
 	unannouncedPath := filepath.Join(jobsDir, unannouncedID+".json")
 	writeJobDocumentAtomically(t, unannouncedPath, indexedJobDocument{
-		Version: 2, JobID: unannouncedID, Type: "cron", Status: "finished", Result: "clean",
-		Action: "warn", StartedAt: 1783500000, User: "alice",
+		Version: 3, JobID: unannouncedID, Type: "cron", Status: "finished", Result: "clean",
+		Action: "warn", StartedAt: 1783500000, UserID: testAliceUserID,
 	})
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -58,8 +58,8 @@ func TestHistoryIndexerWatchesOnlyChangedJobFiles(t *testing.T) {
 	jobPath := filepath.Join(jobsDir, jobID+".json")
 	waitForHistoryState(t, historyDB, jobID, "running", func() {
 		writeJobDocumentAtomically(t, jobPath, indexedJobDocument{
-			Version: 2, JobID: jobID, Type: "cron", Status: "running", Result: "unknown",
-			Action: "move", StartedAt: 1783500001, User: "alice",
+			Version: 3, JobID: jobID, Type: "cron", Status: "running", Result: "unknown",
+			Action: "move", StartedAt: 1783500001, UserID: testAliceUserID,
 		})
 	})
 
@@ -74,8 +74,8 @@ func TestHistoryIndexerWatchesOnlyChangedJobFiles(t *testing.T) {
 	finishedAt := int64(1783500010)
 	waitForHistoryState(t, historyDB, jobID, "finished", func() {
 		writeJobDocumentAtomically(t, jobPath, indexedJobDocument{
-			Version: 2, JobID: jobID, Type: "cron", Status: "finished", Result: "found",
-			Action: "move", StartedAt: 1783500001, FinishedAt: &finishedAt, User: "alice",
+			Version: 3, JobID: jobID, Type: "cron", Status: "finished", Result: "found",
+			Action: "move", StartedAt: 1783500001, FinishedAt: &finishedAt, UserID: testAliceUserID,
 		})
 	})
 
@@ -98,8 +98,8 @@ func TestHistoryEventRefreshDoesNotTrustUnchangedMtime(t *testing.T) {
 	jobPath := filepath.Join(jobsDir, jobID+".json")
 	fixedTime := time.Unix(1783500002, 0)
 	writeJobDocumentAtomically(t, jobPath, indexedJobDocument{
-		Version: 2, JobID: jobID, Type: "cron", Status: "running", Result: "unknown",
-		Action: "warn", StartedAt: 1783500002, User: "alice",
+		Version: 3, JobID: jobID, Type: "cron", Status: "running", Result: "unknown",
+		Action: "warn", StartedAt: 1783500002, UserID: testAliceUserID,
 	})
 	if err := os.Chtimes(jobPath, fixedTime, fixedTime); err != nil {
 		t.Fatal(err)
@@ -110,8 +110,8 @@ func TestHistoryEventRefreshDoesNotTrustUnchangedMtime(t *testing.T) {
 
 	finishedAt := int64(1783500012)
 	writeJobDocumentAtomically(t, jobPath, indexedJobDocument{
-		Version: 2, JobID: jobID, Type: "cron", Status: "finished", Result: "clean",
-		Action: "warn", StartedAt: 1783500002, FinishedAt: &finishedAt, User: "alice",
+		Version: 3, JobID: jobID, Type: "cron", Status: "finished", Result: "clean",
+		Action: "warn", StartedAt: 1783500002, FinishedAt: &finishedAt, UserID: testAliceUserID,
 	})
 	if err := os.Chtimes(jobPath, fixedTime, fixedTime); err != nil {
 		t.Fatal(err)
@@ -159,12 +159,12 @@ func TestHistoryRefreshReconcilesBatchMtimes(t *testing.T) {
 	firstPath := filepath.Join(jobsDir, firstID+".json")
 	secondPath := filepath.Join(jobsDir, secondID+".json")
 	writeJobDocumentAtomically(t, firstPath, indexedJobDocument{
-		Version: 2, JobID: firstID, Type: "cron", Status: "running", Result: "unknown",
-		Action: "warn", StartedAt: 1783500003, User: "alice",
+		Version: 3, JobID: firstID, Type: "cron", Status: "running", Result: "unknown",
+		Action: "warn", StartedAt: 1783500003, UserID: testAliceUserID,
 	})
 	writeJobDocumentAtomically(t, secondPath, indexedJobDocument{
-		Version: 2, JobID: secondID, Type: "cron", Status: "finished", Result: "clean",
-		Action: "warn", StartedAt: 1783500004, User: "alice",
+		Version: 3, JobID: secondID, Type: "cron", Status: "finished", Result: "clean",
+		Action: "warn", StartedAt: 1783500004, UserID: testAliceUserID,
 	})
 	if err := indexer.refresh(t.Context()); err != nil {
 		t.Fatal(err)
@@ -172,8 +172,8 @@ func TestHistoryRefreshReconcilesBatchMtimes(t *testing.T) {
 
 	finishedAt := int64(1783500013)
 	writeJobDocumentAtomically(t, firstPath, indexedJobDocument{
-		Version: 2, JobID: firstID, Type: "cron", Status: "finished", Result: "found",
-		Action: "warn", StartedAt: 1783500003, FinishedAt: &finishedAt, User: "alice",
+		Version: 3, JobID: firstID, Type: "cron", Status: "finished", Result: "found",
+		Action: "warn", StartedAt: 1783500003, FinishedAt: &finishedAt, UserID: testAliceUserID,
 	})
 	changedTime := time.Unix(1783500014, 0)
 	if err := os.Chtimes(firstPath, changedTime, changedTime); err != nil {

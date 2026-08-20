@@ -44,8 +44,8 @@ split_cron_config_line() {
 
     if [ "$#" -lt 9 ]; then
         config_invalid "format" "$line_no" "$line"
-        config_log "[ERROR] Invalid line $line_no: expected 5 cron fields, scan target, action, owner and wake flag, got: $line"
-        config_log "[ERROR] Expected format: minute hour day month weekday scan_target action owner wake(Y/N)"
+        config_log "[ERROR] Invalid line $line_no: expected 5 cron fields, scan target, action, owner user ID and wake flag, got: $line"
+        config_log "[ERROR] Expected format: minute hour day month weekday scan_target action owner_user_id wake(Y/N)"
         config_log "[ERROR] scan_target may be quoted with double quotes if it contains spaces."
         config_log "[ERROR] Supported actions: warn, move, remove"
         return 1
@@ -98,7 +98,7 @@ split_cron_config_line() {
                 return 1
             fi
             CRON_ACTION="$1"
-            CRON_USER="$2"
+            CRON_USER_ID="$2"
             CRON_WAKE="$3"
             ;;
         *)
@@ -114,7 +114,7 @@ split_cron_config_line() {
             fi
             CRON_TARGET="$1"
             CRON_ACTION="$2"
-            CRON_USER="$3"
+            CRON_USER_ID="$3"
             CRON_WAKE="$4"
             ;;
     esac
@@ -134,17 +134,25 @@ split_cron_config_line() {
         return 1
     fi
 
-    case "$CRON_USER" in
-        ''|*[!A-Za-z0-9._-]*)
-            config_invalid "owner" "$line_no" "$CRON_USER"
+    case "$CRON_USER_ID" in
+        *[!a-z0-9]*)
+            config_invalid "owner" "$line_no" "$CRON_USER_ID"
             return 1
             ;;
     esac
 
-    if [ "${#CRON_USER}" -gt 64 ]; then
-        config_invalid "owner" "$line_no" "$CRON_USER"
+    if [ "${#CRON_USER_ID}" -ne 8 ]; then
+        config_invalid "owner" "$line_no" "$CRON_USER_ID"
         return 1
     fi
+    case "$CRON_USER_ID" in
+        *[a-z]*) ;;
+        *) config_invalid "owner" "$line_no" "$CRON_USER_ID"; return 1 ;;
+    esac
+    case "$CRON_USER_ID" in
+        *[0-9]*) ;;
+        *) config_invalid "owner" "$line_no" "$CRON_USER_ID"; return 1 ;;
+    esac
 
     case "$CRON_WAKE" in
         Y|N)

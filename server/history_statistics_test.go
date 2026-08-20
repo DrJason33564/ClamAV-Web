@@ -33,24 +33,24 @@ func TestReadHistoryStatisticsUsesLocalDaysAndUser(t *testing.T) {
 	location := time.FixedZone("UTC+8", 8*60*60)
 	now := time.Date(2026, 8, 5, 12, 30, 0, 0, location)
 
-	insert := func(id, username, result string, startedAt time.Time) {
+	insert := func(id, userID, result string, startedAt time.Time) {
 		t.Helper()
 		_, err := db.Exec(`INSERT INTO history_jobs
-(job_id,job_type,status,result,action,started_at,finished_at,user,json_file,file_mtime_ns,indexed_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?)`, id, "manual", "finished", result, "warn", startedAt.Unix(), startedAt.Unix(), username, "/state/jobs/"+id+".json", 1, now.Unix())
+(job_id,job_type,status,result,action,started_at,finished_at,user_id,json_file,file_mtime_ns,indexed_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?)`, id, "manual", "finished", result, "warn", startedAt.Unix(), startedAt.Unix(), userID, "/state/jobs/"+id+".json", 1, now.Unix())
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	insert("manual-1", "alice", "clean", time.Date(2026, 8, 3, 0, 0, 0, 0, location))
-	insert("manual-2", "alice", "found", time.Date(2026, 8, 3, 23, 59, 59, 0, location))
-	insert("manual-3", "alice", "error", time.Date(2026, 8, 5, 9, 0, 0, 0, location))
-	insert("manual-4", "alice", "unexpected", time.Date(2026, 8, 5, 10, 0, 0, 0, location))
-	insert("manual-5", "bob", "clean", time.Date(2026, 8, 5, 10, 0, 0, 0, location))
-	insert("manual-6", "alice", "clean", time.Date(2026, 8, 2, 23, 59, 59, 0, location))
-	insert("manual-7", "alice", "clean", time.Date(2026, 8, 5, 13, 0, 0, 0, location))
+	insert("manual-1", testAliceUserID, "clean", time.Date(2026, 8, 3, 0, 0, 0, 0, location))
+	insert("manual-2", testAliceUserID, "found", time.Date(2026, 8, 3, 23, 59, 59, 0, location))
+	insert("manual-3", testAliceUserID, "error", time.Date(2026, 8, 5, 9, 0, 0, 0, location))
+	insert("manual-4", testAliceUserID, "unexpected", time.Date(2026, 8, 5, 10, 0, 0, 0, location))
+	insert("manual-5", testBobUserID, "clean", time.Date(2026, 8, 5, 10, 0, 0, 0, location))
+	insert("manual-6", testAliceUserID, "clean", time.Date(2026, 8, 2, 23, 59, 59, 0, location))
+	insert("manual-7", testAliceUserID, "clean", time.Date(2026, 8, 5, 13, 0, 0, 0, location))
 
-	days, total, err := s.readHistoryStatistics(t.Context(), 3, "alice", now)
+	days, total, err := s.readHistoryStatistics(t.Context(), 3, testAliceUserID, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestHistoryStatisticsLookupStartsPendingAndIsUserBound(t *testing.T) {
 	}
 
 	request := httptest.NewRequest(http.MethodPost, "/api/results/statistics/lookups?scope=2", nil)
-	request = request.WithContext(context.WithValue(request.Context(), actorContextKey{}, actor{Username: "alice"}))
+	request = request.WithContext(context.WithValue(request.Context(), actorContextKey{}, actor{ID: testAliceUserID, Username: "alice"}))
 	response := httptest.NewRecorder()
 	s.handleHistoryStatisticsStart(response, request)
 	if response.Code != http.StatusAccepted {
@@ -96,7 +96,7 @@ func TestHistoryStatisticsLookupStartsPendingAndIsUserBound(t *testing.T) {
 
 	id := started["lookup_id"].(string)
 	poll := httptest.NewRequest(http.MethodGet, "/api/results/statistics/lookups/"+id, nil)
-	poll = poll.WithContext(context.WithValue(poll.Context(), actorContextKey{}, actor{Username: "bob"}))
+	poll = poll.WithContext(context.WithValue(poll.Context(), actorContextKey{}, actor{ID: testBobUserID, Username: "bob"}))
 	pollResponse := httptest.NewRecorder()
 	s.handleHistoryStatisticsLookup(pollResponse, poll)
 	if pollResponse.Code != http.StatusNotFound {

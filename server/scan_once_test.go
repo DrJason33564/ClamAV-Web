@@ -56,14 +56,14 @@ func TestCronScanSleepHandling(t *testing.T) {
 			if result.job["status"] != test.wantStatus {
 				t.Fatalf("expected job status %q, got %#v", test.wantStatus, result.job["status"])
 			}
-			if result.job["version"] != float64(2) || result.job["user"] != "alice" {
-				t.Fatalf("expected version 2 job owned by alice, got %#v", result.job)
+			if result.job["version"] != float64(3) || result.job["user_id"] != testAliceUserID {
+				t.Fatalf("expected version 3 job owned by %s, got %#v", testAliceUserID, result.job)
 			}
 			if _, ok := result.job["started_at"].(float64); !ok {
 				t.Fatalf("started_at must be a Unix timestamp number, got %#v", result.job["started_at"])
 			}
 			for _, field := range []string{
-				"version", "job_id", "type", "user", "status", "target", "action", "pid",
+				"version", "job_id", "type", "user_id", "status", "target", "action", "pid",
 				"started_at", "finished_at", "exit_code", "result", "log_file",
 				"detection_log", "message",
 			} {
@@ -95,7 +95,7 @@ func TestCronScanSleepHandling(t *testing.T) {
 
 func TestManualScanRejectsWakeFlag(t *testing.T) {
 	script := repositoryScript(t, "scan_once.sh")
-	cmd := exec.Command(script, "--type", "manual", "-u", "alice", "--target", "/missing", "--action", "warn", "--wake")
+	cmd := exec.Command(script, "--type", "manual", "-u", testAliceUserID, "--target", "/missing", "--action", "warn", "--wake")
 	cmd.Env = append(os.Environ(), "LOG_SCRIPT="+repositoryScript(t, "log.sh"))
 	err := cmd.Run()
 	var exitErr *exec.ExitError
@@ -121,9 +121,9 @@ func TestMoveActionAllocatesNamesAcrossScansAndOwners(t *testing.T) {
 	for _, scan := range []struct {
 		owner, source, quarantined string
 	}{
-		{"alice", first, "same.dat"},
-		{"bob", second, "same.dat.001"},
-		{"alice", reserved, "report.rec.001"},
+		{testAliceUserID, first, "same.dat"},
+		{testBobUserID, second, "same.dat.001"},
+		{testAliceUserID, reserved, "report.rec.001"},
 	} {
 		result := fixture.run(t, scan.owner, []string{scan.source})
 		if result.exitCode != 0 || result.job["status"] != "finished" || result.job["result"] != "found" {
@@ -156,7 +156,7 @@ func TestMoveActionContinuesAfterFileFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := fixture.run(t, "alice", []string{missing, good})
+	result := fixture.run(t, testAliceUserID, []string{missing, good})
 	if result.exitCode != 74 {
 		t.Fatalf("expected action failure exit 74, got %d; log=%s", result.exitCode, result.log)
 	}
@@ -196,7 +196,7 @@ func TestMoveActionFallsBackAndCleansFailedCopies(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			result := fixture.run(t, "alice", []string{source})
+			result := fixture.run(t, testAliceUserID, []string{source})
 			if result.exitCode != 0 {
 				t.Fatalf("fallback scan failed: exit=%d job=%#v log=%s", result.exitCode, result.job, result.log)
 			}
@@ -236,7 +236,7 @@ exec %q "$@"
 		t.Fatal(err)
 	}
 
-	result := fixture.run(t, "alice", []string{source})
+	result := fixture.run(t, testAliceUserID, []string{source})
 	if result.exitCode != 74 || result.job["status"] != "failed" {
 		t.Fatalf("expected immediate cleanup failure: exit=%d job=%#v log=%s", result.exitCode, result.job, result.log)
 	}
@@ -275,7 +275,7 @@ exec %q "$@"
 		t.Fatal(err)
 	}
 
-	result := fixture.run(t, "alice", []string{source})
+	result := fixture.run(t, testAliceUserID, []string{source})
 	if result.exitCode != 74 || result.job["status"] != "failed" || result.job["result"] != "error" {
 		t.Fatalf("expected metadata publish failure: exit=%d job=%#v log=%s", result.exitCode, result.job, result.log)
 	}
@@ -303,7 +303,7 @@ func TestMoveActionRejectsSuffixWhenRecordNameExceedsNameMax(t *testing.T) {
 	if err := os.WriteFile(existing, []byte("existing"), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(existing+".rec", []byte(`"/scan/existing" alice`+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(existing+".rec", []byte(`"/scan/existing" alice001`+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	source := filepath.Join(fixture.scanDir, longName)
@@ -311,7 +311,7 @@ func TestMoveActionRejectsSuffixWhenRecordNameExceedsNameMax(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := fixture.run(t, "alice", []string{source})
+	result := fixture.run(t, testAliceUserID, []string{source})
 	if result.exitCode != 74 || result.job["status"] != "failed" || result.job["result"] != "error" {
 		t.Fatalf("expected filename length failure: exit=%d job=%#v log=%s", result.exitCode, result.job, result.log)
 	}
@@ -520,7 +520,7 @@ func runCronScanFixture(t *testing.T, wake bool, wakeSucceeds bool) cronScanFixt
 	script := repositoryScript(t, "scan_once.sh")
 	logScript := repositoryScript(t, "log.sh")
 	missingTarget := filepath.Join(tmp, "missing-target")
-	args := []string{"--type", "cron", "-u", "alice", "--target", missingTarget, "--action", "warn"}
+	args := []string{"--type", "cron", "-u", testAliceUserID, "--target", missingTarget, "--action", "warn"}
 	if wake {
 		args = append(args, "--wake")
 	}

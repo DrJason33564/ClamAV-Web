@@ -79,7 +79,7 @@ func (s *server) patchAdminUser(w http.ResponseWriter, r *http.Request, who acto
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	var id int64
+	var id string
 	var role, status, timeDockAccount string
 	timeDockAccountChanged := false
 	var password sql.NullString
@@ -147,7 +147,7 @@ func (s *server) patchAdminUser(w http.ResponseWriter, r *http.Request, who acto
 	}
 	if status == "disabled" {
 		// Disabled accounts must not retain unattended scheduled execution.
-		if err := s.disableCronRulesForUser(username); err != nil {
+		if err := s.disableCronRulesForUser(id); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -155,7 +155,7 @@ func (s *server) patchAdminUser(w http.ResponseWriter, r *http.Request, who acto
 	if s.cfg.IsTimeDock && timeDockAccountChanged && status != "disabled" {
 		// Existing cron targets may belong to the previous TimeDock account.
 		// Disable them until the owner reviews and explicitly re-enables them.
-		if err := s.disableCronRulesForUser(username); err != nil {
+		if err := s.disableCronRulesForUser(id); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}

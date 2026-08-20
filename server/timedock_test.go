@@ -50,12 +50,12 @@ func TestNormalizeTimeDockAccount(t *testing.T) {
 func TestUserSchemaAndAdminTimeDockAccount(t *testing.T) {
 	s := newDatabaseTestServer(t)
 	now := time.Now().Unix()
-	if _, err := s.userDB.Exec(`INSERT INTO users(username,password_hash,role,created_at,updated_at) VALUES('alice',NULL,'admin',?,?)`, now, now); err != nil {
+	if _, err := s.userDB.Exec(`INSERT INTO users(id,username,password_hash,role,created_at,updated_at) VALUES(?,'alice',NULL,'admin',?,?)`, testAliceUserID, now, now); err != nil {
 		t.Fatal(err)
 	}
 
 	req := httptest.NewRequest(http.MethodPatch, "/api/admin/users/alice", strings.NewReader(`{"timedock_account":"杰森30"}`))
-	req = req.WithContext(context.WithValue(req.Context(), actorContextKey{}, actor{ID: 1, Username: "alice", Role: "admin"}))
+	req = req.WithContext(context.WithValue(req.Context(), actorContextKey{}, actor{ID: testAliceUserID, Username: "alice", Role: "admin"}))
 	response := httptest.NewRecorder()
 	s.handleAdminUser(response, req)
 	if response.Code != http.StatusOK {
@@ -67,7 +67,7 @@ func TestUserSchemaAndAdminTimeDockAccount(t *testing.T) {
 	}
 
 	listReq := httptest.NewRequest(http.MethodGet, "/api/admin/users", nil)
-	listReq = listReq.WithContext(context.WithValue(listReq.Context(), actorContextKey{}, actor{Username: "alice", Role: "admin"}))
+	listReq = listReq.WithContext(context.WithValue(listReq.Context(), actorContextKey{}, actor{ID: testAliceUserID, Username: "alice", Role: "admin"}))
 	listResponse := httptest.NewRecorder()
 	s.handleAdminUsers(listResponse, listReq)
 	if !strings.Contains(listResponse.Body.String(), `"timedock_account":"杰森30"`) || strings.Contains(listResponse.Body.String(), "allowed_dirs") {
@@ -140,7 +140,7 @@ func TestTimeDockBrowseKeepsDeviceLevelAndFiltersAccounts(t *testing.T) {
 	}
 
 	missing := httptest.NewRequest(http.MethodGet, "/api/browse?path="+root, nil)
-	missing = missing.WithContext(context.WithValue(missing.Context(), actorContextKey{}, actor{Username: "alice"}))
+	missing = missing.WithContext(context.WithValue(missing.Context(), actorContextKey{}, actor{ID: testAliceUserID, Username: "alice"}))
 	missingResponse := httptest.NewRecorder()
 	s.handleBrowse(missingResponse, missing)
 	if missingResponse.Code != http.StatusBadRequest || !strings.Contains(missingResponse.Body.String(), "Please set your TimeDock account") {

@@ -36,7 +36,7 @@ curl -b cookie.txt http://localhost:8080/api/status
 
 ### 1.2 用户隔离
 
-扫描队列、cron、白名单、历史任务、任务日志、异步 lookup 和隔离区都按登录用户名隔离。admin 调用普通业务 API 时也只能操作自己的数据。
+扫描队列、cron、白名单、历史任务、任务日志、异步 lookup 和隔离区都按用户数据库中的不可变 `users.id` 隔离。用户名只用于登录、显示和日志；删除账户后重新创建同名账户会获得新的 ID，因此不会继承旧账户残留资产。admin 调用普通业务 API 时也只能操作自己的数据。
 
 admin 额外拥有的权限仅包括：
 
@@ -72,6 +72,7 @@ admin 额外拥有的权限仅包括：
 ### 1.4 用户名、时间和路径
 
 - 用户名格式：`[A-Za-z0-9._-]{1,64}`；
+- 用户 ID 由后端生成，为同时包含小写字母和数字的 8 位 `[a-z0-9]` 字符串，不作为登录凭证；
 - 任务 JSON 的时间为 Unix 秒时间戳；
 - API 中 Go 运行时对象的时间仍可能使用 RFC3339；
 - 文件浏览、手动扫描、cron 和白名单路径限制在 `/scan`；
@@ -426,7 +427,7 @@ sleep/wake 均为幂等操作。
 
 - `action`：`warn`、`move` 或 `remove`，默认 `warn`；
 - `wait` 只为兼容旧请求保留；
-- owner 从登录 Cookie 获得，客户端不能指定。
+- owner ID 从登录 Cookie 对应的用户记录获得，客户端不能指定。
 
 TimeDock 模式下，每个 `targets` 路径都必须位于当前用户匹配到的账户目录内；直接构造请求不能绕过文件浏览器的目录限制。
 
@@ -484,16 +485,16 @@ ClamAV 扫描全局串行。每次选择下一任务时：
 
 只能取消当前用户尚未开始的任务。
 
-### 任务文件 version 2
+### 任务文件 version 3
 
 `scan_once.sh` 生成：
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "job_id": "manual-1783433000",
   "type": "manual",
-  "user": "alice",
+  "user_id": "a1b2c3d4",
   "status": "finished",
   "target": "/scan/docs",
   "action": "warn",
@@ -510,21 +511,21 @@ ClamAV 扫描全局串行。每次选择下一任务时：
 cron 配置实际结构：
 
 ```text
-分钟 小时 日期 月份 星期 "扫描路径" action owner wake
+分钟 小时 日期 月份 星期 "扫描路径" action owner_user_id wake
 ```
 
 例如：
 
 ```text
-30 3 * * * /scan warn alice N
-0 */6 * * * "/scan/Team A" move alice Y
+30 3 * * * /scan warn a1b2c3d4 N
+0 */6 * * * "/scan/Team A" move a1b2c3d4 Y
 ```
 
 `wake` 只能为 `Y` 或 `N`。`Y` 表示执行该规则时向 `scan_once.sh` 附加 `--wake`，在扫描前唤醒睡眠状态的 ClamAV；`N` 表示不主动唤醒。
 
 ### `GET /api/cron/rules`
 
-只返回当前用户规则。owner 不由 API 输出，也不能由客户端修改。响应中的 `wake` 为布尔值。
+只返回当前用户 ID 所属规则。owner ID 不由 API 输出，也不能由客户端修改。响应中的 `wake` 为布尔值。
 
 ### `POST /api/cron/rules`
 
@@ -542,7 +543,7 @@ cron 配置实际结构：
 }
 ```
 
-后端生成规则 ID，并强制将当前用户名写入 owner。`wake` 为 `true` 时规则文件写入 `Y`，为 `false` 时写入 `N`。
+后端生成规则 ID，并强制将当前 `users.id` 写入 owner 字段。`wake` 为 `true` 时规则文件写入 `Y`，为 `false` 时写入 `N`。
 
 TimeDock 模式下，新增、完整更新和重新启用规则时都会校验 `target` 位于当前用户账户目录内。
 
@@ -569,7 +570,7 @@ TimeDock 模式下，新增、完整更新和重新启用规则时都会校验 `
 `/config/exclude.conf` 每行格式：
 
 ```text
-"路径" owner
+"路径" owner_user_id
 ```
 
 ### `GET /api/whitelist`
@@ -582,7 +583,7 @@ TimeDock 模式下，新增、完整更新和重新启用规则时都会校验 `
 {"path":"/scan/trusted file.dat"}
 ```
 
-后端写入当前用户名，然后重新生成 SHA-256 allow-list 并让 ClamAV reload。
+后端写入当前 `users.id`，然后重新生成 SHA-256 allow-list 并让 ClamAV reload。
 
 TimeDock 模式下，新增和删除请求中的路径都必须位于当前用户账户目录内。
 
@@ -596,9 +597,9 @@ TimeDock 模式下，新增和删除请求中的路径都必须位于当前用�
 
 ## 10. 历史任务与 SQLite 索引
 
-服务启动时扫描一次 `/state/jobs`，运行期间监听任务 JSON 的新增、替换、修改和删除并进行单文件增量索引；`HISTORY_INDEX_REFRESH_INTERVAL` 控制周期完整刷新，作为文件事件丢失或监听不可用时的兜底。只接受 version 2 JSON，version 1、旧文件名和无 owner 文件不会进入索引。
+服务启动时扫描一次 `/state/jobs`，运行期间监听任务 JSON 的新增、替换、修改和删除并进行单文件增量索引；`HISTORY_INDEX_REFRESH_INTERVAL` 控制周期完整刷新，作为文件事件丢失或监听不可用时的兜底。只接受包含合法 `user_id` 的 version 3 JSON，其他版本、旧文件名和无 owner ID 文件不会进入索引。
 
-周期完整刷新会批量读取已索引文件的 mtime，并在内存中完成比对；mtime 未变化时不会重复解析 JSON。文件事件触发的增量索引不依赖 mtime，以免同一时间粒度内的连续原子替换被跳过。文件删除、损坏或变成非 version 2 后，相应索引会被删除。
+周期完整刷新会批量读取已索引文件的 mtime，并在内存中完成比对；mtime 未变化时不会重复解析 JSON。文件事件触发的增量索引不依赖 mtime，以免同一时间粒度内的连续原子替换被跳过。文件删除、损坏或变成非 version 3 后，相应索引会被删除。
 
 ### `POST /api/results/lookups?scope=1-20`
 
@@ -629,7 +630,7 @@ TimeDock 模式下，新增和删除请求中的路径都必须位于当前用�
 }
 ```
 
-列表、总数、排序和分页均由 SQLite 完成，并始终包含 owner 条件。
+列表、总数、排序和分页均由 SQLite 完成，并始终包含 `user_id` 条件。
 
 响应字段及可能值：
 
@@ -744,7 +745,7 @@ lookup。
 隔离元数据格式：
 
 ```text
-"原始路径" owner
+"原始路径" owner_user_id
 ```
 
 旧单字段 `.rec` 不会被列出或自动归属。
@@ -769,11 +770,11 @@ lookup。
 
 ### `DELETE /api/quarantine/delete/{filename}`
 
-也接受 POST。只有 `.rec` owner 为当前用户时才删除隔离文件和元数据。
+也接受 POST。只有 `.rec` owner ID 与当前 `users.id` 一致时才删除隔离文件和元数据。
 
 ### `POST /api/quarantine/recover/{filename}`
 
-恢复前验证 owner。TimeDock 模式下，元数据中的原路径还必须位于用户当前绑定的账户目录内；即使文件来自该用户此前绑定的账户目录，也不会恢复到当前授权范围之外。原路径已经存在时拒绝覆盖；跨文件系统时使用复制、保留权限、删除隔离文件的回退流程。
+恢复前验证 owner ID。TimeDock 模式下，元数据中的原路径还必须位于用户当前绑定的账户目录内；即使文件来自该用户此前绑定的账户目录，也不会恢复到当前授权范围之外。原路径已经存在时拒绝覆盖；跨文件系统时使用复制、保留权限、删除隔离文件的回退流程。
 
 ### `POST /api/quarantine/clean`
 
@@ -788,10 +789,12 @@ lookup。
 | `/config/clamavweb.conf` | 服务端配置 |
 | `/config/cron_scan.conf` | 所有用户 cron 规则 |
 | `/config/exclude.conf` | 所有用户白名单条目 |
-| `/state/jobs/*.json` | version 2 任务事实文件 |
+| `/state/jobs/*.json` | version 3 任务事实文件 |
 | `/log/*.log` | 扫描和检出日志 |
 | `/quarantine/*` | 隔离文件及 owner 元数据 |
 
-`/data`、`/config`、`/state`、`/log` 和 `/quarantine` 都应持久化。`USER_DATABASE_FILE` 和 `HISTORY_DATABASE_FILE` 可分别覆盖两个数据库路径。历史索引库可以从 version 2 JSON 重建，但用户和 session 只能从用户库恢复。
+`/data`、`/config`、`/state`、`/log` 和 `/quarantine` 都应持久化。`USER_DATABASE_FILE` 和 `HISTORY_DATABASE_FILE` 可分别覆盖两个数据库路径。历史索引库可以从 version 3 JSON 重建，但用户和 session 只能从用户库恢复。用户 ID 是其他资产的所有权依据，因此重建 `users.db` 时必须同时清理 cron、白名单、任务状态和隔离区资产。
+
+当前用户 ID 与资产格式不兼容早期的“用户名 owner / version 2 任务”开发数据。检测到旧 `users.db` 或 `history.db` schema 时服务会拒绝启动并提示重建；升级开发环境时应同时清理旧用户库、历史库、cron 规则、白名单、任务 JSON 和隔离区数据，不进行自动归属迁移。
 
 `clamavweb.conf` 的全部字段、默认值和校验规则见 [`server_conf.md`](server_conf.md)。

@@ -20,7 +20,7 @@ type quarantineLookup struct {
 	Error     string              `json:"error,omitempty"`
 	StartedAt time.Time           `json:"started_at"`
 	UpdatedAt time.Time           `json:"updated_at"`
-	User      string              `json:"-"`
+	UserID    string              `json:"-"`
 }
 
 type quarantineSubject struct {
@@ -50,7 +50,7 @@ func (s *server) handleQuarantineLookupStart(w http.ResponseWriter, r *http.Requ
 		UpdatedAt: time.Now(),
 	}
 	who, _ := actorFromRequest(r)
-	lookup.User = who.Username
+	lookup.UserID = who.ID
 	s.quarantineMu.Lock()
 	s.cleanupQuarantineLookupsLocked(time.Now().Add(-15 * time.Minute))
 	s.quarantineLookups[lookup.ID] = lookup
@@ -84,7 +84,7 @@ func (s *server) handleQuarantineLookup(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	who, _ := actorFromRequest(r)
-	if lookup.User != who.Username {
+	if lookup.UserID != who.ID {
 		s.quarantineMu.RUnlock()
 		http.NotFound(w, r)
 		return
@@ -112,9 +112,9 @@ func (s *server) runQuarantineLookup(id string) {
 		s.quarantineMu.RUnlock()
 		return
 	}
-	username := lookup.User
+	userID := lookup.UserID
 	s.quarantineMu.RUnlock()
-	subjects, err := s.readQuarantineSubjects(username)
+	subjects, err := s.readQuarantineSubjects(userID)
 	s.quarantineMu.Lock()
 	defer s.quarantineMu.Unlock()
 	lookup, ok = s.quarantineLookups[id]
@@ -125,18 +125,18 @@ func (s *server) runQuarantineLookup(id string) {
 	if err != nil {
 		lookup.Status = "failed"
 		lookup.Error = err.Error()
-		s.error("quarantine", "quarantine lookup failed", "lookup_id", id, "user", username, "error", err)
+		s.error("quarantine", "quarantine lookup failed", "lookup_id", id, "user_id", userID, "error", err)
 		return
 	}
 	lookup.Status = "success"
 	lookup.Subjects = subjects
-	s.debug("quarantine", "quarantine lookup completed", "lookup_id", id, "user", username, "subjects", len(subjects))
+	s.debug("quarantine", "quarantine lookup completed", "lookup_id", id, "user_id", userID, "subjects", len(subjects))
 }
 
-func (s *server) readQuarantineSubjects(usernames ...string) ([]quarantineSubject, error) {
-	username := ""
-	if len(usernames) > 0 {
-		username = usernames[0]
+func (s *server) readQuarantineSubjects(userIDs ...string) ([]quarantineSubject, error) {
+	userID := ""
+	if len(userIDs) > 0 {
+		userID = userIDs[0]
 	}
 	entries, err := os.ReadDir(s.cfg.QuarantineDir)
 	if err != nil {
@@ -156,7 +156,7 @@ func (s *server) readQuarantineSubjects(usernames ...string) ([]quarantineSubjec
 			// invisible rather than being assigned to an administrator.
 			continue
 		}
-		if username != "" && owner != username {
+		if userID != "" && owner != userID {
 			continue
 		}
 		subjects = append(subjects, quarantineSubject{
@@ -186,7 +186,7 @@ func (s *server) handleQuarantineDelete(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	who, _ := actorFromRequest(r)
-	if err := s.deleteQuarantineSubject(name, who.Username); err != nil {
+	if err := s.deleteQuarantineSubject(name, who.ID); err != nil {
 		s.warn("quarantine", "quarantine subject deletion failed", "name", name, "user", who.Username, "error", err)
 		status := http.StatusInternalServerError
 		if errors.Is(err, os.ErrNotExist) {
@@ -240,14 +240,14 @@ func quarantineNameFromPath(path string, prefix string) (string, error) {
 	return name, nil
 }
 
-func (s *server) deleteQuarantineSubject(name string, usernames ...string) error {
-	username := ""
-	if len(usernames) > 0 {
-		username = usernames[0]
+func (s *server) deleteQuarantineSubject(name string, userIDs ...string) error {
+	userID := ""
+	if len(userIDs) > 0 {
+		userID = userIDs[0]
 	}
 	target := filepath.Join(s.cfg.QuarantineDir, name)
 	_, owner, err := readQuarantineRecord(target + ".rec")
-	if err != nil || (username != "" && owner != username) {
+	if err != nil || (userID != "" && owner != userID) {
 		return os.ErrNotExist
 	}
 	if err := os.Remove(target); err != nil {
@@ -265,14 +265,14 @@ func (s *server) recoverQuarantineSubject(name string, actors ...actor) error {
 	if len(actors) > 0 {
 		who = actors[0]
 	}
-	username := who.Username
+	userID := who.ID
 	quarantined := filepath.Join(s.cfg.QuarantineDir, name)
 	recPath := quarantined + ".rec"
 	sourceFile, owner, err := readQuarantineRecord(recPath)
 	if err != nil {
 		return err
 	}
-	if username != "" && owner != username {
+	if userID != "" && owner != userID {
 		return os.ErrNotExist
 	}
 	if sourceFile == "" {
@@ -387,7 +387,7 @@ func parseQuotedRecord(value string) (string, string, error) {
 		return "", "", errors.New("invalid quarantine record")
 	}
 	ownerFields := strings.Fields(rest[end+1:])
-	if len(ownerFields) != 1 || !usernamePattern.MatchString(ownerFields[0]) {
+	if len(ownerFields) != 1 || !validUserID(ownerFields[0]) {
 		return "", "", errors.New("invalid quarantine record owner")
 	}
 	return rest[:end], ownerFields[0], nil

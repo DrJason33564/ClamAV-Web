@@ -14,7 +14,7 @@ func TestCronScriptRendersWakeFlag(t *testing.T) {
 	cronFile := filepath.Join(tmp, "clamav-scheduled-scan")
 	rules := strings.Join([]string{
 		`15 2 * * 0 "/scan/My Folder" remove admin Y`,
-		`30 3 * * * /scan warn alice N`,
+		`30 3 * * * /scan warn alice001 N`,
 	}, "\n") + "\n"
 	if err := os.WriteFile(configFile, []byte(rules), 0o600); err != nil {
 		t.Fatal(err)
@@ -57,7 +57,7 @@ func TestCronScriptRendersWakeFlag(t *testing.T) {
 func TestCronConfigRejectsInvalidWakeFlag(t *testing.T) {
 	tmp := t.TempDir()
 	configFile := filepath.Join(tmp, "cron_scan.conf")
-	if err := os.WriteFile(configFile, []byte("0 1 * * * /scan warn alice X\n"), 0o600); err != nil {
+	if err := os.WriteFile(configFile, []byte("0 1 * * * /scan warn alice001 X\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 

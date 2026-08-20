@@ -29,6 +29,12 @@ func TestUserAndHistorySchemasAreSeparated(t *testing.T) {
 	if !sqliteTableExists(t, historyDB, "history_jobs") || sqliteTableExists(t, userDB, "history_jobs") {
 		t.Fatal("expected history_jobs to exist only in the history database")
 	}
+	for name, db := range map[string]*sql.DB{"user": userDB, "history": historyDB} {
+		var version int
+		if err := db.QueryRow("SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil || version != 2 {
+			t.Fatalf("unexpected %s database schema version: %d err=%v", name, version, err)
+		}
+	}
 }
 
 func TestLoadConfigUsesSeparateDatabaseFiles(t *testing.T) {
@@ -52,14 +58,11 @@ func TestLoadConfigUsesSeparateDatabaseFiles(t *testing.T) {
 func TestCleanDeleteUserAcrossSeparatedDatabases(t *testing.T) {
 	s := newDatabaseTestServer(t)
 	now := time.Now().Unix()
-	result, err := s.userDB.Exec(`INSERT INTO users(username,password_hash,role,created_at,updated_at) VALUES('bob',NULL,'user',?,?)`, now, now)
+	_, err := s.userDB.Exec(`INSERT INTO users(id,username,password_hash,role,created_at,updated_at) VALUES(?,'bob',NULL,'user',?,?)`, testBobUserID, now, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := result.LastInsertId(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.historyDB.Exec(`INSERT INTO history_jobs(job_id,job_type,status,result,action,started_at,finished_at,user,json_file,file_mtime_ns,indexed_at) VALUES('manual-1783433000','manual','finished','clean','warn',1783433000,1783433010,'bob','/state/jobs/manual-1783433000.json',1,?)`, now); err != nil {
+	if _, err := s.historyDB.Exec(`INSERT INTO history_jobs(job_id,job_type,status,result,action,started_at,finished_at,user_id,json_file,file_mtime_ns,indexed_at) VALUES('manual-1783433000','manual','finished','clean','warn',1783433000,1783433010,?,'/state/jobs/manual-1783433000.json',1,?)`, testBobUserID, now); err != nil {
 		t.Fatal(err)
 	}
 	// Keep this test focused on cross-database cleanup. The history indexer's
@@ -72,7 +75,7 @@ func TestCleanDeleteUserAcrossSeparatedDatabases(t *testing.T) {
 	if err := s.userDB.QueryRow("SELECT COUNT(*) FROM users WHERE username='bob'").Scan(&count); err != nil || count != 0 {
 		t.Fatalf("user was not removed: count=%d err=%v", count, err)
 	}
-	if err := s.historyDB.QueryRow("SELECT COUNT(*) FROM history_jobs WHERE user='bob'").Scan(&count); err != nil || count != 0 {
+	if err := s.historyDB.QueryRow("SELECT COUNT(*) FROM history_jobs WHERE user_id=?", testBobUserID).Scan(&count); err != nil || count != 0 {
 		t.Fatalf("history index was not removed: count=%d err=%v", count, err)
 	}
 }

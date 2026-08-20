@@ -34,7 +34,7 @@ const (
 var usernamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
 type actor struct {
-	ID              int64
+	ID              string
 	Username        string
 	Role            string
 	TimeDockAccount string
@@ -122,7 +122,7 @@ func sameOriginRequest(r *http.Request) bool {
 
 func actorFromRequest(r *http.Request) (actor, error) {
 	who, ok := r.Context().Value(actorContextKey{}).(actor)
-	if !ok || who.Username == "" {
+	if !ok || who.Username == "" || !validUserID(who.ID) {
 		return actor{}, errors.New("authenticated user is unavailable")
 	}
 	return who, nil
@@ -254,8 +254,35 @@ func (s *server) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().Unix()
-	if _, err := tx.ExecContext(r.Context(), `INSERT INTO users(username,password_hash,role,timedock_account,created_at,updated_at) VALUES(?,?,?,?,?,?)`, req.Username, encoded, role, timeDockAccount, now, now); err != nil {
+	var usernameExists int
+	if err := tx.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM users WHERE username=?", req.Username).Scan(&usernameExists); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if usernameExists != 0 {
 		writeError(w, http.StatusConflict, errors.New("username already exists"))
+		return
+	}
+	userID := ""
+	for attempt := 0; attempt < 32; attempt++ {
+		userID, err = newUserID()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if _, err = tx.ExecContext(r.Context(), `INSERT INTO users(id,username,password_hash,role,timedock_account,created_at,updated_at) VALUES(?,?,?,?,?,?,?)`, userID, req.Username, encoded, role, timeDockAccount, now, now); err == nil {
+			break
+		}
+		// A generated ID collision is harmless: retry with fresh cryptographic
+		// randomness. Other constraint or database errors must not be hidden.
+		var idExists int
+		if queryErr := tx.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM users WHERE id=?", userID).Scan(&idExists); queryErr != nil || idExists == 0 {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, errors.New("could not allocate a unique user id"))
 		return
 	}
 	if err := tx.Commit(); err != nil {
@@ -290,7 +317,7 @@ func (s *server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Username = strings.TrimSpace(req.Username)
-	var id int64
+	var id string
 	var username, role, status string
 	var passwordHash sql.NullString
 	err := s.userDB.QueryRowContext(r.Context(), "SELECT id,username,password_hash,role,status FROM users WHERE username=?", req.Username).Scan(&id, &username, &passwordHash, &role, &status)
@@ -455,6 +482,56 @@ func verifyPassword(password, encoded string) bool {
 }
 
 var dummyPasswordHash, _ = hashPassword("clamavweb-dummy-password")
+
+const userIDAlphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+// newUserID returns a compact, non-secret asset owner identifier. Requiring
+// both character classes keeps generated IDs visually distinct from database
+// row numbers while the primary-key constraint handles the unlikely collision.
+func newUserID() (string, error) {
+	for {
+		generated := make([]byte, 8)
+		var hasLetter, hasDigit bool
+		for i := range generated {
+			for {
+				var random [1]byte
+				if _, err := rand.Read(random[:]); err != nil {
+					return "", err
+				}
+				// 252 is the largest multiple of 36 below 256. Rejecting the
+				// remaining values avoids modulo bias in the base-36 alphabet.
+				if random[0] >= 252 {
+					continue
+				}
+				generated[i] = userIDAlphabet[int(random[0])%len(userIDAlphabet)]
+				break
+			}
+			hasLetter = hasLetter || generated[i] >= 'a' && generated[i] <= 'z'
+			hasDigit = hasDigit || generated[i] >= '0' && generated[i] <= '9'
+		}
+		if hasLetter && hasDigit {
+			return string(generated), nil
+		}
+	}
+}
+
+func validUserID(value string) bool {
+	if len(value) != 8 {
+		return false
+	}
+	var hasLetter, hasDigit bool
+	for _, ch := range value {
+		switch {
+		case ch >= 'a' && ch <= 'z':
+			hasLetter = true
+		case ch >= '0' && ch <= '9':
+			hasDigit = true
+		default:
+			return false
+		}
+	}
+	return hasLetter && hasDigit
+}
 
 func validAdminRegisterToken(provided, configured string) bool {
 	if configured == "" || provided == "" {

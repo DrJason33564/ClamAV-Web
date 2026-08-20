@@ -30,7 +30,7 @@ type historyStatisticsLookup struct {
 	Error     string                          `json:"error,omitempty"`
 	StartedAt time.Time                       `json:"started_at"`
 	UpdatedAt time.Time                       `json:"updated_at"`
-	User      string                          `json:"-"`
+	UserID    string                          `json:"-"`
 }
 
 func (s *server) handleHistoryStatisticsStart(w http.ResponseWriter, r *http.Request) {
@@ -51,7 +51,7 @@ func (s *server) handleHistoryStatisticsStart(w http.ResponseWriter, r *http.Req
 		Scope:     scope,
 		StartedAt: now,
 		UpdatedAt: now,
-		User:      who.Username,
+		UserID:    who.ID,
 	}
 
 	s.historyStatisticsMu.Lock()
@@ -88,7 +88,7 @@ func (s *server) handleHistoryStatisticsLookup(w http.ResponseWriter, r *http.Re
 		return
 	}
 	who, _ := actorFromRequest(r)
-	if lookup.User != who.Username {
+	if lookup.UserID != who.ID {
 		s.historyStatisticsMu.RUnlock()
 		http.NotFound(w, r)
 		return
@@ -120,7 +120,7 @@ func (s *server) runHistoryStatisticsLookup(id string) {
 		s.historyStatisticsMu.RUnlock()
 		return
 	}
-	scope, username := lookup.Scope, lookup.User
+	scope, userID := lookup.Scope, lookup.UserID
 	// Keep the requested calendar window stable even if the worker starts near
 	// a local-midnight boundary.
 	asOf := lookup.StartedAt.In(time.Local)
@@ -128,7 +128,7 @@ func (s *server) runHistoryStatisticsLookup(id string) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), historyStatisticsTimeout)
 	defer cancel()
-	days, total, err := s.readHistoryStatistics(ctx, scope, username, asOf)
+	days, total, err := s.readHistoryStatistics(ctx, scope, userID, asOf)
 
 	s.historyStatisticsMu.Lock()
 	defer s.historyStatisticsMu.Unlock()
@@ -140,13 +140,13 @@ func (s *server) runHistoryStatisticsLookup(id string) {
 	if err != nil {
 		lookup.Status = "failed"
 		lookup.Error = err.Error()
-		s.error("history_statistics", "history statistics lookup failed", "lookup_id", id, "user", username, "error", err)
+		s.error("history_statistics", "history statistics lookup failed", "lookup_id", id, "user_id", userID, "error", err)
 		return
 	}
 	lookup.Status = "success"
 	lookup.Days = days
 	lookup.Total = total
-	s.debug("history_statistics", "history statistics lookup completed", "lookup_id", id, "user", username, "scope_days", scope, "total", total)
+	s.debug("history_statistics", "history statistics lookup completed", "lookup_id", id, "user_id", userID, "scope_days", scope, "total", total)
 }
 
 func parseHistoryStatisticsScope(text string) (int, error) {
@@ -161,7 +161,7 @@ func parseHistoryStatisticsScope(text string) (int, error) {
 	return scope, nil
 }
 
-func (s *server) readHistoryStatistics(ctx context.Context, scope int, username string, now time.Time) (map[string]historyStatisticsDay, int, error) {
+func (s *server) readHistoryStatistics(ctx context.Context, scope int, userID string, now time.Time) (map[string]historyStatisticsDay, int, error) {
 	location := now.Location()
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, location)
 	firstDay := today.AddDate(0, 0, -(scope - 1))
@@ -181,8 +181,8 @@ func (s *server) readHistoryStatistics(ctx context.Context, scope int, username 
 		dateKey := dayStart.Format("20060102")
 		days[dateKey] = historyStatisticsDay{}
 		clauses = append(clauses, `SELECT ? AS date_key,result,COUNT(*) FROM history_jobs
-WHERE user=? AND started_at>=? AND started_at<? GROUP BY result`)
-		args = append(args, dateKey, username, dayStart.Unix(), endUnix)
+WHERE user_id=? AND started_at>=? AND started_at<? GROUP BY result`)
+		args = append(args, dateKey, userID, dayStart.Unix(), endUnix)
 	}
 
 	// Each branch uses the user/started_at index and returns only grouped

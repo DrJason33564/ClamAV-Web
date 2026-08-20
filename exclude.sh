@@ -2,9 +2,9 @@
 set -eu
 
 # Build a local ClamAV SHA256 allow-list database from exclude.conf.
-# Each non-empty, non-comment line contains a trusted target and its owner:
-#   /path/without/spaces alice
-#   "/path/with spaces" alice
+# Each non-empty, non-comment line contains a trusted target and its owner user ID:
+#   /path/without/spaces a1b2c3d4
+#   "/path/with spaces" a1b2c3d4
 #
 # Regular files are added directly. Directories are expanded recursively and
 # every regular file under them is added.
@@ -61,7 +61,7 @@ parse_exclude_line() {
                         PARSED_TARGET=''
                         return 0
                     fi
-                    PARSED_USER="$1"
+                    PARSED_USER_ID="$1"
                     ;;
                 *)
                     exclude_log "[WARN] Invalid exclude line $line_no: unterminated quoted path, skipped: $raw_line"
@@ -82,7 +82,7 @@ parse_exclude_line() {
                 return 0
             fi
             PARSED_TARGET="$1"
-            PARSED_USER="$2"
+            PARSED_USER_ID="$2"
             ;;
     esac
 
@@ -90,16 +90,24 @@ parse_exclude_line() {
         exclude_log "[WARN] Empty exclude target at line $line_no, skipped."
     fi
 
-    case "${PARSED_USER:-}" in
-        ''|*[!A-Za-z0-9._-]*)
-            exclude_log "[WARN] Invalid exclude owner at line $line_no, skipped: $raw_line"
+    case "${PARSED_USER_ID:-}" in
+        *[!a-z0-9]*)
+            exclude_log "[WARN] Invalid exclude owner ID at line $line_no, skipped: $raw_line"
             PARSED_TARGET=''
             ;;
     esac
-    if [ -n "$PARSED_TARGET" ] && [ "${#PARSED_USER}" -gt 64 ]; then
-        exclude_log "[WARN] Exclude owner is too long at line $line_no, skipped: $raw_line"
+    if [ -n "$PARSED_TARGET" ] && [ "${#PARSED_USER_ID}" -ne 8 ]; then
+        exclude_log "[WARN] Invalid exclude owner ID at line $line_no, skipped: $raw_line"
         PARSED_TARGET=''
     fi
+    case "${PARSED_USER_ID:-}" in
+        *[a-z]*) ;;
+        *) PARSED_TARGET='' ;;
+    esac
+    case "${PARSED_USER_ID:-}" in
+        *[0-9]*) ;;
+        *) PARSED_TARGET='' ;;
+    esac
 
     return 0
 }

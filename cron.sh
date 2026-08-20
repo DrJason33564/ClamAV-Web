@@ -84,7 +84,7 @@ reload_cron() {
         escaped_scan_script="$(printf "%s" "$SCAN_ONCE_SCRIPT" | sed "s/'/'\\\\''/g")"
         escaped_target="$(printf "%s" "$CRON_TARGET" | sed "s/'/'\\\\''/g")"
         escaped_action="$(printf "%s" "$CRON_ACTION" | sed "s/'/'\\\\''/g")"
-        escaped_user="$(printf "%s" "$CRON_USER" | sed "s/'/'\\\\''/g")"
+        escaped_user="$(printf "%s" "$CRON_USER_ID" | sed "s/'/'\\\\''/g")"
 
         # The wake column is deliberately rendered as a fixed flag rather than
         # interpolated shell input, so configuration values cannot add options.
@@ -98,7 +98,7 @@ reload_cron() {
             "$escaped_scan_script" "$escaped_user" "$escaped_target" "$escaped_action" "$wake_flag" \
             >> "$CRON_FILE"
 
-        log_line "$CRON_LOG_FILE" "[INFO] Registered cron scan: $CRON_MINUTE $CRON_HOUR $CRON_DAY $CRON_MONTH $CRON_WEEKDAY -> $CRON_TARGET [$CRON_ACTION] owner=$CRON_USER wake=$CRON_WAKE"
+        log_line "$CRON_LOG_FILE" "[INFO] Registered cron scan: $CRON_MINUTE $CRON_HOUR $CRON_DAY $CRON_MONTH $CRON_WEEKDAY -> $CRON_TARGET [$CRON_ACTION] owner_id=$CRON_USER_ID wake=$CRON_WAKE"
     done < "$CRON_CONFIG_FILE"
 
     chmod 0644 "$CRON_FILE"

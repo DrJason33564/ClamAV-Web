@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -64,7 +65,12 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     applied_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT PRIMARY KEY CHECK(
+        length(id)=8 AND
+        id NOT GLOB '*[^a-z0-9]*' AND
+        id GLOB '*[a-z]*' AND
+        id GLOB '*[0-9]*'
+    ),
     username TEXT NOT NULL UNIQUE,
     password_hash TEXT,
     role TEXT NOT NULL CHECK(role IN ('user','admin')),
@@ -76,17 +82,22 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     token_hash BLOB NOT NULL UNIQUE,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     created_at INTEGER NOT NULL,
     last_seen_at INTEGER NOT NULL,
     idle_expires_at INTEGER NOT NULL,
     absolute_expires_at INTEGER NOT NULL,
     revoked_at INTEGER
 );
-CREATE INDEX IF NOT EXISTS sessions_token_active ON sessions(token_hash, revoked_at, absolute_expires_at);
-INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, unixepoch());`
+CREATE INDEX IF NOT EXISTS sessions_token_active ON sessions(token_hash, revoked_at, absolute_expires_at);`
 	if _, err := db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("initialize user database: %w", err)
+	}
+	if err := requireSQLiteColumnType(ctx, db, "users", "id", "TEXT"); err != nil {
+		return fmt.Errorf("incompatible user database; recreate users.db: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, unixepoch())"); err != nil {
+		return fmt.Errorf("record user database schema: %w", err)
 	}
 	return nil
 }
@@ -105,15 +116,46 @@ CREATE TABLE IF NOT EXISTS history_jobs (
     action TEXT NOT NULL,
     started_at INTEGER NOT NULL,
     finished_at INTEGER,
-    user TEXT NOT NULL,
+    user_id TEXT NOT NULL,
     json_file TEXT NOT NULL UNIQUE,
     file_mtime_ns INTEGER NOT NULL,
     indexed_at INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS history_jobs_user_started ON history_jobs(user, started_at DESC, job_id DESC);
-INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, unixepoch());`
+CREATE INDEX IF NOT EXISTS history_jobs_user_started ON history_jobs(user_id, started_at DESC, job_id DESC);`
 	if _, err := db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("initialize history database: %w", err)
 	}
+	if err := requireSQLiteColumnType(ctx, db, "history_jobs", "user_id", "TEXT"); err != nil {
+		return fmt.Errorf("incompatible history database; recreate history.db: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, unixepoch())"); err != nil {
+		return fmt.Errorf("record history database schema: %w", err)
+	}
 	return nil
+}
+
+func requireSQLiteColumnType(ctx context.Context, db *sql.DB, table, column, wantType string) error {
+	rows, err := db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%q)", table))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		if name == column {
+			if !strings.EqualFold(columnType, wantType) {
+				return fmt.Errorf("column %s.%s has type %s, want %s", table, column, columnType, wantType)
+			}
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return fmt.Errorf("column %s.%s is missing", table, column)
 }

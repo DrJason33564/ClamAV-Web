@@ -54,9 +54,12 @@ func TestFirstRegistrationCreatesAdminAndCookieLogin(t *testing.T) {
 	if register.Code != http.StatusCreated {
 		t.Fatalf("register failed: %d %s", register.Code, register.Body.String())
 	}
-	var role string
-	if err := s.userDB.QueryRow("SELECT role FROM users WHERE username='alice'").Scan(&role); err != nil || role != "admin" {
+	var userID, role string
+	if err := s.userDB.QueryRow("SELECT id,role FROM users WHERE username='alice'").Scan(&userID, &role); err != nil || role != "admin" {
 		t.Fatalf("expected first user to be admin, role=%q err=%v", role, err)
+	}
+	if !validUserID(userID) {
+		t.Fatalf("registration generated invalid user id %q", userID)
 	}
 	if _, err := s.userDB.Exec("UPDATE users SET timedock_account='Jason' WHERE username='alice'"); err != nil {
 		t.Fatal(err)
@@ -176,12 +179,12 @@ func TestLoginLimitUsesIPInsteadOfUsername(t *testing.T) {
 	}
 }
 
-func TestHistoryIndexIsVersion2AndOwnerScoped(t *testing.T) {
+func TestHistoryIndexIsVersion3AndOwnerScoped(t *testing.T) {
 	s := newDatabaseTestServer(t)
 	jobs := map[string]string{
-		"manual-1783433000.json": `{"version":2,"job_id":"manual-1783433000","type":"manual","status":"finished","result":"clean","action":"warn","started_at":1783433000,"finished_at":1783433010,"user":"alice"}`,
-		"cron-1783432000.json":   `{"version":2,"job_id":"cron-1783432000","type":"cron","status":"finished","result":"found","action":"move","started_at":1783432000,"finished_at":1783432010,"user":"bob"}`,
-		"manual-1783431000.json": `{"version":1,"job_id":"manual-1783431000","type":"manual","user":"alice"}`,
+		"manual-1783433000.json": `{"version":3,"job_id":"manual-1783433000","type":"manual","status":"finished","result":"clean","action":"warn","started_at":1783433000,"finished_at":1783433010,"user_id":"alice001"}`,
+		"cron-1783432000.json":   `{"version":3,"job_id":"cron-1783432000","type":"cron","status":"finished","result":"found","action":"move","started_at":1783432000,"finished_at":1783432010,"user_id":"bob00002"}`,
+		"manual-1783431000.json": `{"version":2,"job_id":"manual-1783431000","type":"manual","user":"alice"}`,
 	}
 	for name, body := range jobs {
 		if err := os.WriteFile(filepath.Join(s.cfg.JobsDir, name), []byte(body), 0o644); err != nil {
@@ -191,7 +194,7 @@ func TestHistoryIndexIsVersion2AndOwnerScoped(t *testing.T) {
 	if err := s.history.refresh(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	items, total, err := s.readResultLogItems(resultScope{All: true}, "alice")
+	items, total, err := s.readResultLogItems(resultScope{All: true}, testAliceUserID)
 	if err != nil || total != 1 || len(items) != 1 || items[0].ID != "manual-1783433000" {
 		t.Fatalf("unexpected owner-scoped history: total=%d items=%#v err=%v", total, items, err)
 	}
@@ -201,9 +204,9 @@ func TestRandomUserSchedulerAlwaysSelectsOwnerHead(t *testing.T) {
 	s := &server{
 		queuedBatchIDs: []string{"alice-first", "alice-second", "bob-first"},
 		batches: map[string]*scanBatch{
-			"alice-first":  {ID: "alice-first", User: "alice"},
-			"alice-second": {ID: "alice-second", User: "alice"},
-			"bob-first":    {ID: "bob-first", User: "bob"},
+			"alice-first":  {ID: "alice-first", UserID: testAliceUserID},
+			"alice-second": {ID: "alice-second", UserID: testAliceUserID},
+			"bob-first":    {ID: "bob-first", UserID: testBobUserID},
 		},
 	}
 	for i := 0; i < 100; i++ {
@@ -216,7 +219,7 @@ func TestRandomUserSchedulerAlwaysSelectsOwnerHead(t *testing.T) {
 
 func TestQuarantineRecordsAreOwnerScoped(t *testing.T) {
 	tmp := t.TempDir()
-	for _, item := range []struct{ name, owner string }{{"a.dat", "alice"}, {"b.dat", "bob"}} {
+	for _, item := range []struct{ name, owner string }{{"a.dat", testAliceUserID}, {"b.dat", testBobUserID}} {
 		if err := os.WriteFile(filepath.Join(tmp, item.name), []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -225,11 +228,11 @@ func TestQuarantineRecordsAreOwnerScoped(t *testing.T) {
 		}
 	}
 	s := &server{cfg: config{QuarantineDir: tmp}}
-	items, err := s.readQuarantineSubjects("alice")
+	items, err := s.readQuarantineSubjects(testAliceUserID)
 	if err != nil || len(items) != 1 || items[0].Name != "a.dat" {
 		t.Fatalf("unexpected quarantine view: %#v err=%v", items, err)
 	}
-	if err := s.deleteQuarantineSubject("b.dat", "alice"); !os.IsNotExist(err) {
+	if err := s.deleteQuarantineSubject("b.dat", testAliceUserID); !os.IsNotExist(err) {
 		t.Fatalf("expected cross-owner delete to look missing, got %v", err)
 	}
 }
@@ -239,25 +242,94 @@ func TestCronAndWhitelistReadsAreOwnerScoped(t *testing.T) {
 	cronFile := filepath.Join(tmp, "cron.conf")
 	cronBody := strings.Join([]string{
 		"# scanner-cron-rule id=aaaaaaaaaaaaaaaa enabled=true",
-		"0 1 * * * /scan warn alice Y",
+		"0 1 * * * /scan warn alice001 Y",
 		"# scanner-cron-rule id=bbbbbbbbbbbbbbbb enabled=true",
-		"0 2 * * * /scan move bob N",
+		"0 2 * * * /scan move bob00002 N",
 	}, "\n") + "\n"
 	if err := os.WriteFile(cronFile, []byte(cronBody), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	excludeFile := filepath.Join(tmp, "exclude.conf")
-	if err := os.WriteFile(excludeFile, []byte("/scan/a alice\n/scan/b bob\n"), 0o600); err != nil {
+	if err := os.WriteFile(excludeFile, []byte("/scan/a alice001\n/scan/b bob00002\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	s := &server{cfg: config{CronConfigFile: cronFile, ExcludeConfig: excludeFile}}
-	rules, err := s.readCronRules("alice")
+	rules, err := s.readCronRules(testAliceUserID)
 	if err != nil || len(rules) != 1 || rules[0].ID != "aaaaaaaaaaaaaaaa" || !rules[0].Wake {
 		t.Fatalf("unexpected cron view: %#v err=%v", rules, err)
 	}
-	entries, err := s.readWhitelistEntries("alice")
+	entries, err := s.readWhitelistEntries(testAliceUserID)
 	if err != nil || len(entries) != 1 || entries[0].Path != "/scan/a" {
 		t.Fatalf("unexpected whitelist view: %#v err=%v", entries, err)
+	}
+}
+
+func TestRecreatedUsernameDoesNotInheritAssets(t *testing.T) {
+	s := newDatabaseTestServer(t)
+	const recreatedUserID = "alice002"
+	now := time.Now().Unix()
+	if _, err := s.userDB.Exec(`INSERT INTO users(id,username,password_hash,role,created_at,updated_at) VALUES(?,'alice',NULL,'user',?,?)`, testAliceUserID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an incomplete external cleanup: the account row is gone while
+	// assets owned by its immutable ID remain in the other stores.
+	if _, err := s.userDB.Exec("DELETE FROM users WHERE id=?", testAliceUserID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.userDB.Exec(`INSERT INTO users(id,username,password_hash,role,created_at,updated_at) VALUES(?,'alice',NULL,'user',?,?)`, recreatedUserID, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	jobID := "manual-1783433000"
+	if _, err := s.historyDB.Exec(`INSERT INTO history_jobs(job_id,job_type,status,result,action,started_at,finished_at,user_id,json_file,file_mtime_ns,indexed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, jobID, "manual", "finished", "clean", "warn", now, now, testAliceUserID, filepath.Join(s.cfg.JobsDir, jobID+".json"), 1, now); err != nil {
+		t.Fatal(err)
+	}
+	assetDir := t.TempDir()
+	s.cfg.CronConfigFile = filepath.Join(assetDir, "cron_scan.conf")
+	s.cfg.ExcludeConfig = filepath.Join(assetDir, "exclude.conf")
+	s.cfg.QuarantineDir = filepath.Join(assetDir, "quarantine")
+	if err := os.MkdirAll(s.cfg.QuarantineDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cron := "# scanner-cron-rule id=aaaaaaaaaaaaaaaa enabled=true\n0 1 * * * /scan warn " + testAliceUserID + " N\n"
+	if err := os.WriteFile(s.cfg.CronConfigFile, []byte(cron), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.cfg.ExcludeConfig, []byte("/scan/trusted "+testAliceUserID+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	quarantined := filepath.Join(s.cfg.QuarantineDir, "old.dat")
+	if err := os.WriteFile(quarantined, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(quarantined+".rec", []byte(`"/scan/old.dat" `+testAliceUserID+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if items, total, err := s.readResultLogItems(resultScope{All: true}, recreatedUserID); err != nil || total != 0 || len(items) != 0 {
+		t.Fatalf("recreated user inherited history: total=%d items=%#v err=%v", total, items, err)
+	}
+	if rules, err := s.readCronRules(recreatedUserID); err != nil || len(rules) != 0 {
+		t.Fatalf("recreated user inherited cron rules: %#v err=%v", rules, err)
+	}
+	if entries, err := s.readWhitelistEntries(recreatedUserID); err != nil || len(entries) != 0 {
+		t.Fatalf("recreated user inherited whitelist entries: %#v err=%v", entries, err)
+	}
+	if subjects, err := s.readQuarantineSubjects(recreatedUserID); err != nil || len(subjects) != 0 {
+		t.Fatalf("recreated user inherited quarantine subjects: %#v err=%v", subjects, err)
+	}
+
+	if _, total, _ := s.readResultLogItems(resultScope{All: true}, testAliceUserID); total != 1 {
+		t.Fatal("old history fixture was not retained")
+	}
+	if rules, _ := s.readCronRules(testAliceUserID); len(rules) != 1 {
+		t.Fatal("old cron fixture was not retained")
+	}
+	if entries, _ := s.readWhitelistEntries(testAliceUserID); len(entries) != 1 {
+		t.Fatal("old whitelist fixture was not retained")
+	}
+	if subjects, _ := s.readQuarantineSubjects(testAliceUserID); len(subjects) != 1 {
+		t.Fatal("old quarantine fixture was not retained")
 	}
 }
 
@@ -411,7 +483,7 @@ func TestServiceConfigUpdatesLoginLimitsAndTrustedProxy(t *testing.T) {
   "web_login_cooldown_interval": 120,
   "server_trusted_reverseproxy": "192.0.2.10, 2001:db8::10"
 }`))
-	request = request.WithContext(context.WithValue(request.Context(), actorContextKey{}, actor{Username: "admin", Role: "admin"}))
+	request = request.WithContext(context.WithValue(request.Context(), actorContextKey{}, actor{ID: testAdminUserID, Username: "admin", Role: "admin"}))
 	response := httptest.NewRecorder()
 	s.handleServiceConfig(response, request)
 	if response.Code != http.StatusOK {
@@ -444,7 +516,7 @@ func TestServiceConfigUpdatesLoginLimitsAndTrustedProxy(t *testing.T) {
 func TestServiceConfigSleepTimerUsesZeroToDisable(t *testing.T) {
 	s := newDatabaseTestServer(t)
 	s.clamavSleepTimer = newClamAVSleepTimerState()
-	actorCtx := context.WithValue(context.Background(), actorContextKey{}, actor{Username: "admin", Role: "admin"})
+	actorCtx := context.WithValue(context.Background(), actorContextKey{}, actor{ID: testAdminUserID, Username: "admin", Role: "admin"})
 
 	emptyRequest := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(`{"clamav_sleep_timer":""}`)).WithContext(actorCtx)
 	emptyResponse := httptest.NewRecorder()
