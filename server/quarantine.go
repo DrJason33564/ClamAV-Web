@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -35,7 +34,7 @@ type quarantineActionResponse struct {
 	Error  string `json:"error,omitempty"`
 }
 
-var renameQuarantineFile = os.Rename
+var copyQuarantineFile = copyRegularFile
 
 const clamavQuarantineLockName = "clamav-quarantine-lock"
 
@@ -326,17 +325,13 @@ func (s *server) recoverQuarantineSubject(name string, who actor) error {
 }
 
 func restoreQuarantinedFile(quarantined string, sourceFile string) error {
-	if err := renameQuarantineFile(quarantined, sourceFile); err == nil {
-		return nil
-	} else if !isCrossDeviceLink(err) {
-		return err
-	}
-
-	// Docker bind mounts and volumes commonly place /quarantine and /scan on
-	// different devices. rename(2) cannot cross that boundary, so fall back to
-	// copy-and-delete while keeping the .rec file until every step succeeds.
-	if err := copyRegularFile(quarantined, sourceFile); err != nil {
-		_ = os.Remove(sourceFile)
+	// O_EXCL is the authoritative existence check. A preceding Stat can make a
+	// friendlier error but cannot prevent another process from creating the
+	// restore target immediately afterward.
+	if err := copyQuarantineFile(quarantined, sourceFile); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("target already exists: %s", sourceFile)
+		}
 		return err
 	}
 	if err := os.Remove(quarantined); err != nil {
@@ -344,14 +339,6 @@ func restoreQuarantinedFile(quarantined string, sourceFile string) error {
 		return err
 	}
 	return nil
-}
-
-func isCrossDeviceLink(err error) bool {
-	var linkErr *os.LinkError
-	if errors.As(err, &linkErr) {
-		return errors.Is(linkErr.Err, syscall.EXDEV)
-	}
-	return errors.Is(err, syscall.EXDEV)
 }
 
 func copyRegularFile(src string, dst string) error {
@@ -377,13 +364,18 @@ func copyRegularFile(src string, dst string) error {
 	_, copyErr := io.Copy(out, in)
 	closeErr := out.Close()
 	if copyErr != nil {
+		_ = os.Remove(dst)
 		return copyErr
 	}
 	if closeErr != nil {
+		_ = os.Remove(dst)
 		return closeErr
 	}
-
-	return os.Chmod(dst, info.Mode().Perm())
+	if err := os.Chmod(dst, info.Mode().Perm()); err != nil {
+		_ = os.Remove(dst)
+		return err
+	}
+	return nil
 }
 
 func readQuarantineRecord(path string) (string, string, error) {

@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -1051,7 +1050,7 @@ func TestQuarantineSubjectsDeleteAndRecover(t *testing.T) {
 	}
 }
 
-func TestQuarantineRecoverFallsBackAcrossDevices(t *testing.T) {
+func TestQuarantineRecoverCopiesAndRemovesSource(t *testing.T) {
 	tmp := t.TempDir()
 	quarantineDir := filepath.Join(tmp, "quarantine")
 	sourceDir := filepath.Join(tmp, "scan")
@@ -1072,14 +1071,6 @@ func TestQuarantineRecoverFallsBackAcrossDevices(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	oldRename := renameQuarantineFile
-	renameQuarantineFile = func(oldpath, newpath string) error {
-		return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: syscall.EXDEV}
-	}
-	t.Cleanup(func() {
-		renameQuarantineFile = oldRename
-	})
-
 	s := &server{cfg: config{QuarantineDir: quarantineDir, BrowseRoots: []string{sourceDir}}}
 	if err := s.recoverQuarantineSubject("cross-device.txt", actor{ID: testAliceUserID}); err != nil {
 		t.Fatal(err)
@@ -1096,6 +1087,64 @@ func TestQuarantineRecoverFallsBackAcrossDevices(t *testing.T) {
 	}
 	if _, err := os.Stat(quarantined + ".rec"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected rec file to be deleted after recover, err=%v", err)
+	}
+}
+
+func TestQuarantineRecoverDoesNotOverwriteTargetCreatedAfterCheck(t *testing.T) {
+	tmp := t.TempDir()
+	quarantineDir := filepath.Join(tmp, "quarantine")
+	sourceDir := filepath.Join(tmp, "scan")
+	if err := os.MkdirAll(quarantineDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	quarantined := filepath.Join(quarantineDir, "race.txt")
+	sourceFile := filepath.Join(sourceDir, "race.txt")
+	recordFile := quarantined + ".rec"
+	if err := os.WriteFile(quarantined, []byte("quarantined"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(recordFile, []byte("\""+sourceFile+"\" "+testAliceUserID+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	originalCopy := copyQuarantineFile
+	copyQuarantineFile = func(src, dst string) error {
+		if err := os.WriteFile(dst, []byte("concurrent"), 0o600); err != nil {
+			return err
+		}
+		return originalCopy(src, dst)
+	}
+	t.Cleanup(func() { copyQuarantineFile = originalCopy })
+
+	s := &server{cfg: config{QuarantineDir: quarantineDir, BrowseRoots: []string{sourceDir}}}
+	err := s.recoverQuarantineSubject("race.txt", actor{ID: testAliceUserID})
+	if err == nil || !strings.Contains(err.Error(), "target already exists") {
+		t.Fatalf("expected concurrent target to reject recovery, got %v", err)
+	}
+	target, err := os.ReadFile(sourceFile)
+	if err != nil || string(target) != "concurrent" {
+		t.Fatalf("concurrent target was changed: data=%q err=%v", target, err)
+	}
+	for _, path := range []string{quarantined, recordFile} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("retry state was not preserved for %s: %v", path, err)
+		}
+	}
+
+	copyQuarantineFile = originalCopy
+	if err := os.Remove(sourceFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.recoverQuarantineSubject("race.txt", actor{ID: testAliceUserID}); err != nil {
+		t.Fatalf("recovery retry failed: %v", err)
+	}
+	restored, err := os.ReadFile(sourceFile)
+	if err != nil || string(restored) != "quarantined" {
+		t.Fatalf("unexpected retry result: data=%q err=%v", restored, err)
 	}
 }
 
