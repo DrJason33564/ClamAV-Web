@@ -62,6 +62,12 @@ func (s *server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 	entries := make([]browseEntry, 0, len(dirEntries))
 	for _, entry := range dirEntries {
 		full := filepath.Join(path, entry.Name())
+		// Symbolic links are intentionally absent from the browse API. Container
+		// mounts often make their targets invalid, and every path-taking API uses
+		// the same no-follow policy below.
+		if entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
 		if s.cfg.IsTimeDock {
 			switch {
 			case path == filepath.Clean(s.cfg.BrowseRoots[0]):
@@ -78,6 +84,10 @@ func (s *server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 		}
 		info, err := entry.Info()
 		if err != nil {
+			continue
+		}
+		// Recheck the FileInfo in case the entry changed after ReadDir.
+		if info.Mode()&os.ModeSymlink != 0 {
 			continue
 		}
 		entries = append(entries, browseEntry{
@@ -133,14 +143,15 @@ func (s *server) safeBrowsePath(input string, who actor) (string, map[string]str
 	if path == root || devices[path] != "" {
 		return path, devices, nil
 	}
-	if err := authorizeTimeDockPath(path, devices, false); err != nil {
+	if err := authorizeTimeDockPath(path, devices); err != nil {
 		return "", nil, err
 	}
 	return path, devices, nil
 }
 
 // safePathForActor applies the TimeDock account boundary after the ordinary
-// /scan and symlink checks. It is shared by every API that accepts scan paths.
+// scan-root and no-symlink checks. It is shared by every API that accepts scan
+// paths.
 func (s *server) safePathForActor(input string, who actor) (string, error) {
 	if s.cfg.IsTimeDock && who.TimeDockAccount == "" {
 		return "", errTimeDockAccountRequired
@@ -156,29 +167,30 @@ func (s *server) safePathForActor(input string, who actor) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := authorizeTimeDockPath(path, devices, false); err != nil {
+	if err := authorizeTimeDockPath(path, devices); err != nil {
 		return "", err
 	}
 	return path, nil
 }
 
-// authorizeRestorePath allows a missing quarantine destination, but resolves
-// its nearest existing ancestor so an existing symlink cannot cross accounts.
+// authorizeRestorePath allows a missing quarantine destination, but all of its
+// existing ancestors must still be under a scan root and must not be symlinks.
 func (s *server) authorizeRestorePath(input string, who actor) error {
+	path, err := s.safePathAllowMissing(input)
+	if err != nil {
+		return err
+	}
 	if !s.cfg.IsTimeDock {
 		return nil
 	}
 	if who.TimeDockAccount == "" {
 		return errTimeDockAccountRequired
 	}
-	if strings.Contains(input, "\x00") || !filepath.IsAbs(input) {
-		return errors.New("invalid restore path")
-	}
 	devices, err := s.timeDockDeviceAccounts(who.TimeDockAccount)
 	if err != nil {
 		return err
 	}
-	return authorizeTimeDockPath(filepath.Clean(input), devices, true)
+	return authorizeTimeDockPath(path, devices)
 }
 
 func (s *server) timeDockDeviceAccounts(account string) (map[string]string, error) {
@@ -220,42 +232,15 @@ func isTimeDockDeviceName(name string) bool {
 	return true
 }
 
-func authorizeTimeDockPath(path string, devices map[string]string, allowMissing bool) error {
+func authorizeTimeDockPath(path string, devices map[string]string) error {
 	for _, accountRoot := range devices {
-		if !pathWithin(path, accountRoot) {
-			continue
-		}
-		realRoot, err := filepath.EvalSymlinks(accountRoot)
-		if err != nil {
-			continue
-		}
-		realPath, err := resolvedExistingPath(path, allowMissing)
-		if err == nil && pathWithin(realPath, realRoot) {
+		// safePath and safePathAllowMissing have already rejected symlinks, so a
+		// lexical containment check is also the effective filesystem boundary.
+		if pathWithin(path, accountRoot) {
 			return nil
 		}
 	}
 	return errTimeDockPathDenied
-}
-
-func resolvedExistingPath(path string, allowMissing bool) (string, error) {
-	if !allowMissing {
-		return filepath.EvalSymlinks(path)
-	}
-	current := path
-	for {
-		resolved, err := filepath.EvalSymlinks(current)
-		if err == nil {
-			return resolved, nil
-		}
-		if !errors.Is(err, os.ErrNotExist) {
-			return "", err
-		}
-		parent := filepath.Dir(current)
-		if parent == current {
-			return "", err
-		}
-		current = parent
-	}
 }
 
 func pathWithin(path, root string) bool {
@@ -265,6 +250,14 @@ func pathWithin(path, root string) bool {
 }
 
 func (s *server) safePath(input string) (string, error) {
+	return s.validatePath(input, false)
+}
+
+func (s *server) safePathAllowMissing(input string) (string, error) {
+	return s.validatePath(input, true)
+}
+
+func (s *server) validatePath(input string, allowMissing bool) (string, error) {
 	if strings.Contains(input, "\x00") {
 		return "", errors.New("path contains null byte")
 	}
@@ -273,20 +266,46 @@ func (s *server) safePath(input string) (string, error) {
 		return "", errors.New("path must be absolute")
 	}
 
-	realPath, err := filepath.EvalSymlinks(clean)
-	if err != nil {
-		return "", err
-	}
 	for _, root := range s.cfg.BrowseRoots {
-		realRoot, err := filepath.EvalSymlinks(root)
-		if err != nil {
+		if !pathWithin(clean, root) {
+			continue
+		}
+		if err := rejectSymlinkComponents(clean, allowMissing); err != nil {
 			return "", err
 		}
-		// Check the resolved path so symlinks under /scan cannot escape the
-		// configured browsing and scanning root.
-		if realPath == realRoot || strings.HasPrefix(realPath, realRoot+"/") {
-			return clean, nil
-		}
+		return clean, nil
 	}
 	return "", fmt.Errorf("path must be under one of: %s", strings.Join(s.cfg.BrowseRoots, ", "))
+}
+
+var errSymlinkPath = errors.New("symbolic links are not allowed")
+
+// rejectSymlinkComponents uses Lstat for every existing component. Checking
+// only the final component would still allow a symlinked parent directory to
+// redirect an otherwise ordinary-looking path.
+func rejectSymlinkComponents(path string, allowMissing bool) error {
+	volumeRoot := filepath.VolumeName(path) + string(os.PathSeparator)
+	relative, err := filepath.Rel(volumeRoot, path)
+	if err != nil {
+		return err
+	}
+	if relative == "." {
+		return nil
+	}
+
+	current := volumeRoot
+	for _, component := range strings.Split(relative, string(os.PathSeparator)) {
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if err != nil {
+			if allowMissing && errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%s: %w", current, errSymlinkPath)
+		}
+	}
+	return nil
 }

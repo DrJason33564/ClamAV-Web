@@ -82,7 +82,7 @@ docker build -t tinkerbell37745/clamav-timedock .
 mkdir -p config data scan quarantine log state
 ```
 
-将需要扫描的内容放入 `scan/`。默认情况下，Web 界面只能浏览和操作容器内的 `/scan`，符号链接也不能逃逸到该目录之外。
+将需要扫描的内容放入 `scan/`。默认情况下，Web 界面只能浏览和操作容器内的 `/scan`；文件浏览会隐藏符号链接，相关 API 也会拒绝包含符号链接的路径。
 
 ### 3. 启动服务
 

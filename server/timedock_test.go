@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -188,6 +189,34 @@ func TestTimeDockPathProtectionAcrossAPIs(t *testing.T) {
 	}
 	if _, err := s.safePathForActor(filepath.Join(root, "usb1", "Jason", "escape"), who); err == nil {
 		t.Fatal("expected an in-account symlink to another account to be rejected")
+	}
+
+	// Even a symlink whose target remains inside this account is unsupported.
+	// All path-taking APIs share this rule rather than relying on ClamAV to skip
+	// an accepted request later.
+	alias := filepath.Join(root, "usb1", "Jason", "documents-link")
+	if err := os.Symlink(allowed, alias); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.safePathForActor(alias, who); !errors.Is(err, errSymlinkPath) {
+		t.Fatalf("scan path symlink was not rejected: %v", err)
+	}
+	if _, err := s.prepareWhitelistPath(alias, who); !errors.Is(err, errSymlinkPath) {
+		t.Fatalf("whitelist path symlink was not rejected: %v", err)
+	}
+	if _, err := s.prepareCronRule(cronRule{Minute: "0", Hour: "1", Day: "*", Month: "*", Weekday: "*", Target: alias, Action: "warn"}, who); !errors.Is(err, errSymlinkPath) {
+		t.Fatalf("cron path symlink was not rejected: %v", err)
+	}
+	if err := s.authorizeRestorePath(filepath.Join(alias, "restored.dat"), who); !errors.Is(err, errSymlinkPath) {
+		t.Fatalf("restore path below symlink was not rejected: %v", err)
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "/api/scans", strings.NewReader(`{"targets":["`+alias+`"],"action":"warn"}`))
+	request = request.WithContext(context.WithValue(request.Context(), actorContextKey{}, who))
+	response = httptest.NewRecorder()
+	s.startScan(response, request)
+	if response.Code != http.StatusBadRequest || len(s.batches) != 0 {
+		t.Fatalf("scan API accepted a symlink: %d %s", response.Code, response.Body.String())
 	}
 }
 

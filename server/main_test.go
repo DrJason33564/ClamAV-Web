@@ -227,23 +227,85 @@ func TestArgon2PasswordHash(t *testing.T) {
 	}
 }
 
-func TestSafePathRejectsSymlinkEscape(t *testing.T) {
+func TestSafePathRejectsEverySymlinkComponent(t *testing.T) {
 	tmp := t.TempDir()
 	root := filepath.Join(tmp, "scan")
 	outside := filepath.Join(tmp, "outside")
-	if err := os.Mkdir(root, 0o755); err != nil {
+	inside := filepath.Join(root, "inside")
+	if err := os.MkdirAll(inside, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Mkdir(outside, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(outside, filepath.Join(root, "escape")); err != nil {
+	regular := filepath.Join(inside, "regular.dat")
+	if err := os.WriteFile(regular, []byte("data"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+	links := map[string]string{
+		"escape":      outside,
+		"inside-dir":  inside,
+		"inside-file": regular,
+	}
+	for name, target := range links {
+		if err := os.Symlink(target, filepath.Join(root, name)); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	s := &server{cfg: config{BrowseRoots: []string{root}}}
-	if _, err := s.safePath(filepath.Join(root, "escape")); err == nil {
-		t.Fatal("expected symlink escaping the scan root to be rejected")
+	if _, err := s.safePath(regular); err != nil {
+		t.Fatalf("regular path was rejected: %v", err)
+	}
+	for _, path := range []string{
+		filepath.Join(root, "escape"),
+		filepath.Join(root, "inside-dir"),
+		filepath.Join(root, "inside-dir", "regular.dat"),
+		filepath.Join(root, "inside-file"),
+	} {
+		if _, err := s.safePath(path); !errors.Is(err, errSymlinkPath) {
+			t.Fatalf("expected symlink path %s to be rejected, got %v", path, err)
+		}
+	}
+	if _, err := s.safePathAllowMissing(filepath.Join(inside, "new", "file.dat")); err != nil {
+		t.Fatalf("missing restore path was rejected: %v", err)
+	}
+	if _, err := s.safePathAllowMissing(filepath.Join(root, "inside-dir", "new.dat")); !errors.Is(err, errSymlinkPath) {
+		t.Fatalf("expected missing path below symlink to be rejected, got %v", err)
+	}
+}
+
+func TestBrowseHidesSymbolicLinks(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "scan")
+	if err := os.MkdirAll(filepath.Join(root, "directory"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	regular := filepath.Join(root, "regular.dat")
+	if err := os.WriteFile(regular, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for name, target := range map[string]string{
+		"directory-link": filepath.Join(root, "directory"),
+		"file-link":      regular,
+		"broken-link":    filepath.Join(root, "missing"),
+	} {
+		if err := os.Symlink(target, filepath.Join(root, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s := &server{cfg: config{BrowseRoots: []string{root}}}
+	response := httptest.NewRecorder()
+	s.handleBrowse(response, httptest.NewRequest(http.MethodGet, "/api/browse?path="+root, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("browse failed: %d %s", response.Code, response.Body.String())
+	}
+	var body browseResponse
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Entries) != 2 || body.Entries[0].Name != "directory" || body.Entries[1].Name != "regular.dat" {
+		t.Fatalf("symbolic links were exposed by browse API: %#v", body.Entries)
 	}
 }
 
@@ -890,7 +952,7 @@ func TestQuarantineSubjectsDeleteAndRecover(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := &server{cfg: config{QuarantineDir: quarantineDir}}
+	s := &server{cfg: config{QuarantineDir: quarantineDir, BrowseRoots: []string{sourceDir}}}
 	subjects, err := s.readQuarantineSubjects(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -962,7 +1024,7 @@ func TestQuarantineRecoverFallsBackAcrossDevices(t *testing.T) {
 		renameQuarantineFile = oldRename
 	})
 
-	s := &server{cfg: config{QuarantineDir: quarantineDir}}
+	s := &server{cfg: config{QuarantineDir: quarantineDir, BrowseRoots: []string{sourceDir}}}
 	if err := s.recoverQuarantineSubject("cross-device.txt"); err != nil {
 		t.Fatal(err)
 	}
