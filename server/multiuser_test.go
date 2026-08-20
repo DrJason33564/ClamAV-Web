@@ -293,6 +293,71 @@ func TestAppConfigRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAppConfigAddsMissingKeysWithoutReplacingExistingContent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "clamavweb.conf")
+	original := "# keep this comment\n  HISTORY_INDEX_REFRESH_INTERVAL = 120\nCLAMAV_SLEEP_TIMER=0\n"
+	if err := os.WriteFile(path, []byte(original), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := newAppConfigStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	if !strings.HasPrefix(content, original) {
+		t.Fatalf("existing configuration was replaced:\n%s", content)
+	}
+	for _, expected := range []string{
+		"WEB_FIRSTRUN_COMPLETED=0\n",
+		"WEB_LOGIN_MAX_TRIES=10\n",
+		"LOG_LEVEL=info\n",
+	} {
+		if !strings.Contains(content, expected) {
+			t.Fatalf("missing default entry %q in:\n%s", expected, content)
+		}
+	}
+	if cfg := store.get(); cfg.HistoryIndexRefreshInterval != 120 || cfg.ClamAVSleepTimer != 0 {
+		t.Fatalf("existing values were not retained: %#v", cfg)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o640 {
+		t.Fatalf("existing permissions changed to %o", info.Mode().Perm())
+	}
+}
+
+func TestAppConfigUpdatePreservesCommentsAndUnchangedFormatting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "clamavweb.conf")
+	original := "# operator note\nHISTORY_INDEX_REFRESH_INTERVAL = 60\nCLAMAV_SLEEP_TIMER=3600\n"
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := newAppConfigStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := store.get()
+	cfg.ClamAVSleepTimer = 0
+	if err := store.update(cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	if !strings.HasPrefix(content, "# operator note\nHISTORY_INDEX_REFRESH_INTERVAL = 60\nCLAMAV_SLEEP_TIMER=0\n") {
+		t.Fatalf("update replaced unrelated content:\n%s", content)
+	}
+}
+
 func TestAppConfigSleepTimerDefaultsAndZeroValue(t *testing.T) {
 	cfg, err := parseAppConfig("")
 	if err != nil || cfg.ClamAVSleepTimer != defaultClamAVSleepTimer {

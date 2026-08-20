@@ -94,10 +94,26 @@ func (s *appConfigStore) update(next appConfig) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := writeAppConfigFile(s.path, next); err != nil {
+	data, err := os.ReadFile(s.path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	s.cfg = next
+	content := ""
+	if err == nil {
+		content = string(data)
+	}
+	original := content
+	content = mergeAppConfigContent(content, next, changedAppConfigKeys(s.cfg, next))
+	final, err := parseAppConfig(content)
+	if err != nil {
+		return err
+	}
+	if content != original {
+		if err := writeAppConfigFile(s.path, content); err != nil {
+			return err
+		}
+	}
+	s.cfg = final
 	return nil
 }
 
@@ -107,7 +123,7 @@ func (s *appConfigStore) ensureAndReload() error {
 	data, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
 		cfg := defaultAppConfig()
-		if err := writeAppConfigFile(s.path, cfg); err != nil {
+		if err := writeAppConfigFile(s.path, mergeAppConfigContent("", cfg, nil)); err != nil {
 			return err
 		}
 		s.cfg = cfg
@@ -119,6 +135,12 @@ func (s *appConfigStore) ensureAndReload() error {
 	cfg, err := parseAppConfig(string(data))
 	if err != nil {
 		return err
+	}
+	merged := mergeAppConfigContent(string(data), cfg, nil)
+	if merged != string(data) {
+		if err := writeAppConfigFile(s.path, merged); err != nil {
+			return err
+		}
 	}
 	s.cfg = cfg
 	return nil
@@ -274,8 +296,97 @@ func normalizeTrustedReverseProxyList(value string) (string, error) {
 	return strings.Join(normalized, ","), nil
 }
 
-func writeAppConfigFile(path string, cfg appConfig) error {
+type appConfigFileEntry struct {
+	key   string
+	value string
+}
+
+func appConfigFileEntries(cfg appConfig) []appConfigFileEntry {
+	return []appConfigFileEntry{
+		{"HISTORY_INDEX_REFRESH_INTERVAL", strconv.Itoa(cfg.HistoryIndexRefreshInterval)},
+		{"CLAMAV_SLEEP_TIMER", strconv.Itoa(cfg.ClamAVSleepTimer)},
+		{"WEB_FIRSTRUN_COMPLETED", strconv.Itoa(cfg.WebFirstRunCompleted)},
+		{"WEB_LOGIN_MAX_TRIES", strconv.Itoa(cfg.WebLoginMaxTries)},
+		{"WEB_LOGIN_MAX_TRIES_OVERALL", strconv.Itoa(cfg.WebLoginMaxTriesOverall)},
+		{"WEB_LOGIN_COOLDOWN_INTERVAL", strconv.Itoa(cfg.WebLoginCooldownInterval)},
+		{"SERVER_TRUSTED_REVERSEPROXY", cfg.ServerTrustedReverseProxy},
+		{"LOG_FILE_MAX_SIZE", strconv.FormatInt(cfg.LogFileMaxSize, 10)},
+		{"LOG_FILE_NUM", strconv.Itoa(cfg.LogFileNum)},
+		{"LOG_LEVEL", cfg.LogLevel},
+	}
+}
+
+func changedAppConfigKeys(current, next appConfig) map[string]bool {
+	currentEntries := appConfigFileEntries(current)
+	nextEntries := appConfigFileEntries(next)
+	changed := make(map[string]bool)
+	for i := range currentEntries {
+		if currentEntries[i].value != nextEntries[i].value {
+			changed[nextEntries[i].key] = true
+		}
+	}
+	return changed
+}
+
+// mergeAppConfigContent preserves the existing document and only replaces keys
+// explicitly changed by the caller. Any keys introduced by a newer server
+// version are appended with their defaults instead of rebuilding the file.
+func mergeAppConfigContent(content string, cfg appConfig, changed map[string]bool) string {
+	entries := appConfigFileEntries(cfg)
+	values := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		values[entry.key] = entry.value
+	}
+
+	seen := make(map[string]bool, len(entries))
+	lines := strings.SplitAfter(content, "\n")
+	for i, segment := range lines {
+		line := strings.TrimSuffix(segment, "\n")
+		ending := strings.TrimPrefix(segment, line)
+		if strings.HasSuffix(line, "\r") {
+			line = strings.TrimSuffix(line, "\r")
+			ending = "\r" + ending
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		key, _, ok := strings.Cut(trimmed, "=")
+		key = strings.TrimSpace(key)
+		if !ok {
+			continue
+		}
+		if _, known := values[key]; !known {
+			continue
+		}
+		seen[key] = true
+		if changed != nil && changed[key] {
+			equals := strings.IndexByte(line, '=')
+			lines[i] = line[:equals+1] + values[key] + ending
+		}
+	}
+
+	merged := strings.Join(lines, "")
+	for _, entry := range entries {
+		if seen[entry.key] {
+			continue
+		}
+		if merged != "" && !strings.HasSuffix(merged, "\n") {
+			merged += "\n"
+		}
+		merged += entry.key + "=" + entry.value + "\n"
+	}
+	return merged
+}
+
+func writeAppConfigFile(path, content string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	mode := os.FileMode(0o600)
+	if info, err := os.Stat(path); err == nil {
+		mode = info.Mode().Perm()
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".clamavweb.*")
@@ -284,12 +395,11 @@ func writeAppConfigFile(path string, cfg appConfig) error {
 	}
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
-	content := fmt.Sprintf("HISTORY_INDEX_REFRESH_INTERVAL=%d\nCLAMAV_SLEEP_TIMER=%d\nWEB_FIRSTRUN_COMPLETED=%d\nWEB_LOGIN_MAX_TRIES=%d\nWEB_LOGIN_MAX_TRIES_OVERALL=%d\nWEB_LOGIN_COOLDOWN_INTERVAL=%d\nSERVER_TRUSTED_REVERSEPROXY=%s\nLOG_FILE_MAX_SIZE=%d\nLOG_FILE_NUM=%d\nLOG_LEVEL=%s\n", cfg.HistoryIndexRefreshInterval, cfg.ClamAVSleepTimer, cfg.WebFirstRunCompleted, cfg.WebLoginMaxTries, cfg.WebLoginMaxTriesOverall, cfg.WebLoginCooldownInterval, cfg.ServerTrustedReverseProxy, cfg.LogFileMaxSize, cfg.LogFileNum, cfg.LogLevel)
 	if _, err := tmp.WriteString(content); err != nil {
 		_ = tmp.Close()
 		return err
 	}
-	if err := tmp.Chmod(0o600); err != nil {
+	if err := tmp.Chmod(mode); err != nil {
 		_ = tmp.Close()
 		return err
 	}
