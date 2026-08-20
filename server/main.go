@@ -49,6 +49,7 @@ type server struct {
 	configFileMu             sync.Mutex
 	accountDeleteMu          sync.Mutex
 	registrationMu           sync.Mutex
+	argon2Limiter            argon2Limiter
 	userDB                   *sql.DB
 	historyDB                *sql.DB
 	appConfig                *appConfigStore

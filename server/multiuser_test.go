@@ -182,6 +182,34 @@ func TestLoginLimitUsesIPInsteadOfUsername(t *testing.T) {
 	}
 }
 
+func TestLoginReturnsTooManyRequestsWhenArgon2IsBusy(t *testing.T) {
+	s := newDatabaseTestServer(t)
+	for slot := 0; slot < argon2Concurrency; slot++ {
+		if !s.argon2Limiter.tryAcquire() {
+			t.Fatal("failed to occupy Argon2 capacity")
+		}
+	}
+	defer func() {
+		for slot := 0; slot < argon2Concurrency; slot++ {
+			s.argon2Limiter.release()
+		}
+	}()
+
+	request := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"username":"missing","password":"incorrect password"}`))
+	request.RemoteAddr = "192.0.2.10:1234"
+	response := httptest.NewRecorder()
+	s.handleAuthLogin(response, request)
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d: %s", response.Code, response.Body.String())
+	}
+	if got := response.Header().Get("Retry-After"); got != argon2RetryAfter {
+		t.Fatalf("Retry-After = %q, want %q", got, argon2RetryAfter)
+	}
+	if !strings.Contains(response.Body.String(), errArgon2Busy.Error()) {
+		t.Fatalf("unexpected response body: %s", response.Body.String())
+	}
+}
+
 func TestHistoryIndexIsVersion3AndOwnerScoped(t *testing.T) {
 	s := newDatabaseTestServer(t)
 	// Keep one legacy v2 fixture to verify username-owned jobs are rejected.

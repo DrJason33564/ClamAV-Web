@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"net/http/httptest"
 	"strconv"
 	"sync"
@@ -8,6 +9,46 @@ import (
 	"testing"
 	"time"
 )
+
+func TestArgon2LimiterEnforcesGlobalCapacity(t *testing.T) {
+	var limiter argon2Limiter
+	for slot := 0; slot < argon2Concurrency; slot++ {
+		if !limiter.tryAcquire() {
+			t.Fatalf("slot %d was rejected before capacity was reached", slot+1)
+		}
+	}
+	if limiter.tryAcquire() {
+		t.Fatal("operation beyond Argon2 capacity was accepted")
+	}
+	limiter.release()
+	if !limiter.tryAcquire() {
+		t.Fatal("released Argon2 capacity was not reusable")
+	}
+	for slot := 0; slot < argon2Concurrency; slot++ {
+		limiter.release()
+	}
+}
+
+func TestArgon2BusyAppliesToHashAndVerify(t *testing.T) {
+	s := &server{}
+	for slot := 0; slot < argon2Concurrency; slot++ {
+		if !s.argon2Limiter.tryAcquire() {
+			t.Fatal("failed to occupy Argon2 capacity")
+		}
+	}
+	defer func() {
+		for slot := 0; slot < argon2Concurrency; slot++ {
+			s.argon2Limiter.release()
+		}
+	}()
+
+	if _, err := s.hashPassword("correct horse battery staple"); !errors.Is(err, errArgon2Busy) {
+		t.Fatalf("hashPassword returned %v, want errArgon2Busy", err)
+	}
+	if _, err := s.verifyPassword("correct horse battery staple", dummyPasswordHash); !errors.Is(err, errArgon2Busy) {
+		t.Fatalf("verifyPassword returned %v, want errArgon2Busy", err)
+	}
+}
 
 func loginLimitTestConfig(perIP, overall, cooldown int) appConfig {
 	cfg := defaultAppConfig()

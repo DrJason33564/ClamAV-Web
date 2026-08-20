@@ -88,7 +88,11 @@ flowchart LR
 - 非安全方法会校验 `Origin` 与请求 Host 一致，以降低跨站请求风险。
 - `/api/admin/*` 和 ClamAV 休眠/唤醒额外要求 admin。
 
-密码使用 Argon2id 和每个密码独立 salt。登录限流以客户端 IP 和全局十分钟窗口计数；可信反向代理的取 IP 规则不可自行假设，必须遵守 [server/server_conf.md](server/server_conf.md) 中的 `SERVER_TRUSTED_REVERSEPROXY` 定义。
+密码使用 Argon2id 和每个密码独立 salt，当前参数每次运算约占用 19 MiB 工作内存。所有由
+HTTP 请求触发的 Argon2id 哈希与校验共享 5 个并发槽位，满载时立即返回 `429`，以将这部分
+峰值工作内存约束在 95 MiB。登录限流以客户端 IP 和全局十分钟窗口计数；可信反向代理的
+取 IP 规则不可自行假设，必须遵守 [server/server_conf.md](server/server_conf.md) 中的
+`SERVER_TRUSTED_REVERSEPROXY` 定义。
 
 HTTP Server 使用固定的连接级安全边界：请求头读取最多 10 秒、完整请求读取最多 30 秒、
 keep-alive 空闲最多 60 秒，请求头最多 64 KiB。响应写入上限为 25 分钟，特意高于 ClamAV

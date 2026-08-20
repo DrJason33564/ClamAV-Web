@@ -128,8 +128,12 @@ func (s *server) patchAdminUser(w http.ResponseWriter, r *http.Request, who acto
 		if *req.Password == "" {
 			password = sql.NullString{}
 		} else {
-			hash, err := hashPassword(*req.Password)
+			hash, err := s.hashPassword(*req.Password)
 			if err != nil {
+				if errors.Is(err, errArgon2Busy) {
+					writeArgon2Busy(w)
+					return
+				}
 				writeError(w, http.StatusBadRequest, err)
 				return
 			}
@@ -176,7 +180,16 @@ func (s *server) handleAuthAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var hash string
-	if err := s.userDB.QueryRowContext(r.Context(), "SELECT password_hash FROM users WHERE id=?", who.ID).Scan(&hash); err != nil || !verifyPassword(req.Password, hash) {
+	if err := s.userDB.QueryRowContext(r.Context(), "SELECT password_hash FROM users WHERE id=?", who.ID).Scan(&hash); err != nil {
+		writeError(w, http.StatusUnauthorized, errors.New("password is incorrect"))
+		return
+	}
+	valid, err := s.verifyPassword(req.Password, hash)
+	if errors.Is(err, errArgon2Busy) {
+		writeArgon2Busy(w)
+		return
+	}
+	if !valid {
 		writeError(w, http.StatusUnauthorized, errors.New("password is incorrect"))
 		return
 	}

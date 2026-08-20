@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -29,7 +30,35 @@ const (
 	sessionIdleTTL      = 2 * time.Hour
 	sessionAbsoluteTTL  = 24 * time.Hour
 	sessionRefreshAfter = 5 * time.Minute
+	argon2Concurrency   = 5
+	argon2RetryAfter    = "1"
 )
+
+var errArgon2Busy = errors.New("password processing is busy; try again later")
+
+// argon2Limiter is zero-value ready so lightweight server instances in tests
+// cannot accidentally bypass the same process-wide memory boundary used in
+// production. Every request-triggered Argon2 operation shares these slots.
+type argon2Limiter struct {
+	once  sync.Once
+	slots chan struct{}
+}
+
+func (l *argon2Limiter) tryAcquire() bool {
+	l.once.Do(func() {
+		l.slots = make(chan struct{}, argon2Concurrency)
+	})
+	select {
+	case l.slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (l *argon2Limiter) release() {
+	<-l.slots
+}
 
 var usernamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
@@ -243,8 +272,12 @@ func (s *server) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	var encoded *string
 	if req.Password != "" {
-		hash, err := hashPassword(req.Password)
+		hash, err := s.hashPassword(req.Password)
 		if err != nil {
+			if errors.Is(err, errArgon2Busy) {
+				writeArgon2Busy(w)
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -321,10 +354,22 @@ func (s *server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	var username, role, status string
 	var passwordHash sql.NullString
 	err := s.userDB.QueryRowContext(r.Context(), "SELECT id,username,password_hash,role,status FROM users WHERE username=?", req.Username).Scan(&id, &username, &passwordHash, &role, &status)
-	valid := err == nil && status == "active" && passwordHash.Valid && verifyPassword(req.Password, passwordHash.String)
+	valid := false
+	if err == nil && status == "active" && passwordHash.Valid {
+		valid, err = s.verifyPassword(req.Password, passwordHash.String)
+		if errors.Is(err, errArgon2Busy) {
+			s.warn("auth", "login rejected because password processing is busy", "client_ip", clientIP, "user", req.Username)
+			writeArgon2Busy(w)
+			return
+		}
+	}
 	if err != nil || !passwordHash.Valid {
 		// Keep unknown users and passwordless users close to the normal timing path.
-		_ = verifyPassword(req.Password, dummyPasswordHash)
+		if _, verifyErr := s.verifyPassword(req.Password, dummyPasswordHash); errors.Is(verifyErr, errArgon2Busy) {
+			s.warn("auth", "login rejected because password processing is busy", "client_ip", clientIP, "user", req.Username)
+			writeArgon2Busy(w)
+			return
+		}
 	}
 	if !valid {
 		s.warn("auth", "login failed", "client_ip", clientIP, "user", req.Username, "reason", "invalid_credentials")
@@ -410,12 +455,25 @@ func (s *server) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var current string
-	if err := s.userDB.QueryRowContext(r.Context(), "SELECT password_hash FROM users WHERE id=?", who.ID).Scan(&current); err != nil || !verifyPassword(req.CurrentPassword, current) {
+	if err := s.userDB.QueryRowContext(r.Context(), "SELECT password_hash FROM users WHERE id=?", who.ID).Scan(&current); err != nil {
 		writeError(w, http.StatusUnauthorized, errors.New("current password is incorrect"))
 		return
 	}
-	next, err := hashPassword(req.NewPassword)
+	valid, err := s.verifyPassword(req.CurrentPassword, current)
+	if errors.Is(err, errArgon2Busy) {
+		writeArgon2Busy(w)
+		return
+	}
+	if !valid {
+		writeError(w, http.StatusUnauthorized, errors.New("current password is incorrect"))
+		return
+	}
+	next, err := s.hashPassword(req.NewPassword)
 	if err != nil {
+		if errors.Is(err, errArgon2Busy) {
+			writeArgon2Busy(w)
+			return
+		}
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -458,6 +516,18 @@ func hashPassword(password string) (string, error) {
 	return fmt.Sprintf("$argon2id$v=19$m=19456,t=2,p=1$%s$%s", b64.EncodeToString(salt), b64.EncodeToString(hash)), nil
 }
 
+func (s *server) hashPassword(password string) (string, error) {
+	// Preserve validation errors even while the KDF is saturated.
+	if len(password) < 8 || len(password) > 1024 {
+		return "", errors.New("password must be between 8 and 1024 bytes")
+	}
+	if !s.argon2Limiter.tryAcquire() {
+		return "", errArgon2Busy
+	}
+	defer s.argon2Limiter.release()
+	return hashPassword(password)
+}
+
 func verifyPassword(password, encoded string) bool {
 	parts := strings.Split(encoded, "$")
 	if len(parts) != 6 || parts[1] != "argon2id" || parts[2] != "v=19" {
@@ -479,6 +549,19 @@ func verifyPassword(password, encoded string) bool {
 	}
 	got := argon2.IDKey([]byte(password), salt, iterations, memory, parallelism, uint32(len(want)))
 	return subtle.ConstantTimeCompare(got, want) == 1
+}
+
+func (s *server) verifyPassword(password, encoded string) (bool, error) {
+	if !s.argon2Limiter.tryAcquire() {
+		return false, errArgon2Busy
+	}
+	defer s.argon2Limiter.release()
+	return verifyPassword(password, encoded), nil
+}
+
+func writeArgon2Busy(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", argon2RetryAfter)
+	writeError(w, http.StatusTooManyRequests, errArgon2Busy)
 }
 
 var dummyPasswordHash, _ = hashPassword("clamavweb-dummy-password")
