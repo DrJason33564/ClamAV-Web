@@ -95,17 +95,27 @@ func (s *server) cleanUserResults(ctx context.Context, userID string) (int, erro
 	if err != nil {
 		return 0, err
 	}
+	defer rows.Close()
 	type ownedJob struct{ id, jsonFile string }
 	var jobs []ownedJob
 	for rows.Next() {
 		var job ownedJob
 		if err := rows.Scan(&job.id, &job.jsonFile); err != nil {
-			rows.Close()
 			return 0, err
 		}
 		jobs = append(jobs, job)
 	}
-	rows.Close()
+	// Do not act on a partial result set. Next returns false both at normal EOF
+	// and when iteration is interrupted by a database or context error.
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	deleted := 0
 	for _, job := range jobs {
 		for _, path := range []string{job.jsonFile, filepath.Join(s.cfg.LogDir, job.id+".log"), filepath.Join(s.cfg.LogDir, "clamav_detection_"+job.id+".log")} {
