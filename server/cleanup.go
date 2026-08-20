@@ -78,15 +78,6 @@ func cleanAllRequested(r *http.Request) bool {
 	return strings.EqualFold(strings.TrimSpace(req.CleanAll), "Y")
 }
 
-func (s *server) cleanAllResults() (int, error) {
-	deletedLogs, err := cleanMatchingFiles(s.cfg.LogDir, removableResultLog)
-	if err != nil {
-		return deletedLogs, err
-	}
-	deletedJobs, err := cleanMatchingFiles(s.cfg.JobsDir, removableResultJob)
-	return deletedLogs + deletedJobs, err
-}
-
 func (s *server) cleanUserResults(ctx context.Context, userID string) (int, error) {
 	if s.history != nil {
 		_ = s.history.refresh(ctx)
@@ -226,61 +217,6 @@ func (s *server) cleanDeleteUser(ctx context.Context, username string) error {
 		s.error("users", "user deletion failed", "user", username, "error", err)
 	}
 	return err
-}
-
-func cleanMatchingFiles(dir string, match func(string) bool) (int, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return 0, nil
-		}
-		return 0, err
-	}
-	deleted := 0
-	for _, entry := range entries {
-		if entry.IsDir() || !match(entry.Name()) {
-			continue
-		}
-		if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
-			return deleted, err
-		}
-		deleted++
-	}
-	return deleted, nil
-}
-
-func cleanDirectoryChildren(dir string) (int, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return 0, nil
-		}
-		return 0, err
-	}
-	deleted := 0
-	for _, entry := range entries {
-		if err := os.RemoveAll(filepath.Join(dir, entry.Name())); err != nil {
-			return deleted, err
-		}
-		deleted++
-	}
-	return deleted, nil
-}
-
-func removableResultLog(name string) bool {
-	if !strings.HasSuffix(name, ".log") {
-		return false
-	}
-	return strings.HasPrefix(name, "manual-") ||
-		strings.HasPrefix(name, "cron-") ||
-		strings.HasPrefix(name, "clamav_detection")
-}
-
-func removableResultJob(name string) bool {
-	if !strings.HasSuffix(name, ".json") {
-		return false
-	}
-	return strings.HasPrefix(name, "manual-") || strings.HasPrefix(name, "cron-")
 }
 
 func writeCleanResponse(w http.ResponseWriter, statusCode int, status string, deleted int, err error) {
