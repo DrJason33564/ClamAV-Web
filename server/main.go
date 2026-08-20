@@ -17,6 +17,17 @@ import (
 	"clamav-scanner/internal/applog"
 )
 
+const (
+	// Keep connection limits as fixed security boundaries rather than runtime
+	// settings that can be accidentally disabled. The write deadline stays
+	// above the 21-minute ClamAV wake timeout so a valid wake can still reply.
+	httpReadHeaderTimeout = 10 * time.Second
+	httpReadTimeout       = 30 * time.Second
+	httpIdleTimeout       = 60 * time.Second
+	httpWriteTimeout      = 25 * time.Minute
+	httpMaxHeaderBytes    = 64 * 1024
+)
+
 type server struct {
 	cfg                      config
 	mu                       sync.RWMutex
@@ -164,7 +175,7 @@ func run() error {
 	mux.HandleFunc("/api/quarantine/recover/", s.handleQuarantineRecover)
 	mux.HandleFunc("/api/quarantine/clean", s.handleQuarantineClean)
 
-	httpServer := &http.Server{Addr: cfg.Addr, Handler: s.logRequests(s.requireAuth(mux))}
+	httpServer := newHTTPServer(cfg.Addr, s.logRequests(s.requireAuth(mux)))
 	listener, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		s.error("startup", "http server listen failed", "address", cfg.Addr, "error", err)
@@ -189,4 +200,16 @@ func run() error {
 	}
 	s.info("startup", "clamav scanner web service stopped")
 	return nil
+}
+
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		IdleTimeout:       httpIdleTimeout,
+		WriteTimeout:      httpWriteTimeout,
+		MaxHeaderBytes:    httpMaxHeaderBytes,
+	}
 }

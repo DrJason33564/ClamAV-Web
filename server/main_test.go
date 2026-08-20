@@ -14,6 +14,22 @@ import (
 	"time"
 )
 
+func TestNewHTTPServerAppliesConnectionLimits(t *testing.T) {
+	handler := http.NewServeMux()
+	httpServer := newHTTPServer("127.0.0.1:8080", handler)
+
+	if httpServer.Addr != "127.0.0.1:8080" || httpServer.Handler != handler {
+		t.Fatalf("unexpected HTTP server routing: addr=%q handler=%v", httpServer.Addr, httpServer.Handler)
+	}
+	if httpServer.ReadHeaderTimeout != httpReadHeaderTimeout ||
+		httpServer.ReadTimeout != httpReadTimeout ||
+		httpServer.IdleTimeout != httpIdleTimeout ||
+		httpServer.WriteTimeout != httpWriteTimeout ||
+		httpServer.MaxHeaderBytes != httpMaxHeaderBytes {
+		t.Fatalf("unexpected HTTP connection limits: %#v", httpServer)
+	}
+}
+
 func TestStartScanRejectsSleepingClamAV(t *testing.T) {
 	tmp := t.TempDir()
 	sleepLock := filepath.Join(tmp, "sleep.lock")
