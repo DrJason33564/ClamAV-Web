@@ -331,6 +331,8 @@ WEB_FIRSTRUN_COMPLETED=2
 
 `status.json` 是全局文件，但 API 会过滤 `active_job_id`，并从 SQLite 查询当前用户自己的最近任务。不会返回其他用户任务。
 
+`ping` 与 `ping_message` 来自 `clamdscan --ping`，后端缓存探测结果 5 秒；缓存期内的并发状态请求不会重复启动探测进程。ClamAV 休眠或唤醒成功后缓存立即失效。
+
 `is_timedock` 在环境变量 `IS_TIMEDOCK=Y` 时为 `true`；未设置、为空或为 `N` 时为 `false`。
 
 ### `GET /api/config`

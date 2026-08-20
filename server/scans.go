@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -364,11 +363,6 @@ func (s *server) runBatch(id string) {
 		s.info("scan", "scan batch completed", "batch_id", id, "user", username, "status", finished.Status, "completed", finished.Completed, "failed", finished.Failed, "threats", finished.Threats)
 	}
 	s.finishBatch(id)
-	// Manual scans can be indexed immediately; the periodic pass remains the
-	// source of truth for cron jobs and for repairing interrupted updates.
-	if s.history != nil {
-		go func() { _ = s.history.refresh(context.Background()) }()
-	}
 }
 
 func (s *server) startScanScript(args []string) (string, func() (string, error), error) {

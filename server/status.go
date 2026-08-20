@@ -19,6 +19,14 @@ type statusResponse struct {
 	IsTimeDock  bool   `json:"is_timedock"`
 }
 
+const clamdPingCacheTTL = 5 * time.Second
+
+type clamdPingCacheEntry struct {
+	status    string
+	message   string
+	checkedAt time.Time
+}
+
 func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w)
@@ -37,7 +45,7 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ping, msg := s.pingClamd(r.Context())
+	ping, msg := s.cachedPingClamd(r.Context())
 	firstRun := "not_completed"
 	if s.appConfig != nil && s.appConfig.get().WebFirstRunCompleted == 2 {
 		firstRun = "completed"
@@ -50,6 +58,31 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		FirstRun:    firstRun,
 		IsTimeDock:  s.cfg.IsTimeDock,
 	})
+}
+
+// cachedPingClamd serializes cache misses so a burst of status requests starts
+// only one clamdscan process. The shared probe is detached from the first HTTP
+// client, while pingClamd still applies the configured command timeout.
+func (s *server) cachedPingClamd(ctx context.Context) (string, string) {
+	s.clamdPingMu.Lock()
+	defer s.clamdPingMu.Unlock()
+
+	if !s.clamdPingCache.checkedAt.IsZero() && time.Since(s.clamdPingCache.checkedAt) < clamdPingCacheTTL {
+		return s.clamdPingCache.status, s.clamdPingCache.message
+	}
+	status, message := s.pingClamd(context.WithoutCancel(ctx))
+	s.clamdPingCache = clamdPingCacheEntry{
+		status:    status,
+		message:   message,
+		checkedAt: time.Now(),
+	}
+	return status, message
+}
+
+func (s *server) invalidateClamdPingCache() {
+	s.clamdPingMu.Lock()
+	s.clamdPingCache = clamdPingCacheEntry{}
+	s.clamdPingMu.Unlock()
 }
 
 func (s *server) enrichStatusSource(source any, userIDs ...string) {

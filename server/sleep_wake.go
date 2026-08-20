@@ -203,6 +203,7 @@ func (s *server) sleepClamAV(ctx context.Context) (string, string, int, error) {
 
 	ping, _ := s.pingClamd(ctx)
 	if sleeping && ping != "ready" {
+		s.invalidateClamdPingCache()
 		if err := writeClamdSleepStatus(s.cfg.StatusFile); err != nil {
 			return "failed", "", http.StatusInternalServerError, fmt.Errorf("write ClamAV sleep status: %w", err)
 		}
@@ -223,6 +224,7 @@ func (s *server) sleepClamAV(ctx context.Context) (string, string, int, error) {
 		s.error("clamav_power", "send ClamAV shutdown failed", "error", err)
 		return "failed", "", powerErrorStatus(ctx, err), fmt.Errorf("put ClamAV to sleep: %w", err)
 	}
+	s.invalidateClamdPingCache()
 
 	// mkdir is the atomic state transition. An existing lock is valid when a
 	// stale sleep marker was found next to a still-running clamd instance.
@@ -260,6 +262,7 @@ func (s *server) wakeClamAV(requestCtx context.Context) (string, string, int, er
 		s.error("clamav_power", "ClamAV wake script failed", "error", err)
 		return "failed", "", http.StatusInternalServerError, fmt.Errorf("wake ClamAV: %w", err)
 	}
+	s.invalidateClamdPingCache()
 
 	// startup.sh owns both the final PONG check and the sleep-lock transition.
 	// A zero exit status is therefore the complete wake result.

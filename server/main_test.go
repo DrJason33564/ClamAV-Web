@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -208,6 +209,61 @@ func TestWhitelistUpdatesRejectSleepingClamAV(t *testing.T) {
 				t.Fatalf("unexpected sleeping response: %#v", body)
 			}
 		})
+	}
+}
+
+func TestStatusCachesAndCoalescesClamdPing(t *testing.T) {
+	binDir := t.TempDir()
+	counterPath := filepath.Join(t.TempDir(), "ping-count")
+	clamdscan := filepath.Join(binDir, "clamdscan")
+	if err := os.WriteFile(clamdscan, []byte("#!/bin/sh\nprintf x >> \"$CLAMD_PING_TEST_COUNTER\"\nsleep 0.05\nprintf PONG\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAMD_PING_TEST_COUNTER", counterPath)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	s := &server{cfg: config{
+		StatusFile:    filepath.Join(t.TempDir(), "missing-status.json"),
+		ClamdConf:     filepath.Join(t.TempDir(), "clamd.conf"),
+		CommandTimout: time.Second,
+	}}
+	for range 2 {
+		response := httptest.NewRecorder()
+		s.handleStatus(response, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"ping":"ready"`) {
+			t.Fatalf("unexpected status response: %d %s", response.Code, response.Body.String())
+		}
+	}
+	assertPingCount(t, counterPath, 1)
+
+	// Expire the entry and issue a burst. The cache mutex must combine every
+	// request into one new clamdscan process rather than merely cache afterward.
+	s.clamdPingMu.Lock()
+	s.clamdPingCache.checkedAt = time.Now().Add(-clamdPingCacheTTL)
+	s.clamdPingMu.Unlock()
+	var callers sync.WaitGroup
+	for range 8 {
+		callers.Add(1)
+		go func() {
+			defer callers.Done()
+			status, message := s.cachedPingClamd(t.Context())
+			if status != "ready" || message != "PONG" {
+				t.Errorf("unexpected cached ping result: status=%q message=%q", status, message)
+			}
+		}()
+	}
+	callers.Wait()
+	assertPingCount(t, counterPath, 2)
+}
+
+func assertPingCount(t *testing.T, path string, want int) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != want {
+		t.Fatalf("expected %d clamd ping processes, got %d", want, len(data))
 	}
 }
 
