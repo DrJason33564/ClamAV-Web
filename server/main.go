@@ -183,7 +183,7 @@ func run() error {
 	mux.HandleFunc("/api/quarantine/recover/", s.handleQuarantineRecover)
 	mux.HandleFunc("/api/quarantine/clean", s.handleQuarantineClean)
 
-	httpServer := newHTTPServer(cfg.Addr, s.logRequests(s.requireAuth(mux)))
+	httpServer := newHTTPServer(cfg.Addr, securityHeaders(s.logRequests(s.requireAuth(mux))))
 	listener, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		s.error("startup", "http server listen failed", "address", cfg.Addr, "error", err)

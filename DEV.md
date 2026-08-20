@@ -99,6 +99,10 @@ keep-alive 空闲最多 60 秒，请求头最多 64 KiB。响应写入上限为 
 唤醒流程的 21 分钟上限。这些值不是运行时配置项；直接暴露服务时由 Go 后端兜底，使用反向
 代理时应在代理侧设置相当或更严格的限制。
 
+Go 服务统一为静态资源、API 和错误响应设置 MIME 嗅探、点击劫持、CSP、Referrer Policy
+和 Permissions Policy 防护。CSP 仅允许同源脚本和连接；React 动态样式需要
+`style-src 'unsafe-inline'`。HSTS 不由后端发送，应由确认始终使用 HTTPS 的反向代理配置。
+
 ### 状态与持久化
 
 | 位置 | 所有者 | 内容 |

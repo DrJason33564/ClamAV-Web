@@ -8,6 +8,11 @@
 
 后端使用内置用户和 Cookie session，不再支持 HTTP Basic Auth。
 
+所有静态页面、API 和错误响应统一包含 `X-Content-Type-Options: nosniff`、禁止页面嵌入的
+`Content-Security-Policy` / `X-Frame-Options`、`Referrer-Policy: no-referrer` 和限制浏览器
+敏感能力的 `Permissions-Policy`。后端不发送 HSTS；始终使用 HTTPS 的部署应由 TLS 终止
+反向代理按实际域名配置 `Strict-Transport-Security`。
+
 登录成功后返回名为 `clamavweb_session` 的 Cookie。Cookie 使用：
 
 - `HttpOnly`；
