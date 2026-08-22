@@ -16,7 +16,7 @@ WEB_LOGIN_COOLDOWN_INTERVAL=600
 SERVER_TRUSTED_REVERSEPROXY=
 LOG_FILE_MAX_SIZE=5242880
 LOG_FILE_NUM=5
-LOG_LEVEL=info
+LOG_LEVEL=warn
 ```
 
 旧配置文件未包含新增键时，服务启动会在文件末尾仅追加缺失键及其默认值，已有配置、注释、
@@ -153,7 +153,7 @@ Go 后端将结构化文本日志写入 `/log/clamavweb.log`。该文件与 Shel
 ### `LOG_LEVEL`
 
 - 类型：字符串；
-- 默认值：`info`；
+- 默认值：`warn`；
 - 允许值：`debug`、`info`、`warn`、`error`；
 - 作用：设置最低写入等级。例如 `info` 会写入 info、warn 和 error。
 

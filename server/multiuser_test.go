@@ -463,7 +463,7 @@ func TestAppConfigAddsMissingKeysWithoutReplacingExistingContent(t *testing.T) {
 	for _, expected := range []string{
 		"WEB_FIRSTRUN_COMPLETED=0\n",
 		"WEB_LOGIN_MAX_TRIES=10\n",
-		"LOG_LEVEL=info\n",
+		"LOG_LEVEL=warn\n",
 	} {
 		if !strings.Contains(content, expected) {
 			t.Fatalf("missing default entry %q in:\n%s", expected, content)

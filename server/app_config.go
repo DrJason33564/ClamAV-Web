@@ -26,7 +26,7 @@ const (
 	maxWebLoginCooldownInterval        = 86400
 	defaultLogFileMaxSize              = 5 * 1024 * 1024
 	defaultLogFileNum                  = 5
-	defaultLogLevel                    = "info"
+	defaultLogLevel                    = "warn"
 	minLogFileMaxSize                  = 64 * 1024
 	maxLogFileMaxSize                  = 1024 * 1024 * 1024
 	maxLogFileNum                      = 100
