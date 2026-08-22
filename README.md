@@ -12,7 +12,7 @@
 [![GitHub Last Commit](https://img.shields.io/github/last-commit/DrJason33564/ClamAV-Web?style=flat-square&logo=github)](https://github.com/DrJason33564/ClamAV-Web/commits)
 [![License](https://img.shields.io/github/license/DrJason33564/ClamAV-Web?style=flat-square)](LICENSE)
 
-[![Go](https://img.shields.io/github/go-mod/go-version/DrJason33564/ClamAV-Web?style=flat-square&logo=go)](server/go.mod)
+[![Go](https://img.shields.io/github/go-mod/go-version/DrJason33564/ClamAV-Web?filename=server%2Fgo.mod)](server/go.mod)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=black)](ClamAV-Web/package.json)
 
 [GitHub](https://github.com/DrJason33564/ClamAV-Web) · [Docker Hub](https://hub.docker.com/r/tinkerbell37745/clamav-timedock) · [快速开始](#-快速开始) · [开发](DEV.md) · [API](server/api.md)
