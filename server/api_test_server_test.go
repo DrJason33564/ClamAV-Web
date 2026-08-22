@@ -259,6 +259,14 @@ func templateStatus(w http.ResponseWriter, r *http.Request) {
 		{"timeout", "clamd ping timed out"},
 	}
 	state := states[rand.Intn(len(states))]
+	clamdVersion := ""
+	databaseVersion := ""
+	databaseDate := ""
+	if state.status == "ready" {
+		clamdVersion = "1.5.4"
+		databaseVersion = "28098"
+		databaseDate = "Thu Aug 14 14:24:22 2026"
+	}
 	writeTemplateJSON(w, http.StatusOK, map[string]any{
 		"source": map[string]any{
 			"version":    1,
@@ -274,10 +282,13 @@ func templateStatus(w http.ResponseWriter, r *http.Request) {
 				"last_job_result": "clean",
 			},
 		},
-		"ping":         state.status,
-		"ping_message": state.message,
-		"checked_at":   timestamp,
-		"is_timedock":  false,
+		"ping":             state.status,
+		"ping_message":     state.message,
+		"clamd_version":    clamdVersion,
+		"database_version": databaseVersion,
+		"database_date":    databaseDate,
+		"checked_at":       timestamp,
+		"is_timedock":      false,
 	})
 }
 
@@ -738,6 +749,13 @@ func TestTemplateAPIResponses(t *testing.T) {
 		}
 		if _, exists := clamd["message"]; exists {
 			t.Fatalf("unexpected clamd message field: %#v", clamd)
+		}
+		if body["ping"] == "ready" {
+			if body["clamd_version"] == "" || body["database_version"] == "" || body["database_date"] == "" {
+				t.Fatalf("ready status is missing version fields: %#v", body)
+			}
+		} else if body["clamd_version"] != "" || body["database_version"] != "" || body["database_date"] != "" {
+			t.Fatalf("unready status contains version fields: %#v", body)
 		}
 		if body["is_timedock"] != false {
 			t.Fatalf("unexpected is_timedock value: %#v", body["is_timedock"])

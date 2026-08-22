@@ -34,6 +34,9 @@ export type StatusResponse = {
   source: StatusSource | string
   ping: string
   ping_message: string
+  clamd_version: string
+  database_version: string
+  database_date: string
   checked_at: string
   first_run: "completed" | "not_completed"
   is_timedock: boolean

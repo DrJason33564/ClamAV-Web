@@ -52,10 +52,11 @@ curl -u test:anything http://localhost:8081/api/status
 - `source.updated_at` 为本次请求的处理时间。
 - `source.clamd.last_checked_at` 为本次请求的处理时间。
 - `source.scan.last_job_id` 恒为 `manual-20260728070000`。
-- `checked_at` 为本次请求的处理时间。
+- `checked_at` 为模拟状态的生成时间。
 - `source.clamd.status` 从 `ready`、`error`、`timeout` 中随机选择。
 - `ping` 与 `source.clamd.status` 相同。
 - `ping_message` 与所选状态匹配。
+- 状态为 `ready` 时返回模拟的 `clamd_version`、`database_version` 和 `database_date`；其他状态下三个字段为空字符串。
 - `is_timedock` 固定为 `false`。
 
 状态与消息的对应关系：

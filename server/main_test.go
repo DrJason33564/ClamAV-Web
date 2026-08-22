@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -211,9 +214,42 @@ func TestWhitelistUpdatesRejectSleepingClamAV(t *testing.T) {
 	}
 }
 
-func TestStatusCachesAndCoalescesClamdPing(t *testing.T) {
+func TestStatusCachesAndCoalescesClamdProbe(t *testing.T) {
 	binDir := t.TempDir()
 	counterPath := filepath.Join(t.TempDir(), "ping-count")
+	socketPath := filepath.Join(t.TempDir(), "clamd.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	versionCommands := make(chan string, 2)
+	versionErrors := make(chan error, 1)
+	go func() {
+		for range 2 {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				versionErrors <- acceptErr
+				return
+			}
+			command := make([]byte, len("VERSION\n"))
+			_, readErr := io.ReadFull(conn, command)
+			if readErr == nil {
+				_, readErr = io.WriteString(conn, "ClamAV 1.5.4/28098/Thu Aug 14 14:24:22 2026\n")
+			}
+			_ = conn.Close()
+			if readErr != nil {
+				versionErrors <- readErr
+				return
+			}
+			if string(command) != "VERSION\n" {
+				versionErrors <- fmt.Errorf("unexpected clamd command: %q", command)
+				return
+			}
+			versionCommands <- string(command)
+		}
+	}()
+
 	clamdscan := filepath.Join(binDir, "clamdscan")
 	if err := os.WriteFile(clamdscan, []byte("#!/bin/sh\nprintf x >> \"$CLAMD_PING_TEST_COUNTER\"\nsleep 0.05\nprintf PONG\n"), 0o755); err != nil {
 		t.Fatal(err)
@@ -224,35 +260,61 @@ func TestStatusCachesAndCoalescesClamdPing(t *testing.T) {
 	s := &server{cfg: config{
 		StatusFile:    filepath.Join(t.TempDir(), "missing-status.json"),
 		ClamdConf:     filepath.Join(t.TempDir(), "clamd.conf"),
+		ClamdSocket:   socketPath,
 		CommandTimout: time.Second,
 	}}
+	var checkedAt string
 	for range 2 {
 		response := httptest.NewRecorder()
 		s.handleStatus(response, httptest.NewRequest(http.MethodGet, "/api/status", nil))
-		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"ping":"ready"`) {
+		if response.Code != http.StatusOK {
 			t.Fatalf("unexpected status response: %d %s", response.Code, response.Body.String())
+		}
+		var body statusResponse
+		if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Ping != "ready" || body.ClamdVersion != "1.5.4" || body.DatabaseVersion != "28098" || body.DatabaseDate != "Thu Aug 14 14:24:22 2026" {
+			t.Fatalf("unexpected status response: %#v", body)
+		}
+		if checkedAt == "" {
+			s.clamdStatusMu.Lock()
+			checkedAt = s.clamdStatusCache.checkedAt.Format(time.RFC3339)
+			s.clamdStatusMu.Unlock()
+			if body.CheckedAt != checkedAt {
+				t.Fatalf("checked_at does not match the cached probe: response=%q cache=%q", body.CheckedAt, checkedAt)
+			}
+		} else if body.CheckedAt != checkedAt {
+			t.Fatalf("cached checked_at changed: first=%q second=%q", checkedAt, body.CheckedAt)
 		}
 	}
 	assertPingCount(t, counterPath, 1)
+	assertVersionQueryCount(t, versionCommands, 1)
 
 	// Expire the entry and issue a burst. The cache mutex must combine every
-	// request into one new clamdscan process rather than merely cache afterward.
-	s.clamdPingMu.Lock()
-	s.clamdPingCache.checkedAt = time.Now().Add(-clamdPingCacheTTL)
-	s.clamdPingMu.Unlock()
+	// request into one new ping and VERSION probe rather than merely cache afterward.
+	s.clamdStatusMu.Lock()
+	s.clamdStatusCache.checkedAt = time.Now().Add(-clamdStatusCacheTTL)
+	s.clamdStatusMu.Unlock()
 	var callers sync.WaitGroup
 	for range 8 {
 		callers.Add(1)
 		go func() {
 			defer callers.Done()
-			status, message := s.cachedPingClamd(t.Context())
-			if status != "ready" || message != "PONG" {
-				t.Errorf("unexpected cached ping result: status=%q message=%q", status, message)
+			status := s.cachedClamdStatus(t.Context())
+			if status.ping != "ready" || status.pingMessage != "PONG" || status.clamdVersion != "1.5.4" || status.databaseVersion != "28098" {
+				t.Errorf("unexpected cached ClamAV status: %#v", status)
 			}
 		}()
 	}
 	callers.Wait()
 	assertPingCount(t, counterPath, 2)
+	assertVersionQueryCount(t, versionCommands, 2)
+	select {
+	case err := <-versionErrors:
+		t.Fatal(err)
+	default:
+	}
 }
 
 func assertPingCount(t *testing.T, path string, want int) {
@@ -263,6 +325,13 @@ func assertPingCount(t *testing.T, path string, want int) {
 	}
 	if len(data) != want {
 		t.Fatalf("expected %d clamd ping processes, got %d", want, len(data))
+	}
+}
+
+func assertVersionQueryCount(t *testing.T, commands chan string, want int) {
+	t.Helper()
+	if len(commands) != want {
+		t.Fatalf("expected %d clamd VERSION queries, got %d", want, len(commands))
 	}
 }
 

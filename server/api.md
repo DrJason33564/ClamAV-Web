@@ -332,6 +332,9 @@ WEB_FIRSTRUN_COMPLETED=2
   },
   "ping": "ready",
   "ping_message": "clamd is ready",
+  "clamd_version": "1.5.4",
+  "database_version": "28098",
+  "database_date": "Thu Aug 14 14:24:22 2026",
   "checked_at": "2026-08-04T19:00:00+08:00",
   "first_run": "completed",
   "is_timedock": true
@@ -340,7 +343,9 @@ WEB_FIRSTRUN_COMPLETED=2
 
 `status.json` 是全局文件，但 API 会过滤 `active_job_id`，并从 SQLite 查询当前用户自己的最近任务。不会返回其他用户任务。
 
-`ping` 与 `ping_message` 来自 `clamdscan --ping`，后端缓存探测结果 5 秒；缓存期内的并发状态请求不会重复启动探测进程。ClamAV 休眠或唤醒成功后缓存立即失效。
+`ping` 与 `ping_message` 来自 `clamdscan --ping`。clamd ready 时，后端通过 Unix socket 发送 `VERSION`，将响应解析为 `clamd_version`、`database_version` 和 `database_date`；查询或解析失败时这三个字段为空字符串。
+
+上述实时状态由后端缓存 5 秒；`checked_at` 是当前缓存结果的探测完成时间。缓存期内的并发状态请求不会重复执行 ping 或 VERSION 查询，ClamAV 休眠或唤醒成功后缓存立即失效。
 
 `is_timedock` 在环境变量 `IS_TIMEDOCK=Y` 时为 `true`；未设置、为空或为 `N` 时为 `false`。
 

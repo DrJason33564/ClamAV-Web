@@ -203,7 +203,7 @@ func (s *server) sleepClamAV(ctx context.Context) (string, string, int, error) {
 
 	ping, _ := s.pingClamd(ctx)
 	if sleeping && ping != "ready" {
-		s.invalidateClamdPingCache()
+		s.invalidateClamdStatusCache()
 		if err := writeClamdSleepStatus(s.cfg.StatusFile); err != nil {
 			return "failed", "", http.StatusInternalServerError, fmt.Errorf("write ClamAV sleep status: %w", err)
 		}
@@ -224,7 +224,7 @@ func (s *server) sleepClamAV(ctx context.Context) (string, string, int, error) {
 		s.error("clamav_power", "send ClamAV shutdown failed", "error", err)
 		return "failed", "", powerErrorStatus(ctx, err), fmt.Errorf("put ClamAV to sleep: %w", err)
 	}
-	s.invalidateClamdPingCache()
+	s.invalidateClamdStatusCache()
 
 	// mkdir is the atomic state transition. An existing lock is valid when a
 	// stale sleep marker was found next to a still-running clamd instance.
@@ -262,7 +262,7 @@ func (s *server) wakeClamAV(requestCtx context.Context) (string, string, int, er
 		s.error("clamav_power", "ClamAV wake script failed", "error", err)
 		return "failed", "", http.StatusInternalServerError, fmt.Errorf("wake ClamAV: %w", err)
 	}
-	s.invalidateClamdPingCache()
+	s.invalidateClamdStatusCache()
 
 	// startup.sh owns both the final PONG check and the sleep-lock transition.
 	// A zero exit status is therefore the complete wake result.
@@ -286,11 +286,7 @@ func sendClamdShutdown(ctx context.Context, socketPath string, timeout time.Dura
 }
 
 func sendClamdShutdownCommand(ctx context.Context, conn net.Conn, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	if requestDeadline, ok := ctx.Deadline(); ok && requestDeadline.Before(deadline) {
-		deadline = requestDeadline
-	}
-	if err := conn.SetDeadline(deadline); err != nil {
+	if err := setClamdSocketDeadline(ctx, conn, timeout); err != nil {
 		return err
 	}
 	if _, err := io.WriteString(conn, "SHUTDOWN\n"); err != nil {
@@ -311,6 +307,14 @@ func sendClamdShutdownCommand(ctx context.Context, conn net.Conn, timeout time.D
 		return err
 	}
 	return errors.New("clamd did not close the SHUTDOWN connection")
+}
+
+func setClamdSocketDeadline(ctx context.Context, conn net.Conn, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	if requestDeadline, ok := ctx.Deadline(); ok && requestDeadline.Before(deadline) {
+		deadline = requestDeadline
+	}
+	return conn.SetDeadline(deadline)
 }
 
 func directoryLockExists(path string) (bool, error) {

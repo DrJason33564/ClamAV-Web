@@ -54,6 +54,48 @@ func TestSendClamdShutdownRejectsResponse(t *testing.T) {
 	}
 }
 
+func TestQueryClamdVersionCommand(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+
+	command := make(chan string, 1)
+	go func() {
+		defer server.Close()
+		data := make([]byte, len("VERSION\n"))
+		_, readErr := io.ReadFull(server, data)
+		if readErr != nil {
+			command <- "read error: " + readErr.Error()
+			return
+		}
+		command <- string(data)
+		_, _ = io.WriteString(server, "ClamAV 1.5.4/28098/Thu Aug 14 14:24:22 2026\n")
+	}()
+
+	version, err := queryClamdVersionCommand(context.Background(), client, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version.clamdVersion != "1.5.4" || version.databaseVersion != "28098" || version.databaseDate != "Thu Aug 14 14:24:22 2026" {
+		t.Fatalf("unexpected clamd VERSION result: %#v", version)
+	}
+	if got := <-command; got != "VERSION\n" {
+		t.Fatalf("unexpected command: %q", got)
+	}
+}
+
+func TestParseClamdVersionResponseRejectsMalformedValues(t *testing.T) {
+	for _, response := range []string{
+		"",
+		"ClamAV 1.5.4",
+		"ClamAV 1.5.4//Thu Aug 14 14:24:22 2026",
+		"1.5.4/28098/Thu Aug 14 14:24:22 2026",
+	} {
+		if version, err := parseClamdVersionResponse(response); err == nil {
+			t.Errorf("expected malformed response to fail: response=%q version=%#v", response, version)
+		}
+	}
+}
+
 func TestDirectoryLockLifecycle(t *testing.T) {
 	tmp := t.TempDir()
 	sleepLock := filepath.Join(tmp, "sleep.lock")

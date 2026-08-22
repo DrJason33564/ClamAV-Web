@@ -44,8 +44,8 @@ type server struct {
 	lookupLifecycleMu        sync.Mutex
 	lookupRuntime            *lookupRuntime
 	clamavPowerMu            sync.Mutex
-	clamdPingMu              sync.Mutex
-	clamdPingCache           clamdPingCacheEntry
+	clamdStatusMu            sync.Mutex
+	clamdStatusCache         clamdStatusCacheEntry
 	configFileMu             sync.Mutex
 	accountDeleteMu          sync.Mutex
 	registrationMu           sync.Mutex
