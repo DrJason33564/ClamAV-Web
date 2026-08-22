@@ -174,6 +174,13 @@ go test ./...
 
 更完整的架构、开发流程、测试与扩展约定，请阅读 [DEV.md](DEV.md)。请求与响应详情请阅读 [server/api.md](server/api.md)。
 
+## 🙏 致谢
+
+本项目开发中使用到了以下数个项目/开源仓库，致谢
+
+- [shadcn/ui](https://ui.shadcn.com/) - 前端组件
+- [Cisco-Talos/clamav](https://github.com/Cisco-Talos/clamav) - 杀毒引擎
+
 ## 📄 License
 
 本项目采用 [MIT License](LICENSE)。
