@@ -42,10 +42,10 @@ split_cron_config_line() {
     set -- $line
     set +f
 
-    if [ "$#" -lt 7 ]; then
+    if [ "$#" -lt 9 ]; then
         config_invalid "format" "$line_no" "$line"
-        config_log "[ERROR] Invalid line $line_no: expected 5 cron fields, scan target and action, got: $line"
-        config_log "[ERROR] Expected format: minute hour day month weekday scan_target action"
+        config_log "[ERROR] Invalid line $line_no: expected 5 cron fields, scan target, action, owner user ID and wake flag, got: $line"
+        config_log "[ERROR] Expected format: minute hour day month weekday scan_target action owner_user_id wake(Y/N)"
         config_log "[ERROR] scan_target may be quoted with double quotes if it contains spaces."
         config_log "[ERROR] Supported actions: warn, move, remove"
         return 1
@@ -93,11 +93,13 @@ split_cron_config_line() {
             set -- $after_quote
             set +f
 
-            if [ "$#" -ne 1 ]; then
-                config_invalid "action" "$line_no" "$line"
+            if [ "$#" -ne 3 ]; then
+                config_invalid "format" "$line_no" "$line"
                 return 1
             fi
             CRON_ACTION="$1"
+            CRON_USER_ID="$2"
+            CRON_WAKE="$3"
             ;;
         *)
             set -f
@@ -105,13 +107,15 @@ split_cron_config_line() {
             set -- $tail
             set +f
 
-            if [ "$#" -ne 2 ]; then
+            if [ "$#" -ne 4 ]; then
                 config_invalid "target" "$line_no" "$line"
-                config_log "[ERROR] Wrap paths containing spaces in double quotes, for example: \"/scan/My Folder\" move"
+                config_log "[ERROR] Wrap paths containing spaces in double quotes, for example: \"/scan/My Folder\" move admin001 Y"
                 return 1
             fi
             CRON_TARGET="$1"
             CRON_ACTION="$2"
+            CRON_USER_ID="$3"
+            CRON_WAKE="$4"
             ;;
     esac
 
@@ -129,6 +133,36 @@ split_cron_config_line() {
         config_invalid "target" "$line_no" "$line"
         return 1
     fi
+
+    case "$CRON_USER_ID" in
+        *[!a-z0-9]*)
+            config_invalid "owner" "$line_no" "$CRON_USER_ID"
+            return 1
+            ;;
+    esac
+
+    if [ "${#CRON_USER_ID}" -ne 8 ]; then
+        config_invalid "owner" "$line_no" "$CRON_USER_ID"
+        return 1
+    fi
+    case "$CRON_USER_ID" in
+        *[a-z]*) ;;
+        *) config_invalid "owner" "$line_no" "$CRON_USER_ID"; return 1 ;;
+    esac
+    case "$CRON_USER_ID" in
+        *[0-9]*) ;;
+        *) config_invalid "owner" "$line_no" "$CRON_USER_ID"; return 1 ;;
+    esac
+
+    case "$CRON_WAKE" in
+        Y|N)
+            ;;
+        *)
+            config_invalid "wake" "$line_no" "$CRON_WAKE"
+            config_log "[ERROR] Wake flag must be Y or N"
+            return 1
+            ;;
+    esac
 
     return 0
 }

@@ -11,8 +11,38 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"time"
 )
+
+// clamavSleepTimerState separates synchronous activity tracking from timer
+// ownership. Only the scheduler goroutine touches time.Timer; callers merely
+// advance the generation and send a coalesced wake-up notification.
+type clamavSleepTimerState struct {
+	mu         sync.Mutex
+	generation uint64
+	changed    chan struct{}
+}
+
+func newClamAVSleepTimerState() *clamavSleepTimerState {
+	return &clamavSleepTimerState{changed: make(chan struct{}, 1)}
+}
+
+func (state *clamavSleepTimerState) advance() {
+	state.mu.Lock()
+	state.generation++
+	state.mu.Unlock()
+	select {
+	case state.changed <- struct{}{}:
+	default:
+	}
+}
+
+func (state *clamavSleepTimerState) currentGeneration() uint64 {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.generation
+}
 
 type clamavPowerResponse struct {
 	Status  string `json:"status"`
@@ -33,6 +63,7 @@ func (s *server) handleClamAVSleep(w http.ResponseWriter, r *http.Request) {
 		writeError(w, statusCode, err)
 		return
 	}
+	s.notifyClamAVSleepTimerChanged("manual_sleep")
 	writeJSON(w, statusCode, clamavPowerResponse{Status: status, Message: message})
 }
 
@@ -50,10 +81,121 @@ func (s *server) handleClamAVWake(w http.ResponseWriter, r *http.Request) {
 		writeError(w, statusCode, err)
 		return
 	}
+	s.notifyClamAVSleepTimerChanged("manual_wake")
 	writeJSON(w, statusCode, clamavPowerResponse{Status: status, Message: message})
 }
 
+func (s *server) notifyClamAVSleepTimerChanged(reason string) {
+	if s.clamavSleepTimer == nil {
+		return
+	}
+	s.clamavSleepTimer.advance()
+	s.debug("clamav_power", "ClamAV sleep timer reset requested", "reason", reason)
+}
+
+func stopAndDrainTimer(timer *time.Timer) {
+	if timer == nil || timer.Stop() {
+		return
+	}
+	select {
+	case <-timer.C:
+	default:
+	}
+}
+
+func (s *server) manualScanPendingOrActive() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.activeBatchID != "" || len(s.queuedBatchIDs) != 0
+}
+
+func (s *server) runClamAVSleepTimer(ctx context.Context) {
+	s.runClamAVSleepTimerWithUnit(ctx, time.Second)
+}
+
+// runClamAVSleepTimerWithUnit keeps production intervals in seconds while
+// allowing deterministic, fast unit tests without weakening config validation.
+func (s *server) runClamAVSleepTimerWithUnit(ctx context.Context, unit time.Duration) {
+	s.runClamAVSleepTimerWithAction(ctx, unit, s.sleepClamAV)
+}
+
+func (s *server) runClamAVSleepTimerWithAction(ctx context.Context, unit time.Duration, sleep func(context.Context) (string, string, int, error)) {
+	if s.clamavSleepTimer == nil {
+		return
+	}
+
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	var armedGeneration uint64
+	var armedInterval int
+	arm := func() {
+		stopAndDrainTimer(timer)
+		timer = nil
+		timerC = nil
+
+		interval := s.appConfig.get().ClamAVSleepTimer
+		if interval == 0 {
+			s.debug("clamav_power", "ClamAV sleep timer disabled")
+			return
+		}
+		sleeping, err := directoryLockExists(s.cfg.SleepLockDir)
+		if err != nil {
+			s.warn("clamav_power", "ClamAV sleep timer state check failed", "error", err)
+		} else if sleeping {
+			s.debug("clamav_power", "ClamAV sleep timer paused while engine is sleeping")
+			return
+		}
+
+		armedGeneration = s.clamavSleepTimer.currentGeneration()
+		armedInterval = interval
+		timer = time.NewTimer(time.Duration(interval) * unit)
+		timerC = timer.C
+		s.debug("clamav_power", "ClamAV sleep timer started", "interval_seconds", interval)
+	}
+
+	arm()
+	defer func() { stopAndDrainTimer(timer) }()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.clamavSleepTimer.changed:
+			arm()
+		case <-timerC:
+			timer = nil
+			timerC = nil
+
+			s.clamavPowerMu.Lock()
+			currentInterval := s.appConfig.get().ClamAVSleepTimer
+			if armedGeneration != s.clamavSleepTimer.currentGeneration() || currentInterval == 0 || currentInterval != armedInterval {
+				s.clamavPowerMu.Unlock()
+				arm()
+				continue
+			}
+			if s.manualScanPendingOrActive() {
+				s.clamavPowerMu.Unlock()
+				s.debug("clamav_power", "automatic ClamAV sleep deferred for manual scan")
+				arm()
+				continue
+			}
+
+			status, _, statusCode, err := sleep(ctx)
+			s.clamavPowerMu.Unlock()
+			if err == nil && status == "sleeping" {
+				s.info("clamav_power", "ClamAV sleep timer expired; engine is sleeping")
+				continue
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			s.warn("clamav_power", "automatic ClamAV sleep failed; timer will retry", "status_code", statusCode, "error", err)
+			arm()
+		}
+	}
+}
+
 func (s *server) sleepClamAV(ctx context.Context) (string, string, int, error) {
+	s.debug("clamav_power", "ClamAV sleep requested")
 	sleeping, err := directoryLockExists(s.cfg.SleepLockDir)
 	if err != nil {
 		return "failed", "", http.StatusInternalServerError, err
@@ -61,6 +203,7 @@ func (s *server) sleepClamAV(ctx context.Context) (string, string, int, error) {
 
 	ping, _ := s.pingClamd(ctx)
 	if sleeping && ping != "ready" {
+		s.invalidateClamdStatusCache()
 		if err := writeClamdSleepStatus(s.cfg.StatusFile); err != nil {
 			return "failed", "", http.StatusInternalServerError, fmt.Errorf("write ClamAV sleep status: %w", err)
 		}
@@ -73,12 +216,15 @@ func (s *server) sleepClamAV(ctx context.Context) (string, string, int, error) {
 		return "failed", "", http.StatusInternalServerError, fmt.Errorf("check active scan lock: %w", err)
 	}
 	if scanning {
+		s.warn("clamav_power", "ClamAV sleep rejected while scan is active")
 		return "failed", "", http.StatusConflict, errors.New("ClamAV cannot sleep while a scan is active")
 	}
 
 	if err := sendClamdShutdown(ctx, s.cfg.ClamdSocket, s.cfg.CommandTimout); err != nil {
+		s.error("clamav_power", "send ClamAV shutdown failed", "error", err)
 		return "failed", "", powerErrorStatus(ctx, err), fmt.Errorf("put ClamAV to sleep: %w", err)
 	}
+	s.invalidateClamdStatusCache()
 
 	// mkdir is the atomic state transition. An existing lock is valid when a
 	// stale sleep marker was found next to a still-running clamd instance.
@@ -88,10 +234,12 @@ func (s *server) sleepClamAV(ctx context.Context) (string, string, int, error) {
 	if err := writeClamdSleepStatus(s.cfg.StatusFile); err != nil {
 		return "failed", "", http.StatusInternalServerError, fmt.Errorf("write ClamAV sleep status: %w", err)
 	}
+	s.info("clamav_power", "ClamAV entered sleep mode")
 	return "sleeping", "ClamAV entered sleep mode.", http.StatusOK, nil
 }
 
 func (s *server) wakeClamAV(requestCtx context.Context) (string, string, int, error) {
+	s.debug("clamav_power", "ClamAV wake requested")
 	ping, _ := s.pingClamd(requestCtx)
 	alreadyAwake := ping == "ready"
 
@@ -108,16 +256,21 @@ func (s *server) wakeClamAV(requestCtx context.Context) (string, string, int, er
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
+			s.error("clamav_power", "ClamAV wake timed out", "timeout", s.cfg.WakeTimeout)
 			return "failed", "", http.StatusGatewayTimeout, errors.New("ClamAV wake timed out")
 		}
+		s.error("clamav_power", "ClamAV wake script failed", "error", err)
 		return "failed", "", http.StatusInternalServerError, fmt.Errorf("wake ClamAV: %w", err)
 	}
+	s.invalidateClamdStatusCache()
 
 	// startup.sh owns both the final PONG check and the sleep-lock transition.
 	// A zero exit status is therefore the complete wake result.
 	if alreadyAwake {
+		s.info("clamav_power", "ClamAV wake completed; daemon was already awake")
 		return "awake", "ClamAV is already awake.", http.StatusOK, nil
 	}
+	s.info("clamav_power", "ClamAV woke successfully")
 	return "awake", "ClamAV woke successfully.", http.StatusOK, nil
 }
 
@@ -133,11 +286,7 @@ func sendClamdShutdown(ctx context.Context, socketPath string, timeout time.Dura
 }
 
 func sendClamdShutdownCommand(ctx context.Context, conn net.Conn, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	if requestDeadline, ok := ctx.Deadline(); ok && requestDeadline.Before(deadline) {
-		deadline = requestDeadline
-	}
-	if err := conn.SetDeadline(deadline); err != nil {
+	if err := setClamdSocketDeadline(ctx, conn, timeout); err != nil {
 		return err
 	}
 	if _, err := io.WriteString(conn, "SHUTDOWN\n"); err != nil {
@@ -158,6 +307,14 @@ func sendClamdShutdownCommand(ctx context.Context, conn net.Conn, timeout time.D
 		return err
 	}
 	return errors.New("clamd did not close the SHUTDOWN connection")
+}
+
+func setClamdSocketDeadline(ctx context.Context, conn net.Conn, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	if requestDeadline, ok := ctx.Deadline(); ok && requestDeadline.Before(deadline) {
+		deadline = requestDeadline
+	}
+	return conn.SetDeadline(deadline)
 }
 
 func directoryLockExists(path string) (bool, error) {
@@ -215,7 +372,6 @@ func writeClamdSleepStatus(path string) error {
 		root["clamd"] = clamd
 	}
 	clamd["status"] = "sleep"
-	clamd["message"] = "clamd is sleeping."
 
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".status.*")

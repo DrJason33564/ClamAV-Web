@@ -6,14 +6,13 @@ import (
 	"net/http"
 )
 
-// Embed the web directory rather than only dist so the Go package remains
-// buildable before the frontend build has run. Production images contain the
-// Vite-generated web/dist directory.
+// Embed the generated web directory. The repository keeps only a web-dist
+// placeholder; Docker replaces it with the Vite-generated frontend assets.
 //
-//go:embed web
+//go:embed web-dist
 var webAssets embed.FS
 
-var distAssets = mustSubFS(webAssets, "web/dist")
+var distAssets = mustSubFS(webAssets, "web-dist")
 
 func mustSubFS(fsys fs.FS, dir string) fs.FS {
 	sub, err := fs.Sub(fsys, dir)

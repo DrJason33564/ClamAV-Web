@@ -54,6 +54,48 @@ func TestSendClamdShutdownRejectsResponse(t *testing.T) {
 	}
 }
 
+func TestQueryClamdVersionCommand(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+
+	command := make(chan string, 1)
+	go func() {
+		defer server.Close()
+		data := make([]byte, len("VERSION\n"))
+		_, readErr := io.ReadFull(server, data)
+		if readErr != nil {
+			command <- "read error: " + readErr.Error()
+			return
+		}
+		command <- string(data)
+		_, _ = io.WriteString(server, "ClamAV 1.5.4/28098/Thu Aug 14 14:24:22 2026\n")
+	}()
+
+	version, err := queryClamdVersionCommand(context.Background(), client, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version.clamdVersion != "1.5.4" || version.databaseVersion != "28098" || version.databaseDate != "Thu Aug 14 14:24:22 2026" {
+		t.Fatalf("unexpected clamd VERSION result: %#v", version)
+	}
+	if got := <-command; got != "VERSION\n" {
+		t.Fatalf("unexpected command: %q", got)
+	}
+}
+
+func TestParseClamdVersionResponseRejectsMalformedValues(t *testing.T) {
+	for _, response := range []string{
+		"",
+		"ClamAV 1.5.4",
+		"ClamAV 1.5.4//Thu Aug 14 14:24:22 2026",
+		"1.5.4/28098/Thu Aug 14 14:24:22 2026",
+	} {
+		if version, err := parseClamdVersionResponse(response); err == nil {
+			t.Errorf("expected malformed response to fail: response=%q version=%#v", response, version)
+		}
+	}
+}
+
 func TestDirectoryLockLifecycle(t *testing.T) {
 	tmp := t.TempDir()
 	sleepLock := filepath.Join(tmp, "sleep.lock")
@@ -107,8 +149,7 @@ func TestSleepClamAVWritesCompleteStatusWhenAlreadySleeping(t *testing.T) {
   "updated_at": "2026-07-29T12:00:00+0800",
   "clamd": {
     "status": "ready",
-    "last_checked_at": "2026-07-29T12:00:00+0800",
-    "message": "clamd is ready."
+    "last_checked_at": "2026-07-29T12:00:00+0800"
   },
   "scan": {
     "active_job_id": null,
@@ -139,8 +180,11 @@ func TestSleepClamAVWritesCompleteStatusWhenAlreadySleeping(t *testing.T) {
 		t.Fatal(err)
 	}
 	clamd := root["clamd"].(map[string]any)
-	if clamd["status"] != "sleep" || clamd["message"] != "clamd is sleeping." {
+	if clamd["status"] != "sleep" {
 		t.Fatalf("unexpected clamd status: %#v", clamd)
+	}
+	if _, exists := clamd["message"]; exists {
+		t.Fatalf("unexpected clamd message field: %#v", clamd)
 	}
 	if clamd["last_checked_at"] != "2026-07-29T12:00:00+0800" {
 		t.Fatalf("clamd fields were not preserved: %#v", clamd)
@@ -177,6 +221,141 @@ func TestWakeClamAVDelegatesStaleLockCleanupToStartupScript(t *testing.T) {
 	}
 	if _, err := os.Stat(sleepLock); !os.IsNotExist(err) {
 		t.Fatalf("expected stale sleep lock removal, err=%v", err)
+	}
+}
+
+func TestClamAVSleepTimerExpires(t *testing.T) {
+	tmp := t.TempDir()
+	shutdownReceived := make(chan struct{})
+	app, err := newAppConfigStore(filepath.Join(tmp, "clamavweb.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The test-only duration unit turns the configured value into milliseconds;
+	// production always uses seconds and retains the 600-second validation.
+	app.mu.Lock()
+	app.cfg.ClamAVSleepTimer = 1
+	app.mu.Unlock()
+	s := &server{
+		cfg:              config{SleepLockDir: filepath.Join(tmp, "sleep.lock")},
+		appConfig:        app,
+		clamavSleepTimer: newClamAVSleepTimerState(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.runClamAVSleepTimerWithAction(ctx, time.Millisecond, func(context.Context) (string, string, int, error) {
+		if err := createDirectoryLock(s.cfg.SleepLockDir); err != nil {
+			return "failed", "", http.StatusInternalServerError, err
+		}
+		close(shutdownReceived)
+		return "sleeping", "ClamAV entered sleep mode.", http.StatusOK, nil
+	})
+
+	select {
+	case <-shutdownReceived:
+	case <-time.After(time.Second):
+		t.Fatal("sleep timer did not send ClamAV shutdown")
+	}
+	if exists, err := directoryLockExists(s.cfg.SleepLockDir); err != nil || !exists {
+		t.Fatalf("sleep timer did not create sleep lock: exists=%v err=%v", exists, err)
+	}
+}
+
+func TestDisabledClamAVSleepTimerDoesNotStart(t *testing.T) {
+	tmp := t.TempDir()
+	app, err := newAppConfigStore(filepath.Join(tmp, "clamavweb.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.mu.Lock()
+	app.cfg.ClamAVSleepTimer = 0
+	app.mu.Unlock()
+	s := &server{
+		cfg:              config{SleepLockDir: filepath.Join(tmp, "sleep.lock")},
+		appConfig:        app,
+		clamavSleepTimer: newClamAVSleepTimerState(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go s.runClamAVSleepTimerWithUnit(ctx, time.Millisecond)
+	time.Sleep(25 * time.Millisecond)
+	cancel()
+	if exists, err := directoryLockExists(s.cfg.SleepLockDir); err != nil || exists {
+		t.Fatalf("disabled sleep timer changed power state: exists=%v err=%v", exists, err)
+	}
+}
+
+func TestClamAVSleepTimerResetDiscardsOldDeadline(t *testing.T) {
+	tmp := t.TempDir()
+	app, err := newAppConfigStore(filepath.Join(tmp, "clamavweb.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.mu.Lock()
+	app.cfg.ClamAVSleepTimer = 1
+	app.mu.Unlock()
+	s := &server{
+		cfg:              config{SleepLockDir: filepath.Join(tmp, "sleep.lock")},
+		appConfig:        app,
+		clamavSleepTimer: newClamAVSleepTimerState(),
+	}
+	fired := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.runClamAVSleepTimerWithAction(ctx, 200*time.Millisecond, func(context.Context) (string, string, int, error) {
+		close(fired)
+		return "sleeping", "", http.StatusOK, nil
+	})
+
+	time.Sleep(50 * time.Millisecond)
+	s.notifyClamAVSleepTimerChanged("test_reset")
+	select {
+	case <-fired:
+		t.Fatal("retired sleep timer deadline fired after reset")
+	case <-time.After(120 * time.Millisecond):
+	}
+	select {
+	case <-fired:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("replacement sleep timer did not fire")
+	}
+}
+
+func TestClamAVSleepTimerDefersForQueuedManualScan(t *testing.T) {
+	tmp := t.TempDir()
+	app, err := newAppConfigStore(filepath.Join(tmp, "clamavweb.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.mu.Lock()
+	app.cfg.ClamAVSleepTimer = 1
+	app.mu.Unlock()
+	s := &server{
+		cfg:              config{SleepLockDir: filepath.Join(tmp, "sleep.lock")},
+		appConfig:        app,
+		clamavSleepTimer: newClamAVSleepTimerState(),
+		queuedBatchIDs:   []string{"web-pending"},
+	}
+	fired := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.runClamAVSleepTimerWithAction(ctx, 20*time.Millisecond, func(context.Context) (string, string, int, error) {
+		fired <- struct{}{}
+		return "sleeping", "", http.StatusOK, nil
+	})
+
+	select {
+	case <-fired:
+		t.Fatal("sleep timer fired while a manual scan was queued")
+	case <-time.After(70 * time.Millisecond):
+	}
+	s.mu.Lock()
+	s.queuedBatchIDs = nil
+	s.mu.Unlock()
+	s.notifyClamAVSleepTimerChanged("queue_cleared")
+	select {
+	case <-fired:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("sleep timer did not resume after the manual queue cleared")
 	}
 }
 

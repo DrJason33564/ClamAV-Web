@@ -1,21 +1,22 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
-var resultJobFileNamePattern = regexp.MustCompile(`^(manual|cron)-([0-9]{14})\.json$`)
-var resultJobIDPattern = regexp.MustCompile(`^(manual|cron)-[0-9]{14}$`)
+var resultJobIDPattern = version3JobIDPattern
+
+const maxResultLookupItems = 500
 
 type resultLookup struct {
 	ID        string          `json:"lookup_id"`
@@ -26,6 +27,7 @@ type resultLookup struct {
 	StartedAt time.Time       `json:"started_at"`
 	UpdatedAt time.Time       `json:"updated_at"`
 	scope     resultScope
+	UserID    string `json:"-"`
 }
 
 type resultLogItem struct {
@@ -33,6 +35,7 @@ type resultLogItem struct {
 	Type   string `json:"type"`
 	Date   string `json:"date"`
 	Result any    `json:"result"`
+	Action string `json:"action"`
 }
 
 type resultJobFile struct {
@@ -73,6 +76,7 @@ func (s *server) handleResultLookupStart(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	who, _ := actorFromRequest(r)
 
 	lookup := &resultLookup{
 		ID:        "result-" + randomHex(8),
@@ -80,13 +84,23 @@ func (s *server) handleResultLookupStart(w http.ResponseWriter, r *http.Request)
 		StartedAt: time.Now(),
 		UpdatedAt: time.Now(),
 		scope:     scope,
+		UserID:    who.ID,
 	}
-	s.resultMu.Lock()
-	s.cleanupResultLookupsLocked(time.Now().Add(-15 * time.Minute))
-	s.resultLookups[lookup.ID] = lookup
-	s.resultMu.Unlock()
-
-	go s.runResultLookup(lookup.ID)
+	if !s.startLookup(who.ID, lookup.ID, func() {
+		s.resultMu.Lock()
+		s.resultLookups[lookup.ID] = lookup
+		s.resultMu.Unlock()
+	}, func() {
+		s.resultMu.Lock()
+		delete(s.resultLookups, lookup.ID)
+		s.resultMu.Unlock()
+	}, func(ctx context.Context) {
+		s.runResultLookup(ctx, lookup.ID)
+	}) {
+		writeError(w, http.StatusTooManyRequests, errors.New("too many pending lookups for this user"))
+		return
+	}
+	s.debug("results", "result lookup started", "lookup_id", lookup.ID, "user", who.Username)
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"status":    "pending",
 		"lookup_id": lookup.ID,
@@ -112,6 +126,12 @@ func (s *server) handleResultLookup(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	who, _ := actorFromRequest(r)
+	if lookup.UserID != who.ID {
+		s.resultMu.RUnlock()
+		http.NotFound(w, r)
+		return
+	}
 	snapshot := *lookup
 	if lookup.Results != nil {
 		snapshot.Results = append([]resultLogItem(nil), lookup.Results...)
@@ -128,7 +148,7 @@ func (s *server) handleResultLookup(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *server) runResultLookup(id string) {
+func (s *server) runResultLookup(ctx context.Context, id string) {
 	s.resultMu.RLock()
 	lookup, ok := s.resultLookups[id]
 	if !ok {
@@ -136,9 +156,13 @@ func (s *server) runResultLookup(id string) {
 		return
 	}
 	scope := lookup.scope
+	userID := lookup.UserID
 	s.resultMu.RUnlock()
 
-	results, total, err := s.readResultLogItems(scope)
+	results, total, err := s.readResultLogItems(ctx, scope, userID)
+	if errors.Is(err, context.Canceled) {
+		return
+	}
 	s.resultMu.Lock()
 	defer s.resultMu.Unlock()
 	lookup, ok = s.resultLookups[id]
@@ -149,74 +173,54 @@ func (s *server) runResultLookup(id string) {
 	if err != nil {
 		lookup.Status = "failed"
 		lookup.Error = err.Error()
+		s.error("results", "result lookup failed", "lookup_id", id, "user_id", userID, "error", err)
 		return
 	}
 	lookup.Status = "success"
 	lookup.Results = results
 	lookup.Total = total
+	s.debug("results", "result lookup completed", "lookup_id", id, "user_id", userID, "returned", len(results), "total", total)
 }
 
-func (s *server) readResultLogItems(scope resultScope) ([]resultLogItem, int, error) {
-	entries, err := os.ReadDir(s.cfg.JobsDir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, 0, nil
-		}
+func (s *server) readResultLogItems(ctx context.Context, scope resultScope, userID string) ([]resultLogItem, int, error) {
+	var total int
+	if err := s.historyDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM history_jobs WHERE user_id=?", userID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	jobFiles := make([]resultJobFile, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		match := resultJobFileNamePattern.FindStringSubmatch(entry.Name())
-		if match == nil {
-			continue
-		}
-		jobType := match[1]
-		date := match[2]
-		jobID := strings.TrimSuffix(entry.Name(), ".json")
-		jobFiles = append(jobFiles, resultJobFile{
-			ID:   jobID,
-			Type: jobType,
-			Date: date,
-		})
+	query := "SELECT job_id,job_type,started_at,result,action FROM history_jobs WHERE user_id=? ORDER BY started_at DESC,job_id DESC"
+	args := []any{userID}
+	if !scope.All {
+		query += " LIMIT ? OFFSET ?"
+		args = append(args, scope.End-scope.Start+1, scope.Start-1)
 	}
-	sort.Slice(jobFiles, func(i, j int) bool {
-		return jobFiles[i].Date > jobFiles[j].Date
-	})
-	total := len(jobFiles)
-
-	// Scope is applied before opening JSON files. We still need to enumerate
-	// filenames to sort by job id timestamp, but range requests only read the
-	// selected job state files instead of every historical JSON document.
-	jobFiles = applyResultScope(jobFiles, scope)
-
-	items := make([]resultLogItem, 0, len(jobFiles))
-	for _, job := range jobFiles {
-		jobID := job.ID
-		result, err := s.readJobResult(jobID)
-		if err != nil {
+	rows, err := s.historyDB.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, total, err
+	}
+	defer rows.Close()
+	items := []resultLogItem{}
+	for rows.Next() {
+		var item resultLogItem
+		var startedAt int64
+		if err := rows.Scan(&item.ID, &item.Type, &startedAt, &item.Result, &item.Action); err != nil {
 			return nil, total, err
 		}
-		items = append(items, resultLogItem{
-			ID:     jobID,
-			Type:   job.Type,
-			Date:   job.Date,
-			Result: result,
-		})
+		// Preserve the existing API date representation while job IDs and stored
+		// timestamps use Unix time in version 3.
+		item.Date = time.Unix(startedAt, 0).Format("20060102150405")
+		items = append(items, item)
 	}
-	return items, total, nil
+	return items, total, rows.Err()
 }
 
 func parseResultScope(scopeText string) (resultScope, error) {
 	scopeText = strings.TrimSpace(scopeText)
 	if scopeText == "" || scopeText == "all" {
-		return resultScope{All: true}, nil
+		return resultScope{}, errors.New("scope must be a numeric range like 1-20")
 	}
 	startText, endText, ok := strings.Cut(scopeText, "-")
 	if !ok {
-		return resultScope{}, errors.New("scope must be all or a numeric range like 1-10")
+		return resultScope{}, errors.New("scope must be a numeric range like 1-20")
 	}
 	start, err := strconv.Atoi(strings.TrimSpace(startText))
 	if err != nil || start < 1 {
@@ -225,6 +229,9 @@ func parseResultScope(scopeText string) (resultScope, error) {
 	end, err := strconv.Atoi(strings.TrimSpace(endText))
 	if err != nil || end < start {
 		return resultScope{}, errors.New("scope end must be greater than or equal to start")
+	}
+	if end-start+1 > maxResultLookupItems {
+		return resultScope{}, errors.New("scope cannot include more than 500 results")
 	}
 	return resultScope{Start: start, End: end}, nil
 }
@@ -273,14 +280,6 @@ func (s *server) readJobResult(jobID string) (any, error) {
 	}
 }
 
-func (s *server) cleanupResultLookupsLocked(before time.Time) {
-	for id, lookup := range s.resultLookups {
-		if lookup.UpdatedAt.Before(before) {
-			delete(s.resultLookups, id)
-		}
-	}
-}
-
 func (s *server) handleDetectionResult(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
@@ -298,11 +297,14 @@ func (s *server) handleDetectionResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.readDetectionResult(jobID)
+	who, _ := actorFromRequest(r)
+	result, err := s.readDetectionResult(jobID, who.ID)
 	if err != nil {
+		s.error("results", "detection result lookup failed", "job_id", jobID, "user", who.Username, "error", err)
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.debug("results", "detection result lookup completed", "job_id", jobID, "user", who.Username)
 	if result == nil {
 		writeJSON(w, http.StatusOK, nil)
 		return
@@ -310,7 +312,20 @@ func (s *server) handleDetectionResult(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-func (s *server) readDetectionResult(jobID string) (*detectionLookupResponse, error) {
+func (s *server) readDetectionResult(jobID string, userIDs ...string) (*detectionLookupResponse, error) {
+	if len(userIDs) > 0 {
+		userID := userIDs[0]
+		var jsonFile string
+		if err := s.historyDB.QueryRow("SELECT json_file FROM history_jobs WHERE job_id=? AND user_id=?", jobID, userID).Scan(&jsonFile); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		if filepath.Dir(jsonFile) != filepath.Clean(s.cfg.JobsDir) {
+			return nil, errors.New("indexed job path is outside jobs directory")
+		}
+	}
 	logText, err := s.readJobLog(jobID)
 	if err != nil {
 		return nil, err

@@ -51,8 +51,8 @@ export function FileBrowser({
     try {
       setData(
         await api<BrowseResponse>(
-          `/api/browse?path=${encodeURIComponent(path)}`,
-        ),
+          `/api/browse?path=${encodeURIComponent(path)}`
+        )
       )
     } catch (nextError) {
       setError(errorMessage(nextError))
@@ -62,7 +62,7 @@ export function FileBrowser({
   }, [])
 
   React.useEffect(() => {
-    void load()
+    queueMicrotask(() => void load())
   }, [load])
 
   function toggle(path: string, checked: boolean) {
@@ -73,13 +73,13 @@ export function FileBrowser({
     onValueChange(
       checked
         ? Array.from(new Set([...value, path]))
-        : value.filter((item) => item !== path),
+        : value.filter((item) => item !== path)
     )
   }
 
   const activeRoot =
     data?.roots.find(
-      (root) => data.path === root || data.path.startsWith(`${root}/`),
+      (root) => data.path === root || data.path.startsWith(`${root}/`)
     ) ?? data?.roots[0]
 
   return (

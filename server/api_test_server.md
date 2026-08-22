@@ -52,11 +52,12 @@ curl -u test:anything http://localhost:8081/api/status
 - `source.updated_at` 为本次请求的处理时间。
 - `source.clamd.last_checked_at` 为本次请求的处理时间。
 - `source.scan.last_job_id` 恒为 `manual-20260728070000`。
-- `checked_at` 为本次请求的处理时间。
+- `checked_at` 为模拟状态的生成时间。
 - `source.clamd.status` 从 `ready`、`error`、`timeout` 中随机选择。
-- `source.clamd.message` 与所选状态匹配。
 - `ping` 与 `source.clamd.status` 相同。
-- `ping_message` 与 `source.clamd.message` 相同。
+- `ping_message` 与所选状态匹配。
+- 状态为 `ready` 时返回模拟的 `clamd_version`、`database_version` 和 `database_date`；其他状态下三个字段为空字符串。
+- `is_timedock` 固定为 `false`。
 
 状态与消息的对应关系：
 
@@ -150,8 +151,8 @@ curl -u test:anything \
 
 `GET /api/cron/rules` 固定返回两个示例任务：
 
-- `testenabled00001`：已启用，每天 `02:00` 扫描 `/scan/documents`。
-- `testdisabled0002`：未启用，每周日 `04:30` 扫描 `/scan/uploads`。
+- `testenabled00001`：已启用，每天 `02:00` 扫描 `/scan/documents`，执行时唤醒 ClamAV。
+- `testdisabled0002`：未启用，每周日 `04:30` 扫描 `/scan/uploads`，不主动唤醒 ClamAV。
 
 新增、更新、启用、禁用、删除和 reload 请求均返回包含这两个任务的成功响应，不会
 修改返回内容，也不会写入真实配置文件。
@@ -168,12 +169,13 @@ curl -u test:anything \
 
 ### 历史扫描结果
 
-`POST /api/results/lookups` 每次创建一个新的查询 ID，并以 `202 Accepted` 返回
-`status: pending`。测试服务同时为该查询生成 1–5 秒的随机准备时间。
+`POST /api/results/lookups?scope=1-20` 校验与正式服务相同的数字范围后，每次创建一个新的
+查询 ID，并以 `202 Accepted` 返回 `status: pending`。测试服务同时为该查询生成 1–5 秒的
+随机准备时间。
 
 ```sh
 curl -u test:anything -X POST \
-  http://localhost:8081/api/results/lookups
+  'http://localhost:8081/api/results/lookups?scope=1-20'
 ```
 
 使用响应中的 `lookup_id` 轮询 `GET /api/results/lookups/{lookup_id}`：
@@ -182,9 +184,15 @@ curl -u test:anything -X POST \
 - 准备时间结束后返回 `200 OK`、`status: success` 以及 20 条示例结果。
 - 未创建过或已被清理的查询 ID 返回 `404 Not Found`。
 
-结果类型包含 `manual` 和 `cron`，结果值循环使用 `clean`、`found`、`error` 和
-`null`。查询状态保存在测试服务进程的内存中，超过 15 分钟的旧查询会在创建新查询
-时清理。
+结果类型包含 `manual` 和 `cron`，结果值循环使用 `unknown`、`clean`、`found` 和
+`error`，检出动作循环使用 `warn`、`move` 和 `remove`。查询状态保存在测试服务进程
+的内存中，超过 15 分钟的旧查询会在创建新查询时清理。
+
+扫描统计使用相同的异步流程。`POST /api/results/statistics/lookups?scope=N` 要求
+`scope` 为 `1–31` 的正整数，先返回 `202 Accepted` 和查询 ID；轮询
+`GET /api/results/statistics/lookups/{lookup_id}`，准备完成后返回 `200 OK`。成功响应
+包含 `scope`、`total`，并以 `YYYYMMDD` 顶层键返回 `unknown`、`clean`、`found`、
+`error` 四种计数。测试数据按当前本地日期生成，不读取真实数据库。
 
 `POST /api/results/detection` 不读取请求体中的任务 ID，始终返回固定测试任务以及：
 
@@ -226,8 +234,10 @@ pending。准备完成后，轮询 GET 接口会返回 `200 OK`、`status: succe
 | `GET` | `/api/whitelist` | 返回三个固定白名单条目。 |
 | `POST` | `/api/whitelist` | 返回成功及固定条目，不新增白名单。 |
 | `DELETE` | `/api/whitelist` | 返回成功及固定条目，不删除白名单。 |
-| `POST` | `/api/results/lookups` | 创建查询并返回新的 ID 和 pending 状态。 |
+| `POST` | `/api/results/lookups?scope=1-20` | 校验数字范围后创建查询并返回新的 ID 和 pending 状态。 |
 | `GET` | `/api/results/lookups/{lookup_id}` | 1–5 秒内返回 pending，随后返回 20 条示例结果。 |
+| `POST` | `/api/results/statistics/lookups?scope=N` | 校验 `scope` 后创建统计查询并返回 pending。 |
+| `GET` | `/api/results/statistics/lookups/{lookup_id}` | 1–5 秒内返回 pending，随后返回按日统计的示例结果。 |
 | `POST` | `/api/results/detection` | 恒定返回 `Example Log File`。 |
 | `POST` | `/api/results/clean` | 返回成功和 `deleted: 0`，不删除文件。 |
 | `POST` | `/api/quarantine/clean` | 返回成功和 `deleted: 0`，不删除文件。 |

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -8,8 +9,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -20,6 +21,7 @@ type quarantineLookup struct {
 	Error     string              `json:"error,omitempty"`
 	StartedAt time.Time           `json:"started_at"`
 	UpdatedAt time.Time           `json:"updated_at"`
+	UserID    string              `json:"-"`
 }
 
 type quarantineSubject struct {
@@ -32,7 +34,7 @@ type quarantineActionResponse struct {
 	Error  string `json:"error,omitempty"`
 }
 
-var renameQuarantineFile = os.Rename
+var copyQuarantineFile = copyRegularFile
 
 const clamavQuarantineLockName = "clamav-quarantine-lock"
 
@@ -48,12 +50,23 @@ func (s *server) handleQuarantineLookupStart(w http.ResponseWriter, r *http.Requ
 		StartedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
-	s.quarantineMu.Lock()
-	s.cleanupQuarantineLookupsLocked(time.Now().Add(-15 * time.Minute))
-	s.quarantineLookups[lookup.ID] = lookup
-	s.quarantineMu.Unlock()
-
-	go s.runQuarantineLookup(lookup.ID)
+	who, _ := actorFromRequest(r)
+	lookup.UserID = who.ID
+	if !s.startLookup(who.ID, lookup.ID, func() {
+		s.quarantineMu.Lock()
+		s.quarantineLookups[lookup.ID] = lookup
+		s.quarantineMu.Unlock()
+	}, func() {
+		s.quarantineMu.Lock()
+		delete(s.quarantineLookups, lookup.ID)
+		s.quarantineMu.Unlock()
+	}, func(ctx context.Context) {
+		s.runQuarantineLookup(ctx, lookup.ID)
+	}) {
+		writeError(w, http.StatusTooManyRequests, errors.New("too many pending lookups for this user"))
+		return
+	}
+	s.debug("quarantine", "quarantine lookup started", "lookup_id", lookup.ID, "user", who.Username)
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"status":    "pending",
 		"lookup_id": lookup.ID,
@@ -79,6 +92,12 @@ func (s *server) handleQuarantineLookup(w http.ResponseWriter, r *http.Request) 
 		http.NotFound(w, r)
 		return
 	}
+	who, _ := actorFromRequest(r)
+	if lookup.UserID != who.ID {
+		s.quarantineMu.RUnlock()
+		http.NotFound(w, r)
+		return
+	}
 	snapshot := *lookup
 	if lookup.Subjects != nil {
 		snapshot.Subjects = append([]quarantineSubject(nil), lookup.Subjects...)
@@ -95,11 +114,22 @@ func (s *server) handleQuarantineLookup(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
-func (s *server) runQuarantineLookup(id string) {
-	subjects, err := s.readQuarantineSubjects()
+func (s *server) runQuarantineLookup(ctx context.Context, id string) {
+	s.quarantineMu.RLock()
+	lookup, ok := s.quarantineLookups[id]
+	if !ok {
+		s.quarantineMu.RUnlock()
+		return
+	}
+	userID := lookup.UserID
+	s.quarantineMu.RUnlock()
+	subjects, err := s.readQuarantineSubjects(ctx, userID)
+	if errors.Is(err, context.Canceled) {
+		return
+	}
 	s.quarantineMu.Lock()
 	defer s.quarantineMu.Unlock()
-	lookup, ok := s.quarantineLookups[id]
+	lookup, ok = s.quarantineLookups[id]
 	if !ok {
 		return
 	}
@@ -107,43 +137,67 @@ func (s *server) runQuarantineLookup(id string) {
 	if err != nil {
 		lookup.Status = "failed"
 		lookup.Error = err.Error()
+		s.error("quarantine", "quarantine lookup failed", "lookup_id", id, "user_id", userID, "error", err)
 		return
 	}
 	lookup.Status = "success"
 	lookup.Subjects = subjects
+	s.debug("quarantine", "quarantine lookup completed", "lookup_id", id, "user_id", userID, "subjects", len(subjects))
 }
 
-func (s *server) readQuarantineSubjects() ([]quarantineSubject, error) {
-	entries, err := os.ReadDir(s.cfg.QuarantineDir)
+func (s *server) readQuarantineSubjects(ctx context.Context, userID string) ([]quarantineSubject, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !validUserID(userID) {
+		return []quarantineSubject{}, nil
+	}
+	directory, err := os.Open(s.cfg.QuarantineDir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	subjects := make([]quarantineSubject, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || entry.Name() == clamavQuarantineLockName || strings.HasSuffix(entry.Name(), ".rec") {
-			continue
-		}
-		sourceFile, err := readQuarantineRecord(filepath.Join(s.cfg.QuarantineDir, entry.Name()+".rec"))
-		if err != nil {
+	defer directory.Close()
+	subjects := make([]quarantineSubject, 0)
+	for {
+		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		subjects = append(subjects, quarantineSubject{
-			Name:       entry.Name(),
-			SourceFile: sourceFile,
-		})
-	}
-	return subjects, nil
-}
-
-func (s *server) cleanupQuarantineLookupsLocked(before time.Time) {
-	for id, lookup := range s.quarantineLookups {
-		if lookup.UpdatedAt.Before(before) {
-			delete(s.quarantineLookups, id)
+		// Read in bounded batches so cancellation does not wait for the entire
+		// quarantine directory to be materialized in memory first.
+		entries, readErr := directory.ReadDir(128)
+		for _, entry := range entries {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if entry.IsDir() || entry.Name() == clamavQuarantineLockName || strings.HasSuffix(entry.Name(), ".rec") {
+				continue
+			}
+			sourceFile, owner, err := readQuarantineRecord(filepath.Join(s.cfg.QuarantineDir, entry.Name()+".rec"))
+			if err != nil {
+				// Legacy and malformed records have no safe owner and are intentionally
+				// invisible rather than being assigned to an administrator.
+				continue
+			}
+			if owner != userID {
+				continue
+			}
+			subjects = append(subjects, quarantineSubject{
+				Name:       entry.Name(),
+				SourceFile: sourceFile,
+			})
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return nil, readErr
 		}
 	}
+	sort.Slice(subjects, func(i, j int) bool { return subjects[i].Name < subjects[j].Name })
+	return subjects, nil
 }
 
 func (s *server) handleQuarantineDelete(w http.ResponseWriter, r *http.Request) {
@@ -156,10 +210,17 @@ func (s *server) handleQuarantineDelete(w http.ResponseWriter, r *http.Request) 
 		writeQuarantineAction(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.deleteQuarantineSubject(name); err != nil {
-		writeQuarantineAction(w, http.StatusInternalServerError, err)
+	who, _ := actorFromRequest(r)
+	if err := s.deleteQuarantineSubject(name, who.ID); err != nil {
+		s.warn("quarantine", "quarantine subject deletion failed", "name", name, "user", who.Username, "error", err)
+		status := http.StatusInternalServerError
+		if errors.Is(err, os.ErrNotExist) {
+			status = http.StatusNotFound
+		}
+		writeQuarantineAction(w, status, err)
 		return
 	}
+	s.info("quarantine", "quarantine subject deleted", "name", name, "user", who.Username)
 	writeQuarantineAction(w, http.StatusOK, nil)
 }
 
@@ -173,10 +234,19 @@ func (s *server) handleQuarantineRecover(w http.ResponseWriter, r *http.Request)
 		writeQuarantineAction(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.recoverQuarantineSubject(name); err != nil {
-		writeQuarantineAction(w, http.StatusInternalServerError, err)
+	who, _ := actorFromRequest(r)
+	if err := s.recoverQuarantineSubject(name, who); err != nil {
+		s.warn("quarantine", "quarantine subject recovery failed", "name", name, "user", who.Username, "error", err)
+		status := http.StatusInternalServerError
+		if errors.Is(err, os.ErrNotExist) {
+			status = http.StatusNotFound
+		} else if errors.Is(err, errTimeDockAccountRequired) || errors.Is(err, errTimeDockPathDenied) {
+			status = http.StatusBadRequest
+		}
+		writeQuarantineAction(w, status, err)
 		return
 	}
+	s.info("quarantine", "quarantine subject recovered", "name", name, "user", who.Username)
 	writeQuarantineAction(w, http.StatusOK, nil)
 }
 
@@ -195,8 +265,15 @@ func quarantineNameFromPath(path string, prefix string) (string, error) {
 	return name, nil
 }
 
-func (s *server) deleteQuarantineSubject(name string) error {
+func (s *server) deleteQuarantineSubject(name string, userID string) error {
+	if !validUserID(userID) {
+		return os.ErrNotExist
+	}
 	target := filepath.Join(s.cfg.QuarantineDir, name)
+	_, owner, err := readQuarantineRecord(target + ".rec")
+	if err != nil || owner != userID {
+		return os.ErrNotExist
+	}
 	if err := os.Remove(target); err != nil {
 		return err
 	}
@@ -207,15 +284,25 @@ func (s *server) deleteQuarantineSubject(name string) error {
 	return nil
 }
 
-func (s *server) recoverQuarantineSubject(name string) error {
+func (s *server) recoverQuarantineSubject(name string, who actor) error {
+	userID := who.ID
+	if !validUserID(userID) {
+		return os.ErrNotExist
+	}
 	quarantined := filepath.Join(s.cfg.QuarantineDir, name)
 	recPath := quarantined + ".rec"
-	sourceFile, err := readQuarantineRecord(recPath)
+	sourceFile, owner, err := readQuarantineRecord(recPath)
 	if err != nil {
 		return err
 	}
+	if owner != userID {
+		return os.ErrNotExist
+	}
 	if sourceFile == "" {
 		return errors.New("quarantine record is empty")
+	}
+	if err := s.authorizeRestorePath(sourceFile, who); err != nil {
+		return err
 	}
 	if _, err := os.Stat(quarantined); err != nil {
 		return err
@@ -238,17 +325,13 @@ func (s *server) recoverQuarantineSubject(name string) error {
 }
 
 func restoreQuarantinedFile(quarantined string, sourceFile string) error {
-	if err := renameQuarantineFile(quarantined, sourceFile); err == nil {
-		return nil
-	} else if !isCrossDeviceLink(err) {
-		return err
-	}
-
-	// Docker bind mounts and volumes commonly place /quarantine and /scan on
-	// different devices. rename(2) cannot cross that boundary, so fall back to
-	// copy-and-delete while keeping the .rec file until every step succeeds.
-	if err := copyRegularFile(quarantined, sourceFile); err != nil {
-		_ = os.Remove(sourceFile)
+	// O_EXCL is the authoritative existence check. A preceding Stat can make a
+	// friendlier error but cannot prevent another process from creating the
+	// restore target immediately afterward.
+	if err := copyQuarantineFile(quarantined, sourceFile); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("target already exists: %s", sourceFile)
+		}
 		return err
 	}
 	if err := os.Remove(quarantined); err != nil {
@@ -256,14 +339,6 @@ func restoreQuarantinedFile(quarantined string, sourceFile string) error {
 		return err
 	}
 	return nil
-}
-
-func isCrossDeviceLink(err error) bool {
-	var linkErr *os.LinkError
-	if errors.As(err, &linkErr) {
-		return errors.Is(linkErr.Err, syscall.EXDEV)
-	}
-	return errors.Is(err, syscall.EXDEV)
 }
 
 func copyRegularFile(src string, dst string) error {
@@ -289,35 +364,49 @@ func copyRegularFile(src string, dst string) error {
 	_, copyErr := io.Copy(out, in)
 	closeErr := out.Close()
 	if copyErr != nil {
+		_ = os.Remove(dst)
 		return copyErr
 	}
 	if closeErr != nil {
+		_ = os.Remove(dst)
 		return closeErr
 	}
-
-	return os.Chmod(dst, info.Mode().Perm())
+	if err := os.Chmod(dst, info.Mode().Perm()); err != nil {
+		_ = os.Remove(dst)
+		return err
+	}
+	return nil
 }
 
-func readQuarantineRecord(path string) (string, error) {
+func readQuarantineRecord(path string) (string, string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", nil
+			return "", "", nil
 		}
-		return "", err
+		return "", "", err
 	}
 	return parseQuotedRecord(string(data))
 }
 
-func parseQuotedRecord(value string) (string, error) {
+func parseQuotedRecord(value string) (string, string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return "", nil
+		return "", "", errors.New("quarantine record is empty")
 	}
-	if !strings.HasPrefix(value, "\"") || !strings.HasSuffix(value, "\"") || len(value) < 2 {
-		return "", errors.New("invalid quarantine record")
+	if !strings.HasPrefix(value, "\"") {
+		return "", "", errors.New("invalid quarantine record")
 	}
-	return strings.TrimSuffix(strings.TrimPrefix(value, "\""), "\""), nil
+	rest := strings.TrimPrefix(value, "\"")
+	end := strings.Index(rest, "\"")
+	if end < 0 {
+		return "", "", errors.New("invalid quarantine record")
+	}
+	ownerFields := strings.Fields(rest[end+1:])
+	if len(ownerFields) != 1 || !validUserID(ownerFields[0]) {
+		return "", "", errors.New("invalid quarantine record owner")
+	}
+	return rest[:end], ownerFields[0], nil
 }
 
 func writeQuarantineAction(w http.ResponseWriter, statusCode int, err error) {

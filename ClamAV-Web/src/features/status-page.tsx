@@ -22,6 +22,7 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { toast } from "@/components/ui/toast"
+import { ScanStatisticsCard } from "@/features/scan-statistics-card"
 import { api } from "@/lib/api"
 import { errorMessage, formatTimestamp } from "@/lib/format"
 import type {
@@ -40,7 +41,7 @@ function sourceObject(source: StatusResponse["source"]): StatusSource {
   return typeof source === "object" && source !== null ? source : {}
 }
 
-export function StatusPage() {
+export function StatusPage({ isAdmin }: { isAdmin: boolean }) {
   const [status, setStatus] = React.useState<StatusResponse | null>(null)
   const [error, setError] = React.useState("")
   const [loading, setLoading] = React.useState(false)
@@ -64,7 +65,7 @@ export function StatusPage() {
   }, [])
 
   React.useEffect(() => {
-    void load()
+    queueMicrotask(() => void load())
   }, [load])
 
   React.useEffect(() => {
@@ -189,69 +190,78 @@ export function StatusPage() {
             </CardContent>
           </Card>
         </div>
-        <Card
-          size="sm"
-          className="relative isolate size-48 self-start"
-          aria-busy={powerLoading}
-        >
-          <div
-            aria-hidden="true"
-            className={cn(
-              "engine-control-mark",
-              (sleeping || !ready) && "grayscale"
-            )}
-          />
-          <div aria-hidden="true" className="engine-control-rings" />
-          <CardHeader className="relative">
-            <CardTitle>
-              <Badge
-                variant={
-                  sleeping ? "secondary" : ready ? "success" : "destructive"
-                }
-              >
-                {sleeping ? "引擎已休眠" : ready ? "引擎运行中" : "引擎异常"}
-              </Badge>
-            </CardTitle>
-            <CardAction>
-              <Button
-                variant={sleeping ? "secondary" : "outline"}
-                size="icon-lg"
-                className="rounded-full"
-                aria-label={
-                  powerLoading && sleeping
-                    ? "正在唤醒 ClamAV"
-                    : sleeping
-                      ? "唤醒 ClamAV"
-                      : "休眠 ClamAV"
-                }
-                aria-busy={powerLoading && sleeping}
-                title={
-                  active
-                    ? "扫描进行中，暂时无法休眠"
-                    : sleeping
-                      ? "唤醒 ClamAV"
-                      : "休眠 ClamAV"
-                }
-                disabled={
-                  powerLoading || active || !status || (!sleeping && !ready)
-                }
-                onClick={() => void togglePower()}
-              >
-                {powerLoading && sleeping ? (
-                  <LoaderCircleIcon
-                    className="animate-spin"
-                    aria-hidden="true"
-                  />
-                ) : (
-                  <MoonIcon
-                    className={cn(sleeping && "fill-current")}
-                    aria-hidden="true"
-                  />
-                )}
-              </Button>
-            </CardAction>
-          </CardHeader>
-        </Card>
+        <div className="grid items-start gap-4 md:grid-cols-[12rem_minmax(0,1fr)]">
+          <Card
+            size="sm"
+            className="relative isolate size-48 self-start"
+            aria-busy={powerLoading}
+          >
+            <div
+              aria-hidden="true"
+              className={cn(
+                "engine-control-mark",
+                (sleeping || !ready) && "grayscale"
+              )}
+            />
+            <div aria-hidden="true" className="engine-control-rings" />
+            <CardHeader className="relative">
+              <CardTitle>
+                <Badge
+                  variant={
+                    sleeping ? "secondary" : ready ? "success" : "destructive"
+                  }
+                >
+                  {sleeping ? "引擎已休眠" : ready ? "引擎运行中" : "引擎异常"}
+                </Badge>
+              </CardTitle>
+              <CardAction>
+                <Button
+                  variant={sleeping ? "secondary" : "outline"}
+                  size="icon-lg"
+                  className="rounded-full"
+                  aria-label={
+                    powerLoading && sleeping
+                      ? "正在唤醒 ClamAV"
+                      : sleeping
+                        ? "唤醒 ClamAV"
+                        : "休眠 ClamAV"
+                  }
+                  aria-busy={powerLoading && sleeping}
+                  title={
+                    !isAdmin
+                      ? "仅管理员可以休眠或唤醒 ClamAV"
+                      : active
+                        ? "扫描进行中，暂时无法休眠"
+                        : sleeping
+                          ? "唤醒 ClamAV"
+                          : "休眠 ClamAV"
+                  }
+                  disabled={
+                    !isAdmin ||
+                    powerLoading ||
+                    active ||
+                    !status ||
+                    (!sleeping && !ready)
+                  }
+                  onClick={() => void togglePower()}
+                >
+                  {powerLoading && sleeping ? (
+                    <LoaderCircleIcon
+                      className="animate-spin"
+                      aria-hidden="true"
+                    />
+                  ) : (
+                    <MoonIcon
+                      className={cn(sleeping && "fill-current")}
+                      aria-hidden="true"
+                    />
+                  )}
+                </Button>
+              </CardAction>
+            </CardHeader>
+          </Card>
+          <ScanStatisticsCard />
+        </div>
         {powerError && <ErrorAlert message={powerError} />}
         {!ready && !sleeping && status && (
           <ErrorAlert

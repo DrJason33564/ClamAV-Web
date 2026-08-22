@@ -1,7 +1,7 @@
 {
   "name": "ClamAV-Web",
   "private": true,
-  "version": "1.1.0",
+  "version": "2.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -23,6 +23,7 @@
     "lucide-react": "^1.27.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
+    "recharts": "^3.8.0",
     "shadcn": "^4.16.0",
     "tailwind-merge": "^3.6.0",
     "tailwindcss": "^4",

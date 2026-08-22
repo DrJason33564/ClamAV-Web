@@ -2,9 +2,9 @@
 set -eu
 
 # Build a local ClamAV SHA256 allow-list database from exclude.conf.
-# Each non-empty, non-comment line is one trusted target:
-#   /path/without/spaces
-#   "/path/with spaces"
+# Each non-empty, non-comment line contains a trusted target and its owner user ID:
+#   /path/without/spaces a1b2c3d4
+#   "/path/with spaces" a1b2c3d4
 #
 # Regular files are added directly. Directories are expanded recursively and
 # every regular file under them is added.
@@ -52,11 +52,16 @@ parse_exclude_line() {
                     PARSED_TARGET="${rest%%\"*}"
                     after_quote="${rest#*\"}"
                     after_quote="$(trim_line "$after_quote")"
-                    if [ -n "$after_quote" ]; then
-                        exclude_log "[WARN] Invalid exclude line $line_no: quoted path must not be followed by extra fields, skipped: $raw_line"
+                    set -f
+                    # shellcheck disable=SC2086
+                    set -- $after_quote
+                    set +f
+                    if [ "$#" -ne 1 ]; then
+                        exclude_log "[WARN] Invalid exclude line $line_no: expected owner after quoted path, skipped: $raw_line"
                         PARSED_TARGET=''
                         return 0
                     fi
+                    PARSED_USER_ID="$1"
                     ;;
                 *)
                     exclude_log "[WARN] Invalid exclude line $line_no: unterminated quoted path, skipped: $raw_line"
@@ -71,18 +76,38 @@ parse_exclude_line() {
             set -- $line
             set +f
 
-            if [ "$#" -ne 1 ]; then
-                exclude_log "[WARN] Invalid exclude line $line_no: paths containing spaces must be wrapped in double quotes, skipped: $raw_line"
+            if [ "$#" -ne 2 ]; then
+                exclude_log "[WARN] Invalid exclude line $line_no: expected path and owner, skipped: $raw_line"
                 PARSED_TARGET=''
                 return 0
             fi
             PARSED_TARGET="$1"
+            PARSED_USER_ID="$2"
             ;;
     esac
 
     if [ -z "$PARSED_TARGET" ]; then
         exclude_log "[WARN] Empty exclude target at line $line_no, skipped."
     fi
+
+    case "${PARSED_USER_ID:-}" in
+        *[!a-z0-9]*)
+            exclude_log "[WARN] Invalid exclude owner ID at line $line_no, skipped: $raw_line"
+            PARSED_TARGET=''
+            ;;
+    esac
+    if [ -n "$PARSED_TARGET" ] && [ "${#PARSED_USER_ID}" -ne 8 ]; then
+        exclude_log "[WARN] Invalid exclude owner ID at line $line_no, skipped: $raw_line"
+        PARSED_TARGET=''
+    fi
+    case "${PARSED_USER_ID:-}" in
+        *[a-z]*) ;;
+        *) PARSED_TARGET='' ;;
+    esac
+    case "${PARSED_USER_ID:-}" in
+        *[0-9]*) ;;
+        *) PARSED_TARGET='' ;;
+    esac
 
     return 0
 }

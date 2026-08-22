@@ -1,0 +1,636 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func newDatabaseTestServer(t *testing.T) *server {
+	t.Helper()
+	tmp := t.TempDir()
+	userDB, err := openUserDatabase(filepath.Join(tmp, "data", "users.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = userDB.Close() })
+	historyDB, err := openHistoryDatabase(filepath.Join(tmp, "data", "history.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = historyDB.Close() })
+	app, err := newAppConfigStore(filepath.Join(tmp, "config", "clamavweb.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &server{
+		cfg:                      config{JobsDir: filepath.Join(tmp, "jobs"), LogDir: filepath.Join(tmp, "log"), AdminRegisterToken: "test-admin-token"},
+		userDB:                   userDB,
+		historyDB:                historyDB,
+		appConfig:                app,
+		batches:                  map[string]*scanBatch{},
+		resultLookups:            map[string]*resultLookup{},
+		historyStatisticsLookups: map[string]*historyStatisticsLookup{},
+		quarantineLookups:        map[string]*quarantineLookup{},
+		loginLimiter:             newLoginLimiter(),
+	}
+	s.lookupRuntime = newLookupRuntime(t.Context())
+	t.Cleanup(s.lookupRuntime.stopAndWait)
+	if err := os.MkdirAll(s.cfg.JobsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s.history = &historyIndexer{db: historyDB, jobsDir: s.cfg.JobsDir}
+	return s
+}
+
+func TestFirstRegistrationCreatesAdminAndCookieLogin(t *testing.T) {
+	s := newDatabaseTestServer(t)
+	register := httptest.NewRecorder()
+	s.handleAuthRegister(register, httptest.NewRequest(http.MethodPost, "/api/auth/register", strings.NewReader(`{"username":"alice","password":"correct horse battery staple","token":"test-admin-token"}`)))
+	if register.Code != http.StatusCreated {
+		t.Fatalf("register failed: %d %s", register.Code, register.Body.String())
+	}
+	var userID, role string
+	if err := s.userDB.QueryRow("SELECT id,role FROM users WHERE username='alice'").Scan(&userID, &role); err != nil || role != "admin" {
+		t.Fatalf("expected first user to be admin, role=%q err=%v", role, err)
+	}
+	if !validUserID(userID) {
+		t.Fatalf("registration generated invalid user id %q", userID)
+	}
+	if _, err := s.userDB.Exec("UPDATE users SET timedock_account='Jason' WHERE username='alice'"); err != nil {
+		t.Fatal(err)
+	}
+	login := httptest.NewRecorder()
+	s.handleAuthLogin(login, httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"username":"alice","password":"correct horse battery staple"}`)))
+	if login.Code != http.StatusOK || len(login.Result().Cookies()) != 1 {
+		t.Fatalf("login failed: %d %s", login.Code, login.Body.String())
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+	request.AddCookie(login.Result().Cookies()[0])
+	response := httptest.NewRecorder()
+	s.requireAuth(http.HandlerFunc(s.handleAuthMe)).ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"username":"alice"`) || !strings.Contains(response.Body.String(), `"timedock_account":"Jason"`) {
+		t.Fatalf("authenticated request failed: %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestFirstRegistrationRequiresConfiguredToken(t *testing.T) {
+	for _, test := range []struct {
+		name, configured, provided string
+		want                       int
+	}{
+		{"missing environment token", "", "", http.StatusForbidden},
+		{"missing request token", "test-admin-token", "", http.StatusForbidden},
+		{"incorrect token", "test-admin-token", "wrong", http.StatusForbidden},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := newDatabaseTestServer(t)
+			s.cfg.AdminRegisterToken = test.configured
+			body := `{"username":"alice","password":"correct horse battery staple","token":"` + test.provided + `"}`
+			response := httptest.NewRecorder()
+			s.handleAuthRegister(response, httptest.NewRequest(http.MethodPost, "/api/auth/register", strings.NewReader(body)))
+			if response.Code != test.want {
+				t.Fatalf("expected %d, got %d: %s", test.want, response.Code, response.Body.String())
+			}
+			var count int
+			if err := s.userDB.QueryRow("SELECT COUNT(*) FROM users").Scan(&count); err != nil || count != 0 {
+				t.Fatalf("invalid token must not create a user, count=%d err=%v", count, err)
+			}
+		})
+	}
+}
+
+func TestFirstRegistrationDoesNotReopenAfterFirstRunCompleted(t *testing.T) {
+	s := newDatabaseTestServer(t)
+	cfg := s.appConfig.get()
+	cfg.WebFirstRunCompleted = 2
+	if err := s.appConfig.update(cfg); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	s.handleAuthRegister(response, httptest.NewRequest(http.MethodPost, "/api/auth/register", strings.NewReader(`{"username":"alice","password":"correct horse battery staple","token":"test-admin-token"}`)))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("expected completed first-run state to return 409, got %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestFirstRegistrationIsSerialized(t *testing.T) {
+	s := newDatabaseTestServer(t)
+	var workers sync.WaitGroup
+	statuses := make(chan int, 2)
+	for _, username := range []string{"alice", "bob"} {
+		workers.Add(1)
+		go func(username string) {
+			defer workers.Done()
+			body := `{"username":"` + username + `","password":"correct horse battery staple","token":"test-admin-token"}`
+			response := httptest.NewRecorder()
+			s.handleAuthRegister(response, httptest.NewRequest(http.MethodPost, "/api/auth/register", strings.NewReader(body)))
+			statuses <- response.Code
+		}(username)
+	}
+	workers.Wait()
+	close(statuses)
+	created := 0
+	for status := range statuses {
+		if status == http.StatusCreated {
+			created++
+		}
+	}
+	if created != 1 {
+		t.Fatalf("expected exactly one first administrator, got %d", created)
+	}
+	var count int
+	if err := s.userDB.QueryRow("SELECT COUNT(*) FROM users").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("expected one user row, count=%d err=%v", count, err)
+	}
+}
+
+func TestLoginLimitUsesIPInsteadOfUsername(t *testing.T) {
+	s := newDatabaseTestServer(t)
+	cfg := s.appConfig.get()
+	cfg.WebLoginMaxTries = 2
+	cfg.WebLoginMaxTriesOverall = 10
+	cfg.WebLoginCooldownInterval = 60
+	if err := s.appConfig.update(cfg); err != nil {
+		t.Fatal(err)
+	}
+	for attempt, username := range []string{"missing-one", "missing-two"} {
+		request := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"username":"`+username+`","password":"incorrect password"}`))
+		request.RemoteAddr = "192.0.2.10:1234"
+		response := httptest.NewRecorder()
+		s.handleAuthLogin(response, request)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d expected 401, got %d: %s", attempt+1, response.Code, response.Body.String())
+		}
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"username":"another-name","password":"incorrect password"}`))
+	request.RemoteAddr = "192.0.2.10:1234"
+	response := httptest.NewRecorder()
+	s.handleAuthLogin(response, request)
+	if response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") == "" {
+		t.Fatalf("username changes must not bypass the source limit: %d headers=%v body=%s", response.Code, response.Header(), response.Body.String())
+	}
+	if len(s.loginLimiter.byIP) != 1 {
+		t.Fatalf("one source should create one limiter entry, got %d", len(s.loginLimiter.byIP))
+	}
+}
+
+func TestLoginReturnsTooManyRequestsWhenArgon2IsBusy(t *testing.T) {
+	s := newDatabaseTestServer(t)
+	for slot := 0; slot < argon2Concurrency; slot++ {
+		if !s.argon2Limiter.tryAcquire() {
+			t.Fatal("failed to occupy Argon2 capacity")
+		}
+	}
+	defer func() {
+		for slot := 0; slot < argon2Concurrency; slot++ {
+			s.argon2Limiter.release()
+		}
+	}()
+
+	request := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"username":"missing","password":"incorrect password"}`))
+	request.RemoteAddr = "192.0.2.10:1234"
+	response := httptest.NewRecorder()
+	s.handleAuthLogin(response, request)
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d: %s", response.Code, response.Body.String())
+	}
+	if got := response.Header().Get("Retry-After"); got != argon2RetryAfter {
+		t.Fatalf("Retry-After = %q, want %q", got, argon2RetryAfter)
+	}
+	if !strings.Contains(response.Body.String(), errArgon2Busy.Error()) {
+		t.Fatalf("unexpected response body: %s", response.Body.String())
+	}
+}
+
+func TestHistoryIndexIsVersion3AndOwnerScoped(t *testing.T) {
+	s := newDatabaseTestServer(t)
+	// Keep one legacy v2 fixture to verify username-owned jobs are rejected.
+	jobs := map[string]string{
+		"manual-1783433000.json": `{"version":3,"job_id":"manual-1783433000","type":"manual","status":"finished","result":"clean","action":"warn","started_at":1783433000,"finished_at":1783433010,"user_id":"alice001"}`,
+		"cron-1783432000.json":   `{"version":3,"job_id":"cron-1783432000","type":"cron","status":"finished","result":"found","action":"move","started_at":1783432000,"finished_at":1783432010,"user_id":"bob00002"}`,
+		"manual-1783431000.json": `{"version":2,"job_id":"manual-1783431000","type":"manual","user":"alice"}`,
+	}
+	for name, body := range jobs {
+		if err := os.WriteFile(filepath.Join(s.cfg.JobsDir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.history.refresh(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	items, total, err := s.readResultLogItems(t.Context(), resultScope{All: true}, testAliceUserID)
+	if err != nil || total != 1 || len(items) != 1 || items[0].ID != "manual-1783433000" {
+		t.Fatalf("unexpected owner-scoped history: total=%d items=%#v err=%v", total, items, err)
+	}
+}
+
+func TestRandomUserSchedulerAlwaysSelectsOwnerHead(t *testing.T) {
+	s := &server{
+		queuedBatchIDs: []string{"alice-first", "alice-second", "bob-first"},
+		batches: map[string]*scanBatch{
+			"alice-first":  {ID: "alice-first", UserID: testAliceUserID},
+			"alice-second": {ID: "alice-second", UserID: testAliceUserID},
+			"bob-first":    {ID: "bob-first", UserID: testBobUserID},
+		},
+	}
+	for i := 0; i < 100; i++ {
+		id, ok := s.nextQueuedBatchID()
+		if !ok || (id != "alice-first" && id != "bob-first") {
+			t.Fatalf("scheduler selected a non-head task: %q", id)
+		}
+	}
+}
+
+func TestQueuedScanMutationsAreOwnerScoped(t *testing.T) {
+	s := &server{
+		activeBatchID:  "bob-active",
+		queuedBatchIDs: []string{"alice-first", "bob-first", "alice-second"},
+		batches: map[string]*scanBatch{
+			"bob-active":   {ID: "bob-active", UserID: testBobUserID},
+			"alice-first":  {ID: "alice-first", UserID: testAliceUserID},
+			"bob-first":    {ID: "bob-first", UserID: testBobUserID},
+			"alice-second": {ID: "alice-second", UserID: testAliceUserID},
+		},
+	}
+	original := strings.Join(s.queuedBatchIDs, ",")
+	if err := s.reorderQueuedBatch("bob-first", 1, testAliceUserID); err == nil {
+		t.Fatal("expected cross-owner reorder to be rejected")
+	}
+	if err := s.cancelQueuedBatch("bob-first", "Y", testAliceUserID); err == nil {
+		t.Fatal("expected cross-owner cancellation to be rejected")
+	}
+	if err := s.reorderQueuedBatch("bob-active", 1, testAliceUserID); err == nil || err.Error() != "queued scan not found" {
+		t.Fatalf("cross-owner active reorder leaked batch state: %v", err)
+	}
+	if err := s.cancelQueuedBatch("bob-active", "Y", testAliceUserID); err == nil || err.Error() != "queued scan not found" {
+		t.Fatalf("cross-owner active cancellation leaked batch state: %v", err)
+	}
+	if err := s.reorderQueuedBatch("alice-first", 1, ""); err == nil {
+		t.Fatal("expected empty-owner reorder to be rejected")
+	}
+	if err := s.cancelQueuedBatch("alice-first", "Y", ""); err == nil {
+		t.Fatal("expected empty-owner cancellation to be rejected")
+	}
+	if got := strings.Join(s.queuedBatchIDs, ","); got != original {
+		t.Fatalf("rejected mutations changed the queue: %s", got)
+	}
+}
+
+func TestQuarantineRecordsAreOwnerScoped(t *testing.T) {
+	tmp := t.TempDir()
+	for _, item := range []struct{ name, owner string }{{"a.dat", testAliceUserID}, {"b.dat", testBobUserID}} {
+		if err := os.WriteFile(filepath.Join(tmp, item.name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(tmp, item.name+".rec"), []byte(`"/scan/`+item.name+`" `+item.owner+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := &server{cfg: config{QuarantineDir: tmp}}
+	items, err := s.readQuarantineSubjects(t.Context(), testAliceUserID)
+	if err != nil || len(items) != 1 || items[0].Name != "a.dat" {
+		t.Fatalf("unexpected quarantine view: %#v err=%v", items, err)
+	}
+	if err := s.deleteQuarantineSubject("b.dat", testAliceUserID); !os.IsNotExist(err) {
+		t.Fatalf("expected cross-owner delete to look missing, got %v", err)
+	}
+	if items, err := s.readQuarantineSubjects(t.Context(), ""); err != nil || len(items) != 0 {
+		t.Fatalf("empty owner must not expose quarantine records: %#v err=%v", items, err)
+	}
+	if err := s.deleteQuarantineSubject("a.dat", ""); !os.IsNotExist(err) {
+		t.Fatalf("expected empty-owner delete to look missing, got %v", err)
+	}
+	if err := s.recoverQuarantineSubject("a.dat", actor{}); !os.IsNotExist(err) {
+		t.Fatalf("expected empty-owner recovery to look missing, got %v", err)
+	}
+}
+
+func TestCronAndWhitelistReadsAreOwnerScoped(t *testing.T) {
+	tmp := t.TempDir()
+	cronFile := filepath.Join(tmp, "cron.conf")
+	cronBody := strings.Join([]string{
+		"# scanner-cron-rule id=aaaaaaaaaaaaaaaa enabled=true",
+		"0 1 * * * /scan warn alice001 Y",
+		"# scanner-cron-rule id=bbbbbbbbbbbbbbbb enabled=true",
+		"0 2 * * * /scan move bob00002 N",
+	}, "\n") + "\n"
+	if err := os.WriteFile(cronFile, []byte(cronBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	excludeFile := filepath.Join(tmp, "exclude.conf")
+	if err := os.WriteFile(excludeFile, []byte("/scan/a alice001\n/scan/b bob00002\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{cfg: config{CronConfigFile: cronFile, ExcludeConfig: excludeFile}}
+	rules, err := s.readCronRules(testAliceUserID)
+	if err != nil || len(rules) != 1 || rules[0].ID != "aaaaaaaaaaaaaaaa" || !rules[0].Wake {
+		t.Fatalf("unexpected cron view: %#v err=%v", rules, err)
+	}
+	entries, err := s.readWhitelistEntries(testAliceUserID)
+	if err != nil || len(entries) != 1 || entries[0].Path != "/scan/a" {
+		t.Fatalf("unexpected whitelist view: %#v err=%v", entries, err)
+	}
+}
+
+func TestRecreatedUsernameDoesNotInheritAssets(t *testing.T) {
+	s := newDatabaseTestServer(t)
+	const recreatedUserID = "alice002"
+	now := time.Now().Unix()
+	if _, err := s.userDB.Exec(`INSERT INTO users(id,username,password_hash,role,created_at,updated_at) VALUES(?,'alice',NULL,'user',?,?)`, testAliceUserID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an incomplete external cleanup: the account row is gone while
+	// assets owned by its immutable ID remain in the other stores.
+	if _, err := s.userDB.Exec("DELETE FROM users WHERE id=?", testAliceUserID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.userDB.Exec(`INSERT INTO users(id,username,password_hash,role,created_at,updated_at) VALUES(?,'alice',NULL,'user',?,?)`, recreatedUserID, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	jobID := "manual-1783433000"
+	if _, err := s.historyDB.Exec(`INSERT INTO history_jobs(job_id,job_type,status,result,action,started_at,finished_at,user_id,json_file,file_mtime_ns,indexed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, jobID, "manual", "finished", "clean", "warn", now, now, testAliceUserID, filepath.Join(s.cfg.JobsDir, jobID+".json"), 1, now); err != nil {
+		t.Fatal(err)
+	}
+	assetDir := t.TempDir()
+	s.cfg.CronConfigFile = filepath.Join(assetDir, "cron_scan.conf")
+	s.cfg.ExcludeConfig = filepath.Join(assetDir, "exclude.conf")
+	s.cfg.QuarantineDir = filepath.Join(assetDir, "quarantine")
+	if err := os.MkdirAll(s.cfg.QuarantineDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cron := "# scanner-cron-rule id=aaaaaaaaaaaaaaaa enabled=true\n0 1 * * * /scan warn " + testAliceUserID + " N\n"
+	if err := os.WriteFile(s.cfg.CronConfigFile, []byte(cron), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.cfg.ExcludeConfig, []byte("/scan/trusted "+testAliceUserID+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	quarantined := filepath.Join(s.cfg.QuarantineDir, "old.dat")
+	if err := os.WriteFile(quarantined, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(quarantined+".rec", []byte(`"/scan/old.dat" `+testAliceUserID+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if items, total, err := s.readResultLogItems(t.Context(), resultScope{All: true}, recreatedUserID); err != nil || total != 0 || len(items) != 0 {
+		t.Fatalf("recreated user inherited history: total=%d items=%#v err=%v", total, items, err)
+	}
+	if rules, err := s.readCronRules(recreatedUserID); err != nil || len(rules) != 0 {
+		t.Fatalf("recreated user inherited cron rules: %#v err=%v", rules, err)
+	}
+	if entries, err := s.readWhitelistEntries(recreatedUserID); err != nil || len(entries) != 0 {
+		t.Fatalf("recreated user inherited whitelist entries: %#v err=%v", entries, err)
+	}
+	if subjects, err := s.readQuarantineSubjects(t.Context(), recreatedUserID); err != nil || len(subjects) != 0 {
+		t.Fatalf("recreated user inherited quarantine subjects: %#v err=%v", subjects, err)
+	}
+
+	if _, total, _ := s.readResultLogItems(t.Context(), resultScope{All: true}, testAliceUserID); total != 1 {
+		t.Fatal("old history fixture was not retained")
+	}
+	if rules, _ := s.readCronRules(testAliceUserID); len(rules) != 1 {
+		t.Fatal("old cron fixture was not retained")
+	}
+	if entries, _ := s.readWhitelistEntries(testAliceUserID); len(entries) != 1 {
+		t.Fatal("old whitelist fixture was not retained")
+	}
+	if subjects, _ := s.readQuarantineSubjects(t.Context(), testAliceUserID); len(subjects) != 1 {
+		t.Fatal("old quarantine fixture was not retained")
+	}
+}
+
+func TestAppConfigRoundTrip(t *testing.T) {
+	store, err := newAppConfigStore(filepath.Join(t.TempDir(), "clamavweb.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := store.get()
+	cfg.HistoryIndexRefreshInterval = 120
+	cfg.ClamAVSleepTimer = 0
+	cfg.WebFirstRunCompleted = 2
+	cfg.WebLoginMaxTries = 12
+	cfg.WebLoginMaxTriesOverall = 120
+	cfg.WebLoginCooldownInterval = 300
+	cfg.ServerTrustedReverseProxy = "192.0.2.10,2001:db8::10"
+	cfg.LogFileMaxSize = 8 * 1024 * 1024
+	cfg.LogFileNum = 9
+	cfg.LogLevel = "debug"
+	if err := store.update(cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(store.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseAppConfig(string(data))
+	if err != nil || parsed != cfg {
+		t.Fatalf("config did not round trip: %#v err=%v", parsed, err)
+	}
+	if !strings.Contains(string(data), "CLAMAV_SLEEP_TIMER=0\n") {
+		t.Fatalf("disabled sleep timer was not written as zero: %s", data)
+	}
+}
+
+func TestAppConfigAddsMissingKeysWithoutReplacingExistingContent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "clamavweb.conf")
+	original := "# keep this comment\n  HISTORY_INDEX_REFRESH_INTERVAL = 120\nCLAMAV_SLEEP_TIMER=0\n"
+	if err := os.WriteFile(path, []byte(original), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := newAppConfigStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	if !strings.HasPrefix(content, original) {
+		t.Fatalf("existing configuration was replaced:\n%s", content)
+	}
+	for _, expected := range []string{
+		"WEB_FIRSTRUN_COMPLETED=0\n",
+		"WEB_LOGIN_MAX_TRIES=10\n",
+		"LOG_LEVEL=warn\n",
+	} {
+		if !strings.Contains(content, expected) {
+			t.Fatalf("missing default entry %q in:\n%s", expected, content)
+		}
+	}
+	if cfg := store.get(); cfg.HistoryIndexRefreshInterval != 120 || cfg.ClamAVSleepTimer != 0 {
+		t.Fatalf("existing values were not retained: %#v", cfg)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o640 {
+		t.Fatalf("existing permissions changed to %o", info.Mode().Perm())
+	}
+}
+
+func TestAppConfigUpdatePreservesCommentsAndUnchangedFormatting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "clamavweb.conf")
+	original := "# operator note\nHISTORY_INDEX_REFRESH_INTERVAL = 60\nCLAMAV_SLEEP_TIMER=3600\n"
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := newAppConfigStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := store.get()
+	cfg.ClamAVSleepTimer = 0
+	if err := store.update(cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	if !strings.HasPrefix(content, "# operator note\nHISTORY_INDEX_REFRESH_INTERVAL = 60\nCLAMAV_SLEEP_TIMER=0\n") {
+		t.Fatalf("update replaced unrelated content:\n%s", content)
+	}
+}
+
+func TestAppConfigSleepTimerDefaultsAndZeroValue(t *testing.T) {
+	cfg, err := parseAppConfig("")
+	if err != nil || cfg.ClamAVSleepTimer != defaultClamAVSleepTimer {
+		t.Fatalf("missing sleep timer did not use default: %#v err=%v", cfg, err)
+	}
+	if _, err := parseAppConfig("CLAMAV_SLEEP_TIMER=\n"); err == nil {
+		t.Fatal("empty sleep timer configuration was accepted")
+	}
+	cfg, err = parseAppConfig("CLAMAV_SLEEP_TIMER=0\n")
+	if err != nil || cfg.ClamAVSleepTimer != 0 {
+		t.Fatalf("zero sleep timer did not disable scheduling: %#v err=%v", cfg, err)
+	}
+}
+
+func TestAppConfigRejectsInvalidLoginAndProxySettings(t *testing.T) {
+	base := defaultAppConfig()
+	for name, mutate := range map[string]func(*appConfig){
+		"zero per-IP limit":       func(cfg *appConfig) { cfg.WebLoginMaxTries = 0 },
+		"overall below per-IP":    func(cfg *appConfig) { cfg.WebLoginMaxTriesOverall = cfg.WebLoginMaxTries - 1 },
+		"zero cooldown":           func(cfg *appConfig) { cfg.WebLoginCooldownInterval = 0 },
+		"invalid trusted proxy":   func(cfg *appConfig) { cfg.ServerTrustedReverseProxy = "proxy.example.com" },
+		"trusted proxy with port": func(cfg *appConfig) { cfg.ServerTrustedReverseProxy = "192.0.2.1:8080" },
+		"empty proxy list item":   func(cfg *appConfig) { cfg.ServerTrustedReverseProxy = "192.0.2.1,,192.0.2.2" },
+		"small log file":          func(cfg *appConfig) { cfg.LogFileMaxSize = minLogFileMaxSize - 1 },
+		"zero log files":          func(cfg *appConfig) { cfg.LogFileNum = 0 },
+		"invalid log level":       func(cfg *appConfig) { cfg.LogLevel = "verbose" },
+		"short sleep timer":       func(cfg *appConfig) { cfg.ClamAVSleepTimer = minClamAVSleepTimer - 1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := base
+			mutate(&cfg)
+			if err := validateAppConfig(cfg); err == nil {
+				t.Fatalf("expected invalid configuration to be rejected: %#v", cfg)
+			}
+		})
+	}
+}
+
+func TestServiceConfigUpdatesLoginLimitsAndTrustedProxy(t *testing.T) {
+	s := newDatabaseTestServer(t)
+	s.historyIntervalChanged = make(chan struct{}, 1)
+	s.clamavSleepTimer = newClamAVSleepTimerState()
+	if allowed, _ := s.loginLimiter.allow("192.0.2.1", time.Now(), s.appConfig.get()); !allowed {
+		t.Fatal("failed to seed login limiter")
+	}
+	request := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(`{
+	  "history_index_refresh_interval": 120,
+	  "clamav_sleep_timer": 600,
+	  "web_login_max_tries": 5,
+  "web_login_max_tries_overall": 50,
+  "web_login_cooldown_interval": 120,
+  "server_trusted_reverseproxy": "192.0.2.10, 2001:db8::10"
+}`))
+	request = request.WithContext(context.WithValue(request.Context(), actorContextKey{}, actor{ID: testAdminUserID, Username: "admin", Role: "admin"}))
+	response := httptest.NewRecorder()
+	s.handleServiceConfig(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("config update failed: %d %s", response.Code, response.Body.String())
+	}
+	cfg := s.appConfig.get()
+	if cfg.ClamAVSleepTimer != 600 || cfg.WebLoginMaxTries != 5 || cfg.WebLoginMaxTriesOverall != 50 || cfg.WebLoginCooldownInterval != 120 || cfg.ServerTrustedReverseProxy != "192.0.2.10,2001:db8::10" {
+		t.Fatalf("unexpected updated config: %#v", cfg)
+	}
+	if len(s.loginLimiter.byIP) != 0 {
+		t.Fatal("changing login limits should reset in-memory limiter state")
+	}
+	select {
+	case <-s.historyIntervalChanged:
+	default:
+		t.Fatal("changing the history refresh interval did not notify the indexer")
+	}
+	select {
+	case <-s.clamavSleepTimer.changed:
+	default:
+		t.Fatal("changing the ClamAV sleep timer did not notify the scheduler")
+	}
+	for _, key := range []string{"log_file_max_size", "log_file_num", "log_level"} {
+		if strings.Contains(response.Body.String(), key) {
+			t.Fatalf("file-only log setting %q leaked through the API: %s", key, response.Body.String())
+		}
+	}
+}
+
+func TestServiceConfigSleepTimerUsesZeroToDisable(t *testing.T) {
+	s := newDatabaseTestServer(t)
+	s.clamavSleepTimer = newClamAVSleepTimerState()
+	actorCtx := context.WithValue(context.Background(), actorContextKey{}, actor{ID: testAdminUserID, Username: "admin", Role: "admin"})
+
+	emptyRequest := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(`{"clamav_sleep_timer":""}`)).WithContext(actorCtx)
+	emptyResponse := httptest.NewRecorder()
+	s.handleServiceConfig(emptyResponse, emptyRequest)
+	if emptyResponse.Code != http.StatusBadRequest {
+		t.Fatalf("empty string should be rejected, got %d %s", emptyResponse.Code, emptyResponse.Body.String())
+	}
+	if s.appConfig.get().ClamAVSleepTimer != defaultClamAVSleepTimer {
+		t.Fatal("rejected empty string changed the sleep timer")
+	}
+
+	zeroRequest := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(`{"clamav_sleep_timer":0}`)).WithContext(actorCtx)
+	zeroResponse := httptest.NewRecorder()
+	s.handleServiceConfig(zeroResponse, zeroRequest)
+	if zeroResponse.Code != http.StatusOK {
+		t.Fatalf("zero sleep timer update failed: %d %s", zeroResponse.Code, zeroResponse.Body.String())
+	}
+	if s.appConfig.get().ClamAVSleepTimer != 0 {
+		t.Fatal("zero API value did not disable the sleep timer")
+	}
+	body := decodeMap(t, zeroResponse)
+	if timer, ok := body["clamav_sleep_timer"].(float64); !ok || timer != 0 {
+		t.Fatalf("disabled sleep timer response was not numeric zero: %#v", body["clamav_sleep_timer"])
+	}
+	data, err := os.ReadFile(s.appConfig.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "CLAMAV_SLEEP_TIMER=0\n") {
+		t.Fatalf("disabled timer was not persisted as zero: %s", data)
+	}
+}
+
+func decodeMap(t *testing.T, recorder *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	var value map[string]any
+	if err := json.NewDecoder(recorder.Body).Decode(&value); err != nil {
+		t.Fatal(err)
+	}
+	return value
+}

@@ -36,15 +36,15 @@ export function QuarantinePage() {
     try {
       const begin = await api<{ lookup_id: string }>(
         "/api/quarantine/lookups",
-        { method: "POST" },
+        { method: "POST" }
       )
       let lookup = await api<QuarantineLookup>(
-        `/api/quarantine/lookups/${encodeURIComponent(begin.lookup_id)}`,
+        `/api/quarantine/lookups/${encodeURIComponent(begin.lookup_id)}`
       )
       while (lookup.status === "pending" && mounted.current) {
         await sleep(500)
         lookup = await api<QuarantineLookup>(
-          `/api/quarantine/lookups/${encodeURIComponent(begin.lookup_id)}`,
+          `/api/quarantine/lookups/${encodeURIComponent(begin.lookup_id)}`
         )
       }
       if (lookup.status === "failed") {
@@ -63,19 +63,19 @@ export function QuarantinePage() {
   }, [])
 
   React.useEffect(() => {
-    void load()
+    queueMicrotask(() => void load())
   }, [load])
 
   async function action(
     item: QuarantineSubject,
-    operation: "recover" | "delete",
+    operation: "recover" | "delete"
   ) {
     const label = operation === "recover" ? "恢复" : "永久删除"
     if (!confirm(`${label}“${item.name}”？`)) return
     try {
       await api(
         `/api/quarantine/${operation}/${encodeURIComponent(item.name)}`,
-        { method: "POST" },
+        { method: "POST" }
       )
       toast.add({ type: "success", title: `文件${label}成功` })
       await load()

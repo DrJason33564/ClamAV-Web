@@ -23,9 +23,15 @@ type templateLookupState struct {
 	ReadyAt   time.Time
 }
 
+type templateStatisticsLookupState struct {
+	templateLookupState
+	Scope int
+}
+
 type templateAPI struct {
 	mu                sync.RWMutex
 	resultLookups     map[string]templateLookupState
+	statisticsLookups map[string]templateStatisticsLookupState
 	quarantineLookups map[string]templateLookupState
 	lookupDelay       func() time.Duration
 }
@@ -95,12 +101,12 @@ var templateCronRules = []map[string]any{
 	{
 		"id": "testenabled00001", "enabled": true,
 		"minute": "0", "hour": "2", "day": "*", "month": "*", "weekday": "*",
-		"target": "/scan/documents", "action": "warn", "line": 2,
+		"target": "/scan/documents", "action": "warn", "wake": true, "line": 2,
 	},
 	{
 		"id": "testdisabled0002", "enabled": false,
 		"minute": "30", "hour": "4", "day": "*", "month": "*", "weekday": "0",
-		"target": "/scan/uploads", "action": "move", "line": 4,
+		"target": "/scan/uploads", "action": "move", "wake": false, "line": 4,
 	},
 }
 
@@ -184,6 +190,7 @@ func newTemplateAPIHandler() http.Handler {
 func newTemplateAPIHandlerWithDelay(lookupDelay func() time.Duration) http.Handler {
 	api := &templateAPI{
 		resultLookups:     make(map[string]templateLookupState),
+		statisticsLookups: make(map[string]templateStatisticsLookupState),
 		quarantineLookups: make(map[string]templateLookupState),
 		lookupDelay:       lookupDelay,
 	}
@@ -202,6 +209,8 @@ func newTemplateAPIHandlerWithDelay(lookupDelay func() time.Duration) http.Handl
 	mux.HandleFunc("/api/whitelist", templateWhitelist)
 	mux.HandleFunc("/api/results/lookups", api.templateResultLookupStart)
 	mux.HandleFunc("/api/results/lookups/", api.templateResultLookup)
+	mux.HandleFunc("/api/results/statistics/lookups", api.templateStatisticsLookupStart)
+	mux.HandleFunc("/api/results/statistics/lookups/", api.templateStatisticsLookup)
 	mux.HandleFunc("/api/results/detection", templateDetection)
 	mux.HandleFunc("/api/results/clean", templateResultsClean)
 	mux.HandleFunc("/api/quarantine/lookups", api.templateQuarantineLookupStart)
@@ -250,6 +259,14 @@ func templateStatus(w http.ResponseWriter, r *http.Request) {
 		{"timeout", "clamd ping timed out"},
 	}
 	state := states[rand.Intn(len(states))]
+	clamdVersion := ""
+	databaseVersion := ""
+	databaseDate := ""
+	if state.status == "ready" {
+		clamdVersion = "1.5.4"
+		databaseVersion = "28098"
+		databaseDate = "Thu Aug 14 14:24:22 2026"
+	}
 	writeTemplateJSON(w, http.StatusOK, map[string]any{
 		"source": map[string]any{
 			"version":    1,
@@ -257,7 +274,6 @@ func templateStatus(w http.ResponseWriter, r *http.Request) {
 			"clamd": map[string]any{
 				"status":          state.status,
 				"last_checked_at": timestamp,
-				"message":         state.message,
 			},
 			"scan": map[string]any{
 				"active_job_id":   nil,
@@ -266,9 +282,13 @@ func templateStatus(w http.ResponseWriter, r *http.Request) {
 				"last_job_result": "clean",
 			},
 		},
-		"ping":         state.status,
-		"ping_message": state.message,
-		"checked_at":   timestamp,
+		"ping":             state.status,
+		"ping_message":     state.message,
+		"clamd_version":    clamdVersion,
+		"database_version": databaseVersion,
+		"database_date":    databaseDate,
+		"checked_at":       timestamp,
+		"is_timedock":      false,
 	})
 }
 
@@ -423,6 +443,10 @@ func (api *templateAPI) templateResultLookupStart(w http.ResponseWriter, r *http
 	if !templateMethod(w, r, http.MethodPost) {
 		return
 	}
+	if _, err := parseResultScope(r.URL.Query().Get("scope")); err != nil {
+		writeTemplateJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
 	id, state := api.createLookup("result")
 	api.mu.Lock()
 	api.resultLookups[id] = state
@@ -470,7 +494,8 @@ func (api *templateAPI) templateResultLookup(w http.ResponseWriter, r *http.Requ
 
 func templateResultItems() []map[string]any {
 	items := make([]map[string]any, 0, 20)
-	results := []any{"clean", "found", "error", nil}
+	results := []any{"unknown", "clean", "found", "error"}
+	actions := []string{"warn", "move", "remove"}
 	baseTime := time.Date(2026, 7, 28, 7, 0, 0, 0, time.FixedZone("CST", 8*60*60))
 	for i := 0; i < 20; i++ {
 		jobType := "manual"
@@ -479,10 +504,69 @@ func templateResultItems() []map[string]any {
 		}
 		date := baseTime.Add(-time.Duration(i) * time.Minute).Format("20060102150405")
 		items = append(items, map[string]any{
-			"id": jobType + "-" + date, "type": jobType, "date": date, "result": results[i%len(results)],
+			"id": jobType + "-" + date, "type": jobType, "date": date,
+			"result": results[i%len(results)], "action": actions[i%len(actions)],
 		})
 	}
 	return items
+}
+
+func (api *templateAPI) templateStatisticsLookupStart(w http.ResponseWriter, r *http.Request) {
+	if !templateMethod(w, r, http.MethodPost) {
+		return
+	}
+	scope, err := parseHistoryStatisticsScope(r.URL.Query().Get("scope"))
+	if err != nil {
+		writeTemplateJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	id, state := api.createLookup("statistics")
+	api.mu.Lock()
+	api.statisticsLookups[id] = templateStatisticsLookupState{templateLookupState: state, Scope: scope}
+	api.cleanupLookupsLocked(time.Now().Add(-15 * time.Minute))
+	api.mu.Unlock()
+	writeTemplateJSON(w, http.StatusAccepted, map[string]any{
+		"status": "pending", "lookup_id": id, "scope": scope,
+		"message": "history statistics are loading; poll /api/results/statistics/lookups/" + id,
+	})
+}
+
+func (api *templateAPI) templateStatisticsLookup(w http.ResponseWriter, r *http.Request) {
+	if !templateMethod(w, r, http.MethodGet) {
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/api/results/statistics/lookups/")
+	if id == "" || strings.Contains(id, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	api.mu.RLock()
+	state, ok := api.statisticsLookups[id]
+	api.mu.RUnlock()
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if time.Now().Before(state.ReadyAt) {
+		writeTemplateJSON(w, http.StatusAccepted, map[string]any{
+			"lookup_id": id, "status": "pending", "scope": state.Scope, "total": 0,
+			"started_at": state.StartedAt, "updated_at": state.StartedAt,
+		})
+		return
+	}
+	response := map[string]any{
+		"lookup_id": id, "status": "success", "scope": state.Scope,
+		"started_at": state.StartedAt, "updated_at": state.ReadyAt,
+	}
+	total := 0
+	today := time.Now()
+	for offset := state.Scope - 1; offset >= 0; offset-- {
+		counts := historyStatisticsDay{Unknown: offset % 2, Clean: 2, Found: offset % 3, Error: 0}
+		response[today.AddDate(0, 0, -offset).Format("20060102")] = counts
+		total += counts.Unknown + counts.Clean + counts.Found + counts.Error
+	}
+	response["total"] = total
+	writeTemplateJSON(w, http.StatusOK, response)
 }
 
 func templateDetection(w http.ResponseWriter, r *http.Request) {
@@ -577,6 +661,11 @@ func (api *templateAPI) cleanupLookupsLocked(before time.Time) {
 			delete(api.resultLookups, id)
 		}
 	}
+	for id, state := range api.statisticsLookups {
+		if state.StartedAt.Before(before) {
+			delete(api.statisticsLookups, id)
+		}
+	}
 	for id, state := range api.quarantineLookups {
 		if state.StartedAt.Before(before) {
 			delete(api.quarantineLookups, id)
@@ -655,8 +744,21 @@ func TestTemplateAPIResponses(t *testing.T) {
 		}
 		source := body["source"].(map[string]any)
 		clamd := source["clamd"].(map[string]any)
-		if body["ping"] != clamd["status"] || body["ping_message"] != clamd["message"] {
+		if body["ping"] != clamd["status"] || body["ping_message"] == "" {
 			t.Fatalf("status fields do not match: %#v", body)
+		}
+		if _, exists := clamd["message"]; exists {
+			t.Fatalf("unexpected clamd message field: %#v", clamd)
+		}
+		if body["ping"] == "ready" {
+			if body["clamd_version"] == "" || body["database_version"] == "" || body["database_date"] == "" {
+				t.Fatalf("ready status is missing version fields: %#v", body)
+			}
+		} else if body["clamd_version"] != "" || body["database_version"] != "" || body["database_date"] != "" {
+			t.Fatalf("unready status contains version fields: %#v", body)
+		}
+		if body["is_timedock"] != false {
+			t.Fatalf("unexpected is_timedock value: %#v", body["is_timedock"])
 		}
 		scan := source["scan"].(map[string]any)
 		if scan["last_job_id"] != templateLastJobID {
@@ -737,17 +839,30 @@ func TestTemplateAPIResponses(t *testing.T) {
 	})
 
 	t.Run("lookups start pending and return twenty items when ready", func(t *testing.T) {
-		response, start := request(http.MethodPost, "/api/results/lookups")
+		response, start := request(http.MethodPost, "/api/results/lookups?scope=1-20")
 		if response.Code != http.StatusAccepted || start["status"] != "pending" {
 			t.Fatalf("unexpected lookup start: %d %#v", response.Code, start)
 		}
-		_, secondStart := request(http.MethodPost, "/api/results/lookups")
+		_, secondStart := request(http.MethodPost, "/api/results/lookups?scope=1-20")
 		if start["lookup_id"] == secondStart["lookup_id"] {
 			t.Fatalf("expected each lookup to have a new id, got %q", start["lookup_id"])
 		}
 		response, lookup := request(http.MethodGet, "/api/results/lookups/"+start["lookup_id"].(string))
 		if response.Code != http.StatusOK || len(lookup["results"].([]any)) != 20 {
 			t.Fatalf("unexpected lookup result: %d %#v", response.Code, lookup)
+		}
+		first := lookup["results"].([]any)[0].(map[string]any)
+		if first["action"] != "warn" {
+			t.Fatalf("history result does not expose action: %#v", first)
+		}
+
+		response, statisticsStart := request(http.MethodPost, "/api/results/statistics/lookups?scope=3")
+		if response.Code != http.StatusAccepted || statisticsStart["status"] != "pending" {
+			t.Fatalf("unexpected statistics lookup start: %d %#v", response.Code, statisticsStart)
+		}
+		response, statistics := request(http.MethodGet, "/api/results/statistics/lookups/"+statisticsStart["lookup_id"].(string))
+		if response.Code != http.StatusOK || statistics["scope"] != float64(3) || statistics["total"].(float64) < 1 {
+			t.Fatalf("unexpected statistics lookup result: %d %#v", response.Code, statistics)
 		}
 
 		response, quarantineStart := request(http.MethodPost, "/api/quarantine/lookups")
@@ -765,8 +880,11 @@ func TestTemplateAPIResponses(t *testing.T) {
 
 	t.Run("lookups remain pending until their delay expires", func(t *testing.T) {
 		slowHandler := newTemplateAPIHandlerWithDelay(func() time.Duration { return time.Hour })
-		for _, lookupPath := range []string{"/api/results/lookups", "/api/quarantine/lookups"} {
-			startRequest := httptest.NewRequest(http.MethodPost, lookupPath, nil)
+		for _, lookup := range []struct{ startPath, pollPath string }{
+			{"/api/results/lookups?scope=1-20", "/api/results/lookups"},
+			{"/api/quarantine/lookups", "/api/quarantine/lookups"},
+		} {
+			startRequest := httptest.NewRequest(http.MethodPost, lookup.startPath, nil)
 			startRequest.SetBasicAuth("any-user", "any-password")
 			startResponse := httptest.NewRecorder()
 			slowHandler.ServeHTTP(startResponse, startRequest)
@@ -775,10 +893,10 @@ func TestTemplateAPIResponses(t *testing.T) {
 				t.Fatal(err)
 			}
 			if startResponse.Code != http.StatusAccepted || start["status"] != "pending" {
-				t.Fatalf("unexpected lookup start for %s: %d %#v", lookupPath, startResponse.Code, start)
+				t.Fatalf("unexpected lookup start for %s: %d %#v", lookup.startPath, startResponse.Code, start)
 			}
 
-			pollRequest := httptest.NewRequest(http.MethodGet, lookupPath+"/"+start["lookup_id"].(string), nil)
+			pollRequest := httptest.NewRequest(http.MethodGet, lookup.pollPath+"/"+start["lookup_id"].(string), nil)
 			pollRequest.SetBasicAuth("any-user", "any-password")
 			pollResponse := httptest.NewRecorder()
 			slowHandler.ServeHTTP(pollResponse, pollRequest)
@@ -787,7 +905,7 @@ func TestTemplateAPIResponses(t *testing.T) {
 				t.Fatal(err)
 			}
 			if pollResponse.Code != http.StatusAccepted || poll["status"] != "pending" {
-				t.Fatalf("unexpected pending poll for %s: %d %#v", lookupPath, pollResponse.Code, poll)
+				t.Fatalf("unexpected pending poll for %s: %d %#v", lookup.startPath, pollResponse.Code, poll)
 			}
 		}
 	})
@@ -809,7 +927,8 @@ func TestTemplateAPIResponses(t *testing.T) {
 	})
 
 	t.Run("every documented API route responds", func(t *testing.T) {
-		_, resultStart := request(http.MethodPost, "/api/results/lookups")
+		_, resultStart := request(http.MethodPost, "/api/results/lookups?scope=1-20")
+		_, statisticsStart := request(http.MethodPost, "/api/results/statistics/lookups?scope=3")
 		_, quarantineStart := request(http.MethodPost, "/api/quarantine/lookups")
 		routes := []struct {
 			method string
@@ -833,8 +952,10 @@ func TestTemplateAPIResponses(t *testing.T) {
 			{http.MethodGet, "/api/whitelist", http.StatusOK},
 			{http.MethodPost, "/api/whitelist", http.StatusOK},
 			{http.MethodDelete, "/api/whitelist", http.StatusOK},
-			{http.MethodPost, "/api/results/lookups", http.StatusAccepted},
+			{http.MethodPost, "/api/results/lookups?scope=1-20", http.StatusAccepted},
 			{http.MethodGet, "/api/results/lookups/" + resultStart["lookup_id"].(string), http.StatusOK},
+			{http.MethodPost, "/api/results/statistics/lookups?scope=3", http.StatusAccepted},
+			{http.MethodGet, "/api/results/statistics/lookups/" + statisticsStart["lookup_id"].(string), http.StatusOK},
 			{http.MethodPost, "/api/results/detection", http.StatusOK},
 			{http.MethodPost, "/api/results/clean", http.StatusOK},
 			{http.MethodPost, "/api/quarantine/clean", http.StatusOK},

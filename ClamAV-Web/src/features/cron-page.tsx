@@ -45,6 +45,7 @@ const emptyDraft: CronDraft = {
   weekday: "*",
   target: "",
   action: "warn",
+  wake: false,
 }
 
 export function CronPage() {
@@ -70,7 +71,7 @@ export function CronPage() {
   }, [])
 
   React.useEffect(() => {
-    void load()
+    queueMicrotask(() => void load())
   }, [load])
 
   function update<K extends keyof CronDraft>(key: K, value: CronDraft[K]) {
@@ -95,7 +96,7 @@ export function CronPage() {
         : "/api/cron/rules"
       await api<CronRulesResponse>(
         url,
-        jsonRequest(editingId ? "PUT" : "POST", draft),
+        jsonRequest(editingId ? "PUT" : "POST", draft)
       )
       toast.add({
         type: "success",
@@ -116,7 +117,7 @@ export function CronPage() {
     try {
       await api<CronRulesResponse>(
         `/api/cron/rules/${encodeURIComponent(rule.id)}/enabled`,
-        jsonRequest("PATCH", { enabled }),
+        jsonRequest("PATCH", { enabled })
       )
       await load()
     } catch (error) {
@@ -133,7 +134,7 @@ export function CronPage() {
     try {
       await api<CronRulesResponse>(
         `/api/cron/rules/${encodeURIComponent(rule.id)}`,
-        { method: "DELETE" },
+        { method: "DELETE" }
       )
       if (editingId === rule.id) reset()
       await load()
@@ -243,14 +244,27 @@ export function CronPage() {
                 <Field orientation="horizontal">
                   <div className="flex flex-1 flex-col gap-1">
                     <FieldLabel htmlFor="cron-enabled">启用规则</FieldLabel>
-                    <FieldDescription>保存后立即参与 Cron 调度</FieldDescription>
+                    <FieldDescription>
+                      保存后立即参与 Cron 调度
+                    </FieldDescription>
                   </div>
                   <Switch
                     id="cron-enabled"
                     checked={draft.enabled}
-                    onCheckedChange={(enabled) =>
-                      update("enabled", enabled)
-                    }
+                    onCheckedChange={(enabled) => update("enabled", enabled)}
+                  />
+                </Field>
+                <Field orientation="horizontal">
+                  <div className="flex flex-1 flex-col gap-1">
+                    <FieldLabel htmlFor="cron-wake">扫描前唤醒引擎</FieldLabel>
+                    <FieldDescription>
+                      执行规则时自动唤醒处于休眠状态的 ClamAV
+                    </FieldDescription>
+                  </div>
+                  <Switch
+                    id="cron-wake"
+                    checked={draft.wake}
+                    onCheckedChange={(wake) => update("wake", wake)}
                   />
                 </Field>
               </FieldGroup>
@@ -296,6 +310,11 @@ export function CronPage() {
                 <span className="text-sm text-muted-foreground">
                   {actionLabel(rule.action)}
                 </span>
+                {rule.wake && (
+                  <Badge variant="outline" className="self-start">
+                    扫描前唤醒引擎
+                  </Badge>
+                )}
                 <div className="flex flex-wrap items-center gap-2">
                   <Switch
                     size="sm"

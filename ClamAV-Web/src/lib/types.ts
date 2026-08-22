@@ -21,7 +21,6 @@ export type StatusSource = {
   clamd?: {
     status?: string
     last_checked_at?: string
-    message?: string
   }
   scan?: {
     active_job_id?: string | null
@@ -35,7 +34,48 @@ export type StatusResponse = {
   source: StatusSource | string
   ping: string
   ping_message: string
+  clamd_version: string
+  database_version: string
+  database_date: string
   checked_at: string
+  first_run: "completed" | "not_completed"
+  is_timedock: boolean
+}
+
+export type UserRole = "admin" | "user"
+
+export type CurrentUser = {
+  username: string
+  role: UserRole
+  timedock_account: string
+}
+
+export type FirstRunResponse = {
+  first_run: "completed" | "not_completed"
+}
+
+export type AuthResponse = CurrentUser & { status?: string; message?: string }
+
+export type AdminUser = CurrentUser & {
+  status: "active" | "disabled" | "deleting"
+  password_set: boolean
+  created_at: number
+  updated_at: number
+}
+
+export type AdminUsersResponse = {
+  status: string
+  users: AdminUser[]
+}
+
+export type ServiceConfig = {
+  history_index_refresh_interval: number
+  clamav_sleep_timer: number
+  web_firstrun_completed: number
+  web_login_max_tries: number
+  web_login_max_tries_overall: number
+  web_login_cooldown_interval: number
+  server_trusted_reverseproxy: string
 }
 
 export type ClamAVPowerResponse = {
@@ -53,6 +93,7 @@ export type CronRule = {
   weekday: string
   target: string
   action: ScanAction
+  wake: boolean
 }
 
 export type CronRulesResponse = {
@@ -86,6 +127,7 @@ export type HistoryItem = {
   type: string
   date: string
   result: string | null
+  action: ScanAction
 }
 
 export type HistoryLookup = {
@@ -94,6 +136,31 @@ export type HistoryLookup = {
   results?: HistoryItem[]
   total: number
   error?: string
+}
+
+export type StatisticsCounts = {
+  unknown: number
+  clean: number
+  found: number
+  error: number
+}
+
+export type StatisticsLookupStart = {
+  status: "pending"
+  lookup_id: string
+  scope: number
+  message?: string
+}
+
+export type StatisticsLookupResponse = {
+  lookup_id: string
+  status: "pending" | "success" | "failed"
+  scope: number
+  total: number
+  error?: string
+  started_at?: string
+  updated_at?: string
+  [key: string]: unknown
 }
 
 export type DetectionDetail = {

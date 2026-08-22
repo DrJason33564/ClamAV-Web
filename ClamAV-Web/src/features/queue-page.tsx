@@ -45,17 +45,20 @@ export function QueuePage() {
   }, [])
 
   React.useEffect(() => {
-    void load()
+    queueMicrotask(() => void load())
   }, [load])
 
   async function reorder(item: QueueItem) {
     const queueNumber = Number(positions[item.id])
     if (!Number.isInteger(queueNumber) || queueNumber < 1) return
     try {
-      await api("/api/scans/reorder", jsonRequest("POST", {
-        id: item.id,
-        queue_number: queueNumber,
-      }))
+      await api(
+        "/api/scans/reorder",
+        jsonRequest("POST", {
+          id: item.id,
+          queue_number: queueNumber,
+        })
+      )
       toast.add({ type: "success", title: "任务顺序已更新" })
       await load()
     } catch (error) {
@@ -72,7 +75,7 @@ export function QueuePage() {
     try {
       await api(
         "/api/scans/cancel",
-        jsonRequest("POST", { id: item.id, cancel: "Y" }),
+        jsonRequest("POST", { id: item.id, cancel: "Y" })
       )
       toast.add({ type: "success", title: "排队任务已删除" })
       await load()
@@ -123,9 +126,7 @@ export function QueuePage() {
                   <span>处理方式：{actionLabel(item.action)}</span>
                   <span>
                     开始时间：
-                    {running
-                      ? formatTimestamp(item.started_at)
-                      : "排队中"}
+                    {running ? formatTimestamp(item.started_at) : "排队中"}
                   </span>
                 </div>
                 {!running && (

@@ -1,250 +1,186 @@
-# ClamAV TimeDock
+<div align="center">
 
-ClamAV TimeDock 是一个面向 ClamAV 的 Web 管理应用，以 Docker 镜像形式运行。通过浏览器即可执行手动或定时扫描、查看任务状态与历史结果、管理信任区和处理隔离文件，无需在日常使用中操作命令行。
+<img src="images/clamav-web-mark.png" width="144" alt="ClamAV-Web 标志">
 
-> 本项目提供管理界面和任务调度能力，病毒检测与病毒库更新由容器内的 ClamAV 完成。
+<h1>ClamAV-Web</h1>
 
-## 主要功能
+**为 [ClamAV](https://www.clamav.net/) 容器提供的 Web 管理、任务调度与多用户工作台**
 
-- 实时查看 ClamAV 状态、最近扫描时间和结果
-- 在网页中浏览文件，选择一个或多个目标发起扫描
-- 查看手动扫描队列，调整等待顺序或取消等待任务
-- 创建、编辑、启停和删除定时扫描规则
-- 查看手动及定时扫描的历史记录、任务日志与检出详情
-- 将可信文件或目录加入信任区
-- 查看、恢复、删除或清空隔离文件
-- 支持仅告警、移入隔离区和直接删除三种处理方式
-- 所有页面和 API 均使用账号密码验证
+[![GitHub Release](https://img.shields.io/github/v/release/DrJason33564/ClamAV-Web?style=flat-square&logo=github)](https://github.com/DrJason33564/ClamAV-Web/releases)
+[![Docker Pulls](https://img.shields.io/docker/pulls/tinkerbell37745/clamav-timedock?style=flat-square&logo=docker)](https://hub.docker.com/r/tinkerbell37745/clamav-timedock)
+[![Docker Image Size](https://img.shields.io/docker/image-size/tinkerbell37745/clamav-timedock/latest?style=flat-square&logo=docker&color=2496ED)](https://hub.docker.com/r/tinkerbell37745/clamav-timedock)
+[![GitHub Last Commit](https://img.shields.io/github/last-commit/DrJason33564/ClamAV-Web?style=flat-square&logo=github)](https://github.com/DrJason33564/ClamAV-Web/commits)
+[![License](https://img.shields.io/github/license/DrJason33564/ClamAV-Web?style=flat-square)](LICENSE)
 
-扫描任务会串行执行，避免多个扫描同时占用 ClamAV。
+[![Go](https://img.shields.io/github/go-mod/go-version/DrJason33564/ClamAV-Web?style=flat-square&logo=go)](server/go.mod)
+[![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=black)](ClamAV-Web/package.json)
 
-## 快速开始
+[GitHub](https://github.com/DrJason33564/ClamAV-Web) · [Docker Hub](https://hub.docker.com/r/tinkerbell37745/clamav-timedock) · [快速开始](#-快速开始) · [开发](DEV.md) · [API](server/api.md)
 
-### 构建镜像
+</div>
 
-```sh
-docker build -t clamav-timedock .
+ClamAV-Web 将 ClamAV 的扫描能力、定时任务和结果处理整合为一个浏览器可用的管理界面。它以单个 Docker 镜像运行：内含 ClamAV、Go 后端、React 前端和 cron 调度服务，适合家庭服务器、小型团队与NAS场景。
+
+> 本项目负责管理、编排与展示；病毒检测和病毒库更新仍由上游 `clamav/clamav` 完成。
+
+## 📸 界面预览
+
+<table>
+  <tr>
+    <td align="center" width="50%"><img src="images/状态首页.png" width="400" alt="状态首页"><br>ClamAV 状态与扫描统计</td>
+    <td align="center" width="50%"><img src="images/手动扫描.png" width="400" alt="手动扫描"><br>文件浏览与扫描提交</td>
+  </tr>
+</table>
+
+<table>
+  <tr>
+    <td align="center" width="33.33%"><img src="images/定时任务.png" width="320" alt="定时任务"><br>cron 规则管理</td>
+    <td align="center" width="33.33%"><img src="images/历史任务.png" width="320" alt="历史任务"><br>历史任务记录</td>
+    <td align="center" width="33.33%"><img src="images/隔离区.png" width="320" alt="隔离区"><br>隔离区</td>
+  </tr>
+</table>
+
+## ✨ 功能一览
+
+| 模块 | 能力 |
+| --- | --- |
+| 状态面板 | 查看 ClamAV 连通性、运行状态、最近扫描结果与统计；管理员可休眠或唤醒引擎。 |
+| 手动扫描 | 在 `/scan` 中安全浏览并多选文件/目录，提交串行扫描任务。 |
+| 定时任务 | 可视化创建、编辑、启停和重载五段 cron 规则。 |
+| 任务与历史 | 调整等待队列、取消未开始任务；异步查询历史、日志、检出详情与统计。 |
+| 文件处置 | 支持仅告警、移动至隔离区、直接删除；隔离文件可恢复或永久清理。 |
+| 信任区 | 以 SHA-256 生成 ClamAV allow-list，支持文件与目录递归加入。 |
+| 多用户 | 内置 admin / user、Argon2id 密码哈希、Cookie session，以及用户间业务数据隔离。 |
+| TimeDock 模式 | 适配拾光坞 NAS 的用户空间隔离机制，可将每个账号限制在指定的 `/scan` 子目录，避免越权浏览和提交路径。 |
+
+## 🧱 工作方式
+
+```text
+浏览器
+  │ React + Vite 构建的单页界面
+  ▼
+Go HTTP 服务（认证、权限、队列、API、SQLite 索引）
+  ├── /scan_once.sh ──► clamd / ClamAV
+  ├── /cron.sh ───────► Debian cron
+  ├── /config         ──► 规则、白名单、服务配置
+  └── /data /state /log /quarantine ──► 持久化数据与运行产物
 ```
 
-### 启动容器
+生产构建会先编译 `ClamAV-Web/`，再将静态文件嵌入 Go 可执行程序；容器启动后由 `startup.sh` 协调 ClamAV、cron 和 Web 服务。扫描全局串行执行，防止多个任务同时挤占扫描引擎。
 
-先创建用于持久化数据的目录：
+## 🚀 快速开始
+
+### 1. 构建镜像
 
 ```sh
-mkdir -p config scan quarantine log state
+docker build -t tinkerbell37745/clamav-timedock .
 ```
 
-然后启动：
+### 2. 准备持久化目录
+
+```sh
+mkdir -p config data scan quarantine log state
+```
+
+将需要扫描的内容放入 `scan/`。默认情况下，Web 界面只能浏览和操作容器内的 `/scan`；文件浏览会隐藏符号链接，相关 API 也会拒绝包含符号链接的路径。
+
+### 3. 启动服务
+
+首次注册管理员必须设置一个非空的 `ADMIN_REGISTER_TOKEN`。请替换示例中的随机值，并妥善保管。
 
 ```sh
 docker run -d \
-  --name clamav-timedock \
+  --name clamav-web \
   --restart unless-stopped \
   -p 8080:8080 \
   -e TZ=Asia/Shanghai \
-  -e SCANNER_ACCOUNTS='admin:请替换为强密码' \
+  -e ADMIN_REGISTER_TOKEN='replace-with-a-long-random-token' \
   -v "$(pwd)/config:/config" \
+  -v "$(pwd)/data:/data" \
   -v "$(pwd)/scan:/scan" \
   -v "$(pwd)/quarantine:/quarantine" \
   -v "$(pwd)/log:/log" \
   -v "$(pwd)/state:/state" \
-  clamav-timedock
+  tinkerbell37745/clamav-timedock
 ```
 
-启动后访问：
+访问 `http://<主机地址>:8080`。首次打开时，使用你设置的令牌注册首个账户；该账户会自动成为管理员。完成首次运行流程后，管理员可在界面中创建其他账户。
 
-```text
-http://主机地址:8080
-```
+## 📦 持久化目录
 
-使用 `SCANNER_ACCOUNTS` 设置的账号登录。该变量为必填项，多个账号（虽然现在尚未实际使用到）可以用逗号、分号或换行分隔：
-
-```text
-admin:password1,operator:password2
-```
-
-首次启动会自动生成所需配置。默认没有启用的定时扫描任务，可在 WebUI 中自行添加。
-
-## WebUI 使用指南
-
-### 首页状态
-
-登录后，首页会显示：
-
-- ClamAV 当前是否准备就绪
-- 当前是否有扫描正在运行
-- 最近一次扫描时间
-- 最近一次扫描结果
-
-右上角的刷新按钮可立即更新状态。
-
-在“设置”中可以调整状态轮询间隔。开启调试模式后，首页还会显示后端返回的原始状态数据，便于排查问题。以上界面偏好保存在当前浏览器中。
-
-### 手动扫描
-
-1. 打开“手动扫描”。
-2. 在文件浏览器中进入目标目录。
-3. 勾选一个或多个文件、目录。
-4. 选择检出后的处理方式。
-5. 点击“开始扫描”。
-
-可选的处理方式：
-
-| 方式 | 行为 |
-| --- | --- |
-| 仅告警 | 记录威胁，不修改原文件 |
-| 移动到隔离区 | 将检出文件移入隔离区，以便后续恢复或删除 |
-| 直接删除 | 立即删除检出文件，无法从隔离区恢复 |
-
-建议首次使用时选择“仅告警”。“移动到隔离区”和“直接删除”都会修改 `/scan` 中的数据。
-
-WebUI 只能浏览和扫描挂载到 `/scan` 下的内容。即使 `/scan` 内存在符号链接，也不能通过它访问该目录之外的文件。
-
-### 定时扫描
-
-打开“定时扫描”后，可以在页面中：
-
-- 新建或编辑周期规则
-- 从文件浏览器选择扫描目标
-- 设置分钟、小时、日期、月份和星期
-- 选择检出处理方式
-- 启用或停用规则
-- 删除已有规则
-- 重新加载定时任务
-
-时间字段采用标准的五段 cron 表达式。常见示例：
-
-| 执行时间 | 分钟 | 小时 | 日期 | 月份 | 星期 |
-| --- | --- | --- | --- | --- | --- |
-| 每天 03:30 | `30` | `3` | `*` | `*` | `*` |
-| 每 6 小时 | `0` | `*/6` | `*` | `*` | `*` |
-| 每周日 02:15 | `15` | `2` | `*` | `*` | `0` |
-
-表达式支持单值、范围、步长和逗号列表，例如 `3`、`1-5`、`*/6`、`1-10/2`、`1,3,5`。星期取值为 `0-7`，其中 `0` 和 `7` 通常都表示星期日。
-
-保存、启停、编辑或删除规则后，WebUI 会校验配置并重新加载定时任务。定时扫描遇到其他任务正在运行时会等待，之后再继续执行。
-
-### 任务队列
-
-“任务队列”显示当前正在执行和等待中的手动扫描批次：
-
-- 序号 `0` 表示正在运行
-- 序号 `1` 起表示等待顺序
-- 等待中的任务可以调整序号
-- 等待中的任务可以取消
-- 已经开始的任务不能从该页面取消或重新排序
-
-队列保存在 Web 服务内存中。容器重启后，尚未开始的排队任务不会恢复；已经完成的扫描仍可在“历史任务”中查看。
-
-### 信任区
-
-打开“信任区”，从文件浏览器中选择一个文件或目录，然后点击“添加到信任区”。已有条目可以在列表中删除。
-
-信任区适合加入确认安全、但会被误报或不希望重复告警的内容。它依据文件的 SHA256 内容哈希生成 ClamAV allow-list：
-
-- 添加目录时，会递归处理目录内的文件
-- 文件内容变化后，原有哈希不再匹配，需要重新添加或刷新信任条目
-- 扫描进行期间不能修改信任区
-- 信任区同样只能选择 `/scan` 下已存在的文件或目录
-
-WebUI 在增删信任条目后会自动更新 allow-list 并让 ClamAV 重新加载数据库。
-
-### 历史任务
-
-“历史任务”按页显示已执行的手动和定时扫描。打开某条记录后可以查看：
-
-- 任务类型与执行结果
-- 威胁文件及检出原因
-- ClamAV 检出日志
-- 完整任务日志
-
-页面上的清理按钮会删除全部历史任务状态及对应日志，此操作不可恢复。
-
-### 隔离区
-
-使用“移动到隔离区”扫描出威胁后，可以在“隔离区”中查看文件及其原始路径，并进行：
-
-- **恢复**：将文件放回原路径
-- **删除**：永久删除单个隔离文件
-- **清空**：永久删除隔离区中的所有内容
-
-如果原路径已经存在同名文件，恢复会被拒绝，不会覆盖现有数据。恢复出的文件仍可能包含威胁，请在确认安全后操作。
-
-“直接删除”模式不会把文件放入隔离区，因此无法在此恢复。
-
-## 数据目录
+六个目录都建议挂载到宿主机；容器需要读取 `/scan`，而隔离、删除和恢复还需要对它写入。
 
 | 容器路径 | 用途 |
 | --- | --- |
-| `/scan` | WebUI 可浏览和扫描的数据 |
-| `/quarantine` | 被隔离的文件及原路径记录 |
-| `/state` | 任务历史和运行状态 |
-| `/log` | 扫描日志与检出详情 |
-| `/config` | WebUI 管理的定时任务和信任区数据 |
+| `/scan` | 可浏览、扫描和处置的目标数据根目录 |
+| `/quarantine` | 隔离文件与其原始路径记录 |
+| `/config` | 定时规则、信任区、服务配置 |
+| `/data` | 用户、会话和历史索引 SQLite 数据库 |
+| `/state` | 扫描任务 JSON、状态文件和锁 |
+| `/log` | Go 后端、启动、cron、扫描与检出日志 |
 
-建议持久化挂载以上五个目录。请确保容器对 `/scan` 有读取权限；使用隔离、删除和恢复功能时还需要写入权限。
+## 🔐 安全与权限
 
-## 常用环境变量
+- 密码以带独立随机 salt 的 **Argon2id** 哈希保存；认证使用 `HttpOnly`、`SameSite=Strict` 的 Cookie session。
+- session 的绝对有效期为 24 小时，空闲有效期为 2 小时；登录接口有单 IP 与全局限流。
+- 除首次状态、首次管理员注册和登录外，所有 API 都要求登录；浏览器中的写操作还必须同源。
+- 用户的扫描队列、规则、信任区、历史、日志、查询任务和隔离区相互隔离。admin 只拥有用户与全局服务管理权，不能查看其他用户的业务数据。
+- `move`、`remove`、清空历史与清空隔离区会修改或删除数据。建议先使用“仅告警”，并使用 EICAR 等安全测试样本验证流程。
 
-| 变量 | 默认值 | 说明 |
+如在 HTTPS 反向代理后部署，请设置 `SCANNER_COOKIE_SECURE=true`；若需要读取真实客户端 IP，只能在可信代理前提下配置 `SERVER_TRUSTED_REVERSEPROXY`。完整语义见 [服务端配置](server/server_conf.md)。
+
+## ⚙️ 常用配置
+
+| 配置 | 默认值 | 说明 |
 | --- | --- | --- |
-| `SCANNER_ACCOUNTS` | 无 | **必填**；WebUI 账号，格式为 `user:password` |
-| `SCANNER_ADDR` | `:8080` | Web 服务监听地址 |
-| `TZ` | 镜像默认值 | 页面时间和定时任务使用的时区 |
-| `SCAN_LOG_MAX_BYTES` | `5242880` | 单个日志的轮转阈值，单位为字节 |
-| `SCAN_WAIT_INTERVAL` | `30` | 定时任务等待扫描锁的重试间隔，单位为秒 |
-| `SCAN_WAIT_MAX_SECONDS` | `0` | 最长等待时间；`0` 表示不限制 |
+| `SCANNER_ADDR` | `:8080` | Web 服务监听地址。 |
+| `ADMIN_REGISTER_TOKEN` | 无 | 首次管理员注册的必填令牌；推荐通过 Docker secret 注入。 |
+| `SCANNER_COOKIE_SECURE` | `false` | HTTPS 反向代理后设为 `true`。 |
+| `IS_TIMEDOCK` | `N` | `Y` 时启用 TimeDock 模式。 |
+| `TZ` | 镜像默认值 | 页面时间与 cron 时区。 |
+| `SCAN_WAIT_INTERVAL` | `30` | 定时任务等待扫描锁的重试间隔（秒）。 |
+| `SCAN_WAIT_MAX_SECONDS` | `0` | 定时任务最大等待时间；`0` 为不限制。 |
+| `USER_DATABASE_FILE` | `/data/users.db` | 用户与 session 数据库。 |
+| `HISTORY_DATABASE_FILE` | `/data/history.db` | 历史任务索引数据库。 |
+| `CLAMAV_SLEEP_TIMER` | `3600` | ClamAV 自动休眠间隔（秒）；配置文件或 API 设为 `0` 可关闭。 |
+| `LOG_FILE_MAX_SIZE` | `5242880` | `/log/clamavweb.log` 单文件最大字节数。 |
+| `LOG_FILE_NUM` | `5` | Go 后端日志文件总数（包含当前文件）。 |
+| `LOG_LEVEL` | `warn` | Go 后端最低日志等级。 |
 
-通常只需设置账号、时区和端口，其余值保持默认即可。
+服务配置保存在 `/config/clamavweb.conf`，管理 API 可调整登录限制、历史索引间隔和 ClamAV 自动休眠时间，供前端设置页接入；日志配置需手工修改并重启服务，不通过界面或 API 暴露。配置项范围、默认值及反向代理规则见 [server/server_conf.md](server/server_conf.md)。
 
-## 部署与安全建议
+## 📖 使用要点
 
-- Web 服务自身不提供 HTTPS。部署到非可信网络时，请使用 HTTPS 反向代理并限制访问来源。
-- “直接删除”、清空历史和清空隔离区均为不可逆操作。
-- 建议先用测试目录和 EICAR 等安全测试样本验证权限、隔离及恢复流程。
-- 病毒库更新行为继承自上游 `clamav/clamav` 镜像，容器需要相应的网络访问能力。
+- **处理方式**：`warn` 只记录威胁；`move` 移至隔离区并可恢复；`remove` 直接删除，不能恢复。
+- **定时规则**：使用五段 cron（分 时 日 月 周），支持范围、步长与逗号列表；保存后会校验并重载。
+- **信任区**：白名单按内容 SHA-256 生效。文件变更后需重新添加；扫描执行时不能修改信任区。
+- **队列**：等待任务可调整顺序或取消；容器重启后，内存中尚未开始的手动任务不会恢复。
+- **隔离恢复**：若原路径已有同名文件，恢复会拒绝覆盖；恢复出的文件仍可能有风险。
 
-## API 与开发
+## 🛠️ 开发与接口
 
-WebUI 使用的接口、请求参数和响应示例见 [server/api.md](server/api.md)。
-
-Web 服务使用 Go 编写，前端使用 Vite 构建。生产镜像会先构建前端，
-再将构建结果编译进 Go 服务程序。
-
-前端开发服务器默认监听 `http://localhost:5173`，并将 `/api` 请求代理到
-`http://127.0.0.1:8080`。启动前端开发环境：
+前端源码位于 `ClamAV-Web/`，后端源码位于 `server/`。本地前端开发服务器监听 `http://127.0.0.1:5174`，并默认将 `/api` 代理到 `http://127.0.0.1:8080`。
 
 ```sh
-cd frontend
+cd ClamAV-Web
 npm ci
 npm run dev
 ```
-
-如果 Go 服务不在默认地址，可以在启动 Vite 时设置代理目标：
-
-```sh
-VITE_API_PROXY_TARGET=http://127.0.0.1:9000 npm run dev
-```
-
-构建前端：
-
-```sh
-cd frontend
-npm run build
-```
-
-构建结果位于 `server/web/dist`。运行 Go 测试：
 
 ```sh
 cd server
 go test ./...
 ```
 
-前端 JavaScript 位于 `server/web/src`，按功能划分为文件浏览器、手动扫描、
-定时任务、任务队列、信任区、历史任务、隔离区、设置面板和状态首页模块。
-`main.js` 只负责模块初始化与抽屉导航，公共 API、DOM 和格式化工具位于
-`shared.js`。样式暂时统一保留在 `style.css`。
+更完整的架构、开发流程、测试与扩展约定，请阅读 [DEV.md](DEV.md)。请求与响应详情请阅读 [server/api.md](server/api.md)。
 
-## License
+## 🙏 致谢
+
+本项目开发中使用到了以下数个项目/开源仓库，致谢
+
+- [shadcn/ui](https://ui.shadcn.com/) - 前端组件
+- [Cisco-Talos/clamav](https://github.com/Cisco-Talos/clamav) - 杀毒引擎
+
+## 📄 License
 
 本项目采用 [MIT License](LICENSE)。

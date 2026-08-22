@@ -1,459 +1,550 @@
-# Scanner API
+# ClamAV TimeDock 后端 API
 
-本文档记录 `server` 当前提供的全部 HTTP API。后续新增、修改或删除 API 时，请同步更新本文档。
+本文档按业务模块记录 Go 后端提供的 HTTP API。服务默认监听 `:8080`。
 
-所有 API 默认监听在 `SCANNER_ADDR`，默认值为 `:8080`。所有接口都启用 HTTP Basic Auth，账号从 `SCANNER_ACCOUNTS` 读取，格式为：
+## 1. 通用约定
 
-```text
-user:password
-user1:password1,user2:password2
+### 1.1 认证
+
+后端使用内置用户和 Cookie session，不再支持 HTTP Basic Auth。
+
+所有静态页面、API 和错误响应统一包含 `X-Content-Type-Options: nosniff`、禁止页面嵌入的
+`Content-Security-Policy` / `X-Frame-Options`、`Referrer-Policy: no-referrer` 和限制浏览器
+敏感能力的 `Permissions-Policy`。后端不发送 HSTS；始终使用 HTTPS 的部署应由 TLS 终止
+反向代理按实际域名配置 `Strict-Transport-Security`。
+
+登录成功后返回名为 `clamavweb_session` 的 Cookie。Cookie 使用：
+
+- `HttpOnly`；
+- `SameSite=Strict`；
+- `Path=/`；
+- 24 小时绝对有效期；
+- 2 小时空闲有效期；
+- HTTPS 请求时设置 `Secure`；TLS 在反向代理终止时需设置 `SCANNER_COOKIE_SECURE=true`。
+
+除以下接口和静态页面外，所有 `/api/` 请求都需要有效 Cookie：
+
+- `POST /api/auth/register`：仅数据库为空且提供正确 `ADMIN_REGISTER_TOKEN` 时可匿名创建首任 admin；
+- `POST /api/auth/login`；
+- `GET /api/first-run/status`。
+
+命令行示例：
+
+```sh
+curl -c cookie.txt \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"replace-this-password"}' \
+  http://localhost:8080/api/auth/login
+
+curl -b cookie.txt http://localhost:8080/api/status
 ```
 
-示例请求中的 `admin:secret` 请替换为实际账号。
+### 1.2 用户隔离
 
-## 通用约定
+扫描队列、cron、白名单、历史任务、任务日志、异步 lookup 和隔离区都按用户数据库中的不可变 `users.id` 隔离。用户名只用于登录、显示和日志；删除账户后重新创建同名账户会获得新的 ID，因此不会继承旧账户残留资产。admin 调用普通业务 API 时也只能操作自己的数据。
 
-- 响应格式：API 路径默认返回 JSON，`/` 返回 HTML。
-- 错误格式：
+admin 额外拥有的权限仅包括：
+
+- 用户管理；
+- 服务配置；
+- ClamAV sleep/wake 和其他全局 ClamAV 控制。
+
+不存在 admin 查看所有用户任务、日志、cron、白名单或隔离文件的接口。
+
+### 1.3 错误与状态码
+
+通用错误格式：
+
+```json
+{"error":"error message"}
+```
+
+常见状态码：
+
+- `200`：成功；
+- `201`：资源创建成功；
+- `202`：异步 lookup 或扫描已接受；
+- `400`：请求格式或字段非法；
+- `401`：未登录、Cookie 失效或密码错误；
+- `403`：角色权限不足或跨来源请求被拒绝；
+- `404`：资源不存在或资源不属于当前用户；
+- `409`：扫描锁、休眠状态、最后一名 admin 或用户删除冲突；
+- `429`：登录请求达到单 IP/全局限制，或全局 Argon2 处理容量已满；响应包含 `Retry-After`；
+- `500`：后端、文件系统、SQLite 或外部命令失败。
+
+对其他用户资源的访问通常返回 `404`，避免泄露资源是否存在。
+
+### 1.4 用户名、时间和路径
+
+- 用户名格式：`[A-Za-z0-9._-]{1,64}`；
+- 用户 ID 由后端生成，为同时包含小写字母和数字的 8 位 `[a-z0-9]` 字符串，不作为登录凭证；
+- 任务 JSON 的时间为 Unix 秒时间戳；
+- API 中 Go 运行时对象的时间仍可能使用 RFC3339；
+- 文件浏览、手动扫描、cron 和白名单路径限制在 `/scan`；
+- 文件浏览不会返回符号链接；扫描、cron、白名单和隔离区恢复路径的任意现有层级包含符号链接时都会被拒绝。
+
+`IS_TIMEDOCK=Y` 时还会启用 TimeDock 账户目录限制。`timedock_account` 最多 64 个 Unicode 字符，只允许汉字、英文字母和数字，匹配文件夹名称时区分大小写。
+
+## 2. 首次运行
+
+### `GET /api/first-run/status`
+
+无需登录。只返回首次运行状态，不返回 ClamAV 或任务信息。
+
+```json
+{"first_run":"not_completed"}
+```
+
+`WEB_FIRSTRUN_COMPLETED=2` 时返回 `completed`，其他情况返回 `not_completed`。
+
+### `POST /api/first-run/complete`
+
+需要 admin。完成前必须至少存在一名状态为 `active` 的 admin。
+
+成功后原子更新 `/config/clamavweb.conf`：
+
+```text
+WEB_FIRSTRUN_COMPLETED=2
+```
+
+响应：
+
+```json
+{"status":"success","first_run":"completed"}
+```
+
+接口可重复调用。
+
+## 3. 认证与当前账户
+
+### `POST /api/auth/register`
+
+请求：
 
 ```json
 {
-  "error": "error message"
+  "username": "alice",
+  "password": "a sufficiently long password",
+  "role": "user",
+  "timedock_account": "Alice30",
+  "token": "value from ADMIN_REGISTER_TOKEN"
 }
 ```
 
-- 路径限制：文件浏览和手动扫描目标均限制在 `/scan` 下。
-- 符号链接：后端会解析真实路径，指向 `/scan` 外部的 symlink 会被拒绝。
-- 扫描动作：
-  - `warn`：只告警。
-  - `move`：移动到隔离区。
-  - `remove`：直接删除。
+两种行为：
 
-## `GET /`
+1. 用户表为空且 `WEB_FIRSTRUN_COMPLETED=0`：允许匿名调用，密码必填，首个用户强制为 `admin`；请求体的 `token` 必须与非空环境变量 `ADMIN_REGISTER_TOKEN` 完全一致；
+2. 用户表非空：仅 admin 可调用，`role` 可为 `user` 或 `admin`，密码可省略。
 
-用途：返回 Scanner WebUI 页面。
+环境令牌只保护首位管理员注册。用户表非空后，`token` 可省略且不参与后续 admin 创建用户
+的权限判断。环境变量未设置、令牌缺失或令牌错误时返回 `403`；首次运行已经完成但用户表
+为空时返回 `409`，不会重新开放匿名注册。
 
-调用：
+密码省略时账户会被创建，但在 admin 设置密码前不能登录。
 
-```sh
-curl -u admin:secret http://localhost:8080/
+响应：
+
+```json
+{
+  "status": "success",
+  "username": "alice",
+  "role": "user",
+  "timedock_account": "Alice30",
+  "password_set": true
+}
 ```
 
-响应：HTML 页面。
+密码使用带独立随机 salt 的 Argon2id 哈希保存，数据库不保存明文密码。
 
-## `GET /api/status`
+### `POST /api/auth/login`
 
-用途：获取服务状态。返回 `/state/status.json` 的内容，并实时执行一次 `clamdscan --ping` 检查 clamd。
+请求：
 
-调用：
-
-```sh
-curl -u admin:secret http://localhost:8080/api/status
+```json
+{"username":"alice","password":"password"}
 ```
 
-响应示例：
+成功响应会同时签发 session Cookie：
+
+```json
+{"status":"success","username":"alice","role":"user"}
+```
+
+被禁用、正在删除、无密码、用户名不存在或密码错误时统一返回 `401`。
+
+登录限制按客户端 IP 和全局十分钟窗口计数，用户名变化不会产生新的限额。所有进入处理
+流程的登录请求都会计数。达到单 IP 上限后仅该 IP 进入冷却；达到全局上限后所有登录进入
+冷却。冷却期间返回 `429` 和 `Retry-After`，且不查询数据库或执行 Argon2，其他 API 不受
+影响。
+
+所有由 HTTP 请求触发的 Argon2id 哈希和校验共享全局 5 个并发槽位，包括登录、注册、修改
+密码、删除账户和管理员设置密码。槽位满载时请求不排队，立即返回 `429` 和
+`Retry-After: 1`，且不执行新的 Argon2 运算。登录计数限流与该并发边界相互独立。
+
+默认仅使用连接的 `RemoteAddr`。设置 `SERVER_TRUSTED_REVERSEPROXY` 后，可使用英文半角
+逗号配置多个可信 IPv4/IPv6 地址；只有直接来源匹配列表中任意地址的请求才优先使用
+`X-Forwarded-For` 首项，头缺失或非法时回退到 `RemoteAddr`。完整配置语义见
+[`server_conf.md`](server_conf.md)。
+
+### `POST /api/auth/logout`
+
+撤销当前 session，并清除 Cookie。
+
+```json
+{"status":"success"}
+```
+
+### `GET /api/auth/me`
+
+```json
+{"username":"alice","role":"user","timedock_account":"Jason"}
+```
+
+### `PUT /api/auth/password`
+
+请求：
+
+```json
+{
+  "current_password": "old password",
+  "new_password": "new password"
+}
+```
+
+修改成功后撤销该用户的全部 session，并清除当前 Cookie，用户需要重新登录。
+
+### `DELETE /api/auth/account`
+
+用户主动注销。请求体必须再次提供当前密码：
+
+```json
+{"password":"current password"}
+```
+
+注销执行 clean delete：
+
+- 撤销全部 session；
+- 删除等待中的手动扫描；
+- 删除异步 lookup；
+- 删除该用户 cron 并 reload；
+- 删除该用户白名单并重建 allow-list；
+- 删除该用户隔离文件；
+- 删除任务 JSON、任务日志、检出日志和历史索引；
+- 最后物理删除用户。
+
+存在 `waiting` 或 `running` 扫描时返回 `409`，不强制终止 ClamAV。最后一名有效 admin 不能注销。
+
+## 4. 用户管理（admin）
+
+本模块只返回账户管理字段，不能返回用户业务数据。
+
+### `GET /api/admin/users`
+
+响应：
+
+```json
+{
+  "status": "success",
+  "users": [
+    {
+      "username": "alice",
+      "role": "user",
+      "status": "active",
+      "timedock_account": "Jason",
+      "password_set": true,
+      "created_at": 1783433000,
+      "updated_at": 1783433000
+    }
+  ]
+}
+```
+
+响应顶层包含 `"status":"success"`。`password_set` 只表示账户当前是否设置了密码，不返回密码哈希。`timedock_account` 可为空；TimeDock 模式下为空的用户不能浏览或提交扫描路径。
+
+### `POST /api/admin/users`
+
+与非首次运行时的 `POST /api/auth/register` 相同。建议管理端使用本路径。
+
+```json
+{
+  "username": "bob",
+  "password": "a sufficiently long password",
+  "role": "user",
+  "timedock_account": "Bob30"
+}
+```
+
+`timedock_account` 可省略或设为空字符串，并使用与 PATCH 相同的校验规则。创建成功响应会返回 `timedock_account` 和 `password_set`。
+
+### `PATCH /api/admin/users/{username}`
+
+所有字段均可选：
+
+```json
+{
+  "role": "admin",
+  "status": "active",
+  "timedock_account": "Jason",
+  "password": "new password"
+}
+```
+
+规则：
+
+- `role` 只能是 `user` 或 `admin`；
+- `status` 只能是 `active` 或 `disabled`；
+- `timedock_account` 可为空；非空时最多 64 个 Unicode 字符，且只允许汉字、英文字母和数字；
+- TimeDock 模式下修改 `timedock_account` 会停用该用户已启用的 cron，避免旧规则继续访问此前绑定的账户目录；
+- `password: ""` 会清除密码，使用户无法登录；
+- 设置或清除密码会撤销该用户全部 session；
+- 禁用会撤销 session，并停用该用户当前启用的 cron；
+- 重新启用用户时不会自动恢复 cron；
+- 最后一名有效 admin 不能被降级或禁用。
+
+禁用保留用户的历史、白名单和隔离文件，与注销/删除不同。
+
+### `DELETE /api/admin/users/{username}`
+
+执行与账户注销相同的 clean delete，但不需要目标用户密码。
+
+- admin 不能通过此接口删除自己，应使用账户注销接口；
+- 最后一名有效 admin 不能删除；
+- 目标用户存在活动扫描时返回 `409`；
+- 中途失败时用户保持 `deleting` 状态，禁止登录，admin 可重试删除。
+
+## 5. 服务状态、配置与 ClamAV 控制
+
+### `GET /api/status`
+
+返回 ClamAV 全局状态和当前用户的扫描状态：
 
 ```json
 {
   "source": {
     "version": 1,
-    "updated_at": "2026-07-07T10:30:00+0800",
-    "clamd": {
-      "status": "ready",
-      "last_checked_at": "2026-07-07T10:30:00+0800",
-      "message": "clamd is ready."
-    },
+    "clamd": {"status":"ready"},
     "scan": {
       "active_job_id": null,
-      "last_job_id": "manual-20260707103334",
+      "last_job_id": "manual-1783433000",
       "last_job_status": "finished",
       "last_job_result": "clean"
     }
   },
   "ping": "ready",
   "ping_message": "clamd is ready",
-  "checked_at": "2026-07-07T10:31:00+08:00"
+  "clamd_version": "1.5.4",
+  "database_version": "28098",
+  "database_date": "Thu Aug 14 14:24:22 2026",
+  "checked_at": "2026-08-04T19:00:00+08:00",
+  "first_run": "completed",
+  "is_timedock": true
 }
 ```
 
-字段说明：
+`status.json` 是全局文件，但 API 会过滤 `active_job_id`，并从 SQLite 查询当前用户自己的最近任务。不会返回其他用户任务。
 
-- `source`：状态文件内容。如果状态文件不存在，会返回说明信息。
-- `source.clamd.status`：ClamAV 状态；休眠成功后为 `sleep`。
-- `source.clamd.message`：ClamAV 状态说明；`status` 为 `sleep` 时固定为 `clamd is sleeping.`。
-- `source.scan.last_job_status`：后端根据 `source.scan.last_job_id` 读取 `/state/jobs/<last_job_id>.json` 后补充，可能为 `running`、`finished`、`failed` 或 `null`。
-- `source.scan.last_job_result`：后端根据同一 job 状态文件中的 `result` 字段补充；如果状态文件不存在或字段不存在则为 `null`。
-- `ping`：实时 clamd ping 结果，可能为 `ready`、`error`、`timeout`。
-- `ping_message`：ping 结果说明。
-- `checked_at`：本次 API 检查时间。
+`ping` 与 `ping_message` 来自 `clamdscan --ping`。clamd ready 时，后端通过 Unix socket 发送 `VERSION`，将响应解析为 `clamd_version`、`database_version` 和 `database_date`；查询或解析失败时这三个字段为空字符串。
 
-## `POST /api/clamav/sleep`
+上述实时状态由后端缓存 5 秒；`checked_at` 是当前缓存结果的探测完成时间。缓存期内的并发状态请求不会重复执行 ping 或 VERSION 查询，ClamAV 休眠或唤醒成功后缓存立即失效。
 
-用途：让 ClamAV 进入休眠。后端通过 `/tmp/clamd.sock` 发送 `SHUTDOWN`；命令无响应并正常关闭连接后，原子创建 `/state/sleep.lock` 空目录作为休眠状态标记。Go Web 服务和 cron 保持运行。
+`is_timedock` 在环境变量 `IS_TIMEDOCK=Y` 时为 `true`；未设置、为空或为 `N` 时为 `false`。
 
-调用：
+### `GET /api/config`
 
-```sh
-curl -u admin:secret -X POST http://localhost:8080/api/clamav/sleep
-```
-
-成功响应：
+仅 admin：
 
 ```json
 {
-  "status": "sleeping",
-  "message": "ClamAV entered sleep mode."
+  "history_index_refresh_interval": 60,
+  "clamav_sleep_timer": 3600,
+  "web_firstrun_completed": 2,
+  "web_login_max_tries": 10,
+  "web_login_max_tries_overall": 100,
+  "web_login_cooldown_interval": 600,
+  "server_trusted_reverseproxy": "192.0.2.10,2001:db8::10"
 }
 ```
 
-返回字段：
+### `PATCH /api/config`
 
-| 字段 | 类型 | 可能值 | 对应情况 |
-| --- | --- | --- | --- |
-| `status` | `string` | `sleeping` | SHUTDOWN 命令成功且 `/state/sleep.lock` 已存在；也包括接口调用前 ClamAV 已休眠的幂等成功情况。 |
-| `message` | `string` | 状态说明 | 首次成功休眠时为 `ClamAV entered sleep mode.`；已经处于休眠状态时为 `ClamAV is already sleeping.`。 |
-
-说明：
-
-- 接口具有幂等性；ClamAV 已休眠时仍返回 `200 OK` 和 `sleeping`。
-- 休眠成功后会原子更新 `/state/status.json`，将 `clamd.status` 写为 `sleep`、`clamd.message` 写为 `clamd is sleeping.`，并保留其他状态字段。
-- `/state/scan.lock` 表示扫描正在执行时，接口返回 `409 Conflict`，不会关闭 ClamAV。
-- socket 连接、写入、响应或休眠锁创建失败时返回 `500 Internal Server Error`。
-- socket 操作超时时返回 `504 Gateway Timeout`。
-- `409`、`500` 和 `504` 错误响应使用通用 `{"error":"error message"}` 结构，不包含 `status` 字段；当前接口不会返回 `status: "failed"`。
-- 本接口当前不会改变手动或 cron 扫描流程；休眠状态下触发扫描的行为将在后续功能中处理。
-
-## `POST /api/clamav/wake`
-
-用途：唤醒 ClamAV。后端执行 `/startup.sh --wake`；该模式只负责确认或启动官方 `/init`、等待 ClamAV 返回 PONG，并删除 `/state/sleep.lock`，不创建目录、不校验应用配置，也不启动 cron 或 Go Web 服务。
-
-调用：
-
-```sh
-curl -u admin:secret -X POST http://localhost:8080/api/clamav/wake
-```
-
-成功响应：
+仅 admin。当前可修改：
 
 ```json
 {
-  "status": "awake",
-  "message": "ClamAV woke successfully."
+  "history_index_refresh_interval": 120,
+  "clamav_sleep_timer": 3600,
+  "web_login_max_tries": 10,
+  "web_login_max_tries_overall": 100,
+  "web_login_cooldown_interval": 600,
+  "server_trusted_reverseproxy": "192.0.2.10,2001:db8::10"
 }
 ```
 
-返回字段：
+历史刷新间隔允许范围为 5–86400 秒。`clamav_sleep_timer` 为 `0` 时关闭定时休眠，启用时
+必须是至少 600 的整数；空字符串不被接受。修改后立即重启对应计时器。登录限制和可信反代字段的范围、默认值及安全要求
+见 [`server_conf.md`](server_conf.md)。修改任一登录限制会清空当前登录计数与冷却状态；可信
+反代修改立即应用。传入空字符串可取消可信反代。
 
-| 字段 | 类型 | 可能值 | 对应情况 |
-| --- | --- | --- | --- |
-| `status` | `string` | `awake` | `/startup.sh --wake` 执行成功、ClamAV 已通过 PONG 检查且 `/state/sleep.lock` 已删除；也包括接口调用前 ClamAV 已就绪的幂等成功情况。 |
-| `message` | `string` | 状态说明 | 实际执行唤醒并成功时为 `ClamAV woke successfully.`；调用前已经处于工作状态时为 `ClamAV is already awake.`。 |
+### `POST /api/clamav/sleep`
 
-说明：
+仅 admin。扫描锁存在时返回 `409`。成功响应：
 
-- 接口具有幂等性；ClamAV 已可正常 PONG 时，`startup.sh --wake` 不会重复启动 `/init`，只删除可能存在的陈旧 sleep lock，并返回 `200 OK` 和 `awake`。
-- 唤醒失败时保留 `/state/sleep.lock`，返回 `500 Internal Server Error`。
-- 唤醒超时时返回 `504 Gateway Timeout`。
-- `500` 和 `504` 错误响应使用通用 `{"error":"error message"}` 结构，不包含 `status` 字段；当前接口不会返回 `status: "failed"`。
-- `/startup.sh --wake` 在需要新启动 `/init` 时会原子更新 `/state/clamav-init.pid`，使容器 PID 1 能继续监督并在容器退出时优雅停止最新进程；ClamAV 已就绪时不会改写 PID。
-
-## `GET /api/browse`
-
-用途：浏览 `/scan` 下的文件和目录，用于前端选择手动扫描目标。
-
-查询参数：
-
-| 参数 | 必填 | 说明 |
-| --- | --- | --- |
-| `path` | 否 | 要浏览的绝对路径。为空时默认浏览 `/scan`。 |
-
-调用：
-
-```sh
-curl -u admin:secret "http://localhost:8080/api/browse?path=/scan"
+```json
+{"status":"sleeping","message":"ClamAV entered sleep mode."}
 ```
 
-响应示例：
+### `POST /api/clamav/wake`
+
+仅 admin。执行 `/startup.sh --wake`，成功响应：
+
+```json
+{"status":"awake","message":"ClamAV woke successfully."}
+```
+
+sleep/wake 均为幂等操作。
+
+定时休眠使用同一套 sleep 逻辑。服务启动、手动扫描成功启动及手动唤醒后会开始或重置计时；
+休眠成功后暂停计时。扫描正在运行时不会强制关闭 ClamAV，定时器会在完整间隔后重试。
+
+## 6. 文件浏览
+
+### `GET /api/browse?path=/scan`
+
+列出 `/scan` 下的文件和目录。响应包含 `path`、`parent`、`entries` 和 `roots`。路径为空时默认 `/scan`。
+
+如果路径指向文件，则返回文件所在目录。目录排在文件之前；符号链接不会出现在 `entries` 中，直接请求符号链接路径会返回 `400`。
+
+### TimeDock 模式
+
+`IS_TIMEDOCK=Y` 时：
+
+- `/scan` 的直接子目录中只识别真实目录 `extdev` 或名称匹配 `usb[0-9]+` 的真实目录；
+- 请求 `/scan` 时，只返回第一层中实际包含当前用户账户目录的设备。例如存在 `/scan/usb1/Jason`、`/scan/usb2/Jason` 和 `/scan/usb3/James` 时，账户为 `Jason` 的用户只看到 `usb1` 和 `usb2`；
+- 请求 `/scan/usb1` 时，只返回名称与 `timedock_account` 完全匹配的第一层账户目录；
+- 进入 `/scan/usb1/Jason` 后按普通模式继续浏览其文件和子目录；
+- 不能访问没有当前账户目录的设备或其他账户目录；所有符号链接均隐藏并拒绝，不区分其目标是否仍在当前账户内；
+- `timedock_account` 为空时返回 `400`：`{"error":"Please set your TimeDock account"}`。
+
+`IS_TIMEDOCK` 未设置、为空或为 `N` 时保持原有文件浏览行为。其他值会导致服务拒绝启动。
+
+## 7. 手动扫描与内存队列
+
+### `POST /api/scans`
+
+请求：
 
 ```json
 {
-  "path": "/scan",
-  "entries": [
-    {
-      "name": "docs",
-      "path": "/scan/docs",
-      "is_dir": true,
-      "size": 4096,
-      "modified": "2026-07-07T10:20:00+08:00"
-    },
-    {
-      "name": "sample.zip",
-      "path": "/scan/sample.zip",
-      "is_dir": false,
-      "size": 1024,
-      "modified": "2026-07-07T10:20:00+08:00"
-    }
-  ],
-  "roots": ["/scan"]
-}
-```
-
-说明：
-
-- 如果 `path` 指向文件，后端会返回该文件所在目录的列表。
-- `parent` 仅在父目录仍位于允许根目录内时返回。
-- 返回结果中目录会排在文件前面。
-
-## `POST /api/scans`
-
-用途：提交手动扫描批次。后端会把批次加入内存队列，由队列调度器逐个目标调用 `scan_once.sh`；不传 `--id`，由脚本生成 `job_id` 并通过 stdout 返回。
-
-请求体：
-
-```json
-{
-  "targets": ["/scan/docs", "/scan/sample.zip"],
+  "targets": ["/scan/docs", "/scan/example.dat"],
   "action": "warn",
-  "wait": true
+  "wait": false
 }
 ```
 
-字段说明：
+- `action`：`warn`、`move` 或 `remove`，默认 `warn`；
+- `wait` 只为兼容旧请求保留；
+- owner ID 从登录 Cookie 对应的用户记录获得，客户端不能指定。
 
-| 字段 | 必填 | 说明 |
-| --- | --- | --- |
-| `targets` | 是 | 扫描目标列表，必须位于 `/scan` 下且存在。 |
-| `action` | 否 | `warn`、`move`、`remove`，为空时默认 `warn`。 |
-| `wait` | 否 | 兼容保留字段。后端接受该字段但不处理，提交到 `scan_once.sh` 的命令始终不追加 `--wait`。 |
+TimeDock 模式下，每个 `targets` 路径都必须位于当前用户匹配到的账户目录内；直接构造请求不能绕过文件浏览器的目录限制。
+所有模式下，`targets` 的任意路径层级均不得为符号链接。
 
-调用：
-
-```sh
-curl -u admin:secret \
-  -H "Content-Type: application/json" \
-  -d '{"targets":["/scan/docs"],"action":"warn","wait":true}' \
-  http://localhost:8080/api/scans
-```
-
-响应状态码：`202 Accepted`
-
-响应示例：
+响应：
 
 ```json
-{
-  "id": "web-5f7c2e9b0a61b432",
-  "status": "queued",
-  "message": "Queued"
-}
+{"id":"web-5f7c2e9b0a61b432","status":"queued","message":"Queued"}
 ```
 
-ClamAV 休眠时返回 `409 Conflict`，不会生成批次 ID、加入内存队列或执行 `scan_once.sh`：
+ClamAV 休眠时返回 `409`，请求不会进入队列。
 
-```json
-{
-  "id": "",
-  "status": "failed",
-  "message": "ClamAV is sleeping."
-}
-```
+### 队列调度规则
 
-说明：
+ClamAV 扫描全局串行。每次选择下一任务时：
 
-- `id` 是 WebUI 批次 ID，固定以 `web-` 开头。
-- 新提交的批次先进入内存队列，响应中的 `status` 通常为 `queued`，`message` 为 `Queued`。
-- 真正的扫描任务 ID 由 `scan_once.sh` 生成，例如 `manual-20260707103334`。
-- 当前队列信息只保存在 Web 服务进程内；扫描完成后从内存队列移除。
-- 队列调度器在启动手动批次前会检查 `/state/scan.lock`。如果锁中的 `pid` 仍存活，说明已有自动或其他扫描正在运行，手动批次保持 `queued`，后端每 5 秒重试一次。
-- 如果 `/state/scan.lock` 不存在，或锁中的 `pid` 缺失、为空、非法、已退出，后端认为该锁不阻塞手动队列，并启动 `scan_once.sh`；无效锁文件由 `scan_once.sh` 自己在抢锁流程中清理。
-- `wait` 仅为兼容旧调用保留；手动扫描队列串行调度，后端不会因为该字段向 `scan_once.sh` 传递 `--wait`。
-- 后端在解析扫描请求和创建队列任务前检查 `/state/sleep.lock`；存在时直接返回上述休眠响应。
+1. 收集当前拥有等待任务的用户；
+2. 随机选择一名用户；
+3. 执行该用户队列中的第一项。
 
-## `GET /api/scans`
+同一用户内部保持 FIFO，并可重排。该策略避免先清空某个用户的完整队列再处理其他用户。
 
-用途：列出当前内存队列中的手动扫描批次，包括正在运行和等待中的批次。已完成批次不会出现在此接口；历史扫描结果由 `/api/results` 读取 `/state/jobs/*.json` 提供。
+### `GET /api/scans?scope=all`
 
-查询参数：
-
-| 参数 | 必填 | 说明 |
-| --- | --- | --- |
-| `scope` | 否 | 返回范围，支持 `all` 或数字范围如 `1-10`，默认 `all`。当范围起始数字为 `1` 时，会一并返回运行中的任务；起始数字不为 `1` 时，不返回运行中的任务。 |
-
-调用：
-
-```sh
-curl -u admin:secret http://localhost:8080/api/scans
-curl -u admin:secret 'http://localhost:8080/api/scans?scope=1-10'
-```
-
-响应示例：
+只返回当前用户的活动批次和等待批次：
 
 ```json
 [
   {
     "id": "web-5f7c2e9b0a61b432",
-    "status": "running",
-    "job_ids": ["manual-20260707103334"],
-    "targets": ["/scan/docs"],
-    "action": "warn",
-    "started_at": "2026-07-07T10:33:34Z",
-    "queue_number": 0
-  },
-  {
-    "id": "web-6a8d2a8f91c0e124",
     "status": "queued",
     "job_ids": [],
     "targets": ["/scan/docs"],
-    "action": "move",
+    "action": "warn",
     "started_at": null,
     "queue_number": 1
   }
 ]
 ```
 
-说明：
+`queue_number` 是当前用户队列内的相对位置，不暴露其他用户任务数量或位置。支持 `all` 或 `1-10` 形式的 scope。
 
-- `queue_number` 在每次响应时根据当前内存队列计算。
-- 正在运行的批次 `queue_number` 固定为 `0`，`status` 为 `running`。
-- 等待中的批次 `queue_number` 从 `1` 开始递增，`status` 为 `queued`。
-- `started_at` 是实际开始扫描的时间；等待中的批次为 `null`。
-- 队列前进、重排或取消后，等待中批次的 `queue_number` 会在下次响应中重新计算。
+### `POST /api/scans/reorder`
 
-## `POST /api/scans/reorder`
+```json
+{"id":"web-5f7c2e9b0a61b432","queue_number":1}
+```
 
-用途：调整等待队列中的批次顺序。只能调整 `queue_number >= 1` 的等待批次；正在运行的批次 `queue_number = 0`，不能通过此接口调整。
+只改变当前用户任务之间的顺序，不移动、覆盖或泄露其他用户任务。运行中的任务不能重排。
 
-请求体：
+### `POST /api/scans/cancel`
+
+```json
+{"id":"web-5f7c2e9b0a61b432","cancel":"Y"}
+```
+
+只能取消当前用户尚未开始的任务。
+
+### 任务文件 version 3
+
+`scan_once.sh` 生成：
 
 ```json
 {
-  "id": "web-6a8d2a8f91c0e124",
-  "queue_number": 1
+  "version": 3,
+  "job_id": "manual-1783433000",
+  "type": "manual",
+  "user_id": "a1b2c3d4",
+  "status": "finished",
+  "target": "/scan/docs",
+  "action": "warn",
+  "started_at": 1783433000,
+  "finished_at": 1783433010,
+  "result": "clean"
 }
 ```
 
-调用：
+任务 ID 使用 `manual-<Unix秒>` 或 `cron-<Unix秒>`。同一秒冲突时追加 `-001`、`-002`。运行中 `finished_at` 为 `null`。
 
-```sh
-curl -u admin:secret \
-  -H "Content-Type: application/json" \
-  -d '{"id":"web-6a8d2a8f91c0e124","queue_number":1}' \
-  http://localhost:8080/api/scans/reorder
-```
+## 8. 定时扫描
 
-响应示例：
-
-```json
-{
-  "status": "success",
-  "message": "Queue reordered"
-}
-```
-
-说明：
-
-- 请求成功后只返回状态；前端如需最新队列，应再次调用 `GET /api/scans`。
-- 如果目标 ID 不在等待队列中，或目标是正在运行的批次，返回 `400` 和 `status: failed`。
-
-## `POST /api/scans/cancel`
-
-用途：取消等待队列中的批次。只能取消 `queue_number >= 1` 的等待批次；正在运行的批次 `queue_number = 0`，不能通过此接口取消。
-
-请求体：
-
-```json
-{
-  "id": "web-6a8d2a8f91c0e124",
-  "cancel": "Y"
-}
-```
-
-调用：
-
-```sh
-curl -u admin:secret \
-  -H "Content-Type: application/json" \
-  -d '{"id":"web-6a8d2a8f91c0e124","cancel":"Y"}' \
-  http://localhost:8080/api/scans/cancel
-```
-
-响应示例：
-
-```json
-{
-  "status": "success",
-  "message": "Queued scan canceled"
-}
-```
-
-说明：
-
-- `cancel` 必须为大写 `Y`。
-- 请求成功后只返回状态；前端如需最新队列，应再次调用 `GET /api/scans`。
-- 如果目标 ID 不在等待队列中，目标是正在运行的批次，或 `cancel` 不是 `Y`，返回 `400` 和 `status: failed`。
-
-## 定时扫描规则格式
-
-定时扫描规则保存在 `/config/cron_scan.conf`。WebUI 只管理带元数据的规则块，其他用户注释和说明文本会保留。
-
-启用规则：
+cron 配置实际结构：
 
 ```text
-# scanner-cron-rule id=abc123def456gh78 enabled=true
-30 3 * * * /scan/docs warn
+分钟 小时 日期 月份 星期 "扫描路径" action owner_user_id wake
 ```
 
-禁用规则：
+例如：
 
 ```text
-# scanner-cron-rule id=abc123def456gh78 enabled=false
-# 30 3 * * * /scan/docs warn
+30 3 * * * /scan warn a1b2c3d4 N
+0 */6 * * * "/scan/Team A" move a1b2c3d4 Y
 ```
 
-规则 ID 由后端生成，长度 16 位，只包含小写字母和数字。
+`wake` 只能为 `Y` 或 `N`。`Y` 表示执行该规则时向 `scan_once.sh` 附加 `--wake`，在扫描前唤醒睡眠状态的 ClamAV；`N` 表示不主动唤醒。
 
-`scan_once.sh` 支持仅用于 cron 任务的 `--wake` 参数。带该参数的 cron 调用会在发现 `/state/sleep.lock` 时执行 `/startup.sh --wake`，成功后继续扫描；不带该参数时会生成完整的失败任务记录并在任务日志中写入 `[ERROR] ClamAV is sleeping`。当前 `cron.sh` 生成 crontab 时不会自动追加 `--wake`，定时规则与该参数的配置接入将在后续实现。
+### `GET /api/cron/rules`
 
-## `GET /api/cron/rules`
+只返回当前用户 ID 所属规则。owner ID 不由 API 输出，也不能由客户端修改。响应中的 `wake` 为布尔值。
 
-用途：列出 WebUI 管理的定时扫描规则。
-
-调用：
-
-```sh
-curl -u admin:secret http://localhost:8080/api/cron/rules
-```
-
-响应示例：
-
-```json
-{
-  "rules": [
-    {
-      "id": "abc123def456gh78",
-      "enabled": true,
-      "minute": "30",
-      "hour": "3",
-      "day": "*",
-      "month": "*",
-      "weekday": "*",
-      "target": "/scan/docs",
-      "action": "warn",
-      "line": 12
-    }
-  ]
-}
-```
-
-说明：
-
-- 只读取 `# scanner-cron-rule` 元数据行及其下一行。
-- 没有元数据的旧规则不会出现在结果中。
-
-## `POST /api/cron/rules`
-
-用途：新增定时扫描规则。保存成功后会自动执行 `/cron.sh reload`。
-
-请求体：
+### `POST /api/cron/rules`
 
 ```json
 {
@@ -463,730 +554,272 @@ curl -u admin:secret http://localhost:8080/api/cron/rules
   "day": "*",
   "month": "*",
   "weekday": "*",
-  "target": "/scan/docs",
-  "action": "warn"
+  "target": "/scan",
+  "action": "warn",
+  "wake": true
 }
 ```
 
-调用：
+后端生成规则 ID，并强制将当前 `users.id` 写入 owner 字段。`wake` 为 `true` 时规则文件写入 `Y`，为 `false` 时写入 `N`。
 
-```sh
-curl -u admin:secret \
-  -H "Content-Type: application/json" \
-  -d '{"enabled":true,"minute":"30","hour":"3","day":"*","month":"*","weekday":"*","target":"/scan/docs","action":"warn"}' \
-  http://localhost:8080/api/cron/rules
-```
+TimeDock 模式下，新增、完整更新和重新启用规则时都会校验 `target` 位于当前用户账户目录内。
 
-响应状态码：`201 Created`
+### `PUT /api/cron/rules/{id}`
 
-响应示例：
+完整更新当前用户规则，字段结构与新增接口相同。不能更新其他用户同 ID 规则。
+
+### `PATCH /api/cron/rules/{id}/enabled`
 
 ```json
-{
-  "rules": [
-    {
-      "id": "abc123def456gh78",
-      "enabled": true,
-      "minute": "30",
-      "hour": "3",
-      "day": "*",
-      "month": "*",
-      "weekday": "*",
-      "target": "/scan/docs",
-      "action": "warn",
-      "line": 4
-    }
-  ],
-  "message": "Cron rules reloaded: 1 rule(s)."
-}
+{"enabled":false}
 ```
 
-## `PUT /api/cron/rules/{id}`
+### `DELETE /api/cron/rules/{id}`
 
-用途：完整更新指定定时扫描规则。保存成功后会自动执行 `/cron.sh reload`。
+删除当前用户规则。
 
-路径参数：
+### `POST /api/cron/reload`
 
-| 参数 | 说明 |
-| --- | --- |
-| `id` | 16 位规则 ID。 |
+校验完整配置并重建系统 cron 文件。响应只返回当前用户规则。cron 文件的读写和 reload 使用进程锁，避免多用户并发保存导致丢失更新。
 
-请求体与 `POST /api/cron/rules` 相同。请求体中的 `id` 会被忽略，以路径中的 `id` 为准。
+## 9. 白名单
 
-调用：
-
-```sh
-curl -u admin:secret \
-  -X PUT \
-  -H "Content-Type: application/json" \
-  -d '{"enabled":true,"minute":"0","hour":"*/6","day":"*","month":"*","weekday":"*","target":"/scan/docs","action":"move"}' \
-  http://localhost:8080/api/cron/rules/abc123def456gh78
-```
-
-响应示例：
-
-```json
-{
-  "rules": [],
-  "message": "Cron rules reloaded: 1 rule(s)."
-}
-```
-
-## `PATCH /api/cron/rules/{id}/enabled`
-
-用途：启用或禁用指定定时扫描规则。保存成功后会自动执行 `/cron.sh reload`。
-
-禁用规则时，后端会把元数据写成 `enabled=false`，并注释掉对应规则行；启用时会恢复规则行。
-
-请求体：
-
-```json
-{
-  "enabled": false
-}
-```
-
-调用：
-
-```sh
-curl -u admin:secret \
-  -X PATCH \
-  -H "Content-Type: application/json" \
-  -d '{"enabled":false}' \
-  http://localhost:8080/api/cron/rules/abc123def456gh78/enabled
-```
-
-响应示例：
-
-```json
-{
-  "rules": [],
-  "message": "Cron rules reloaded: 0 rule(s)."
-}
-```
-
-## `DELETE /api/cron/rules/{id}`
-
-用途：删除指定定时扫描规则。只删除对应的元数据行和下一行规则，其他用户注释会保留。保存成功后会自动执行 `/cron.sh reload`。
-
-调用：
-
-```sh
-curl -u admin:secret \
-  -X DELETE \
-  http://localhost:8080/api/cron/rules/abc123def456gh78
-```
-
-响应示例：
-
-```json
-{
-  "rules": [],
-  "message": "Cron rules reloaded: 0 rule(s)."
-}
-```
-
-## `POST /api/cron/reload`
-
-用途：手动 reload 当前 `/config/cron_scan.conf`。此接口不修改配置文件，只调用 `/cron.sh reload`。
-
-调用：
-
-```sh
-curl -u admin:secret \
-  -X POST \
-  http://localhost:8080/api/cron/reload
-```
-
-响应示例：
-
-```json
-{
-  "rules": [],
-  "message": "Cron rules reloaded: 1 rule(s)."
-}
-```
-
-## 定时规则校验
-
-保存定时规则时，后端会先做基础校验：
-
-- cron 字段支持 `*`、数字、范围、步进、逗号列表。
-- `target` 必须存在，且真实路径必须位于 `/scan` 下。
-- `action` 必须为 `warn`、`move`、`remove`。
-
-Go 校验通过后，后端会写入临时配置文件并调用：
-
-```sh
-/cron.sh validate <tmpfile>
-```
-
-脚本校验成功时输出：
+`/config/exclude.conf` 每行格式：
 
 ```text
-Cron config is valid: 1 rule(s).
+"路径" owner_user_id
 ```
 
-脚本校验失败时返回类似：
+### `GET /api/whitelist`
 
-```text
-Invalid crontab rule at: minute, line 3, value 99
+仅返回当前用户条目。
+
+### `POST /api/whitelist`
+
+```json
+{"path":"/scan/trusted file.dat"}
 ```
 
-后端会把该错误信息返回给前端：
+后端写入当前 `users.id`，然后重新生成 SHA-256 allow-list 并让 ClamAV reload。
+
+TimeDock 模式下，新增和删除请求中的路径都必须位于当前用户账户目录内。
+
+### `DELETE /api/whitelist`
+
+请求体同 POST，只删除 `path + 当前用户` 匹配的行。相同路径属于其他用户时不会被删除。
+
+扫描运行或 ClamAV 休眠时不允许修改白名单。
+
+注意：ClamAV allow-list 对共享 clamd 实例全局生效。API 所有权隔离不能改变一个用户的信任哈希会影响所有扫描这一 clamd 固有行为。
+
+## 10. 历史任务与 SQLite 索引
+
+服务启动时扫描一次 `/state/jobs`，运行期间监听任务 JSON 的新增、替换、修改和删除并进行单文件增量索引；`HISTORY_INDEX_REFRESH_INTERVAL` 控制周期完整刷新，作为文件事件丢失或监听不可用时的兜底。只接受包含合法 `user_id` 的 version 3 JSON，其他版本、旧文件名和无 owner ID 文件不会进入索引。
+
+周期完整刷新会批量读取已索引文件的 mtime，并在内存中完成比对；mtime 未变化时不会重复解析 JSON。文件事件触发的增量索引不依赖 mtime，以免同一时间粒度内的连续原子替换被跳过。文件删除、损坏或变成非 version 3 后，相应索引会被删除。
+
+### `POST /api/results/lookups?scope=1-20`
+
+创建当前用户的异步历史查询。`scope` 必须显式提供为闭区间，单次最多包含 500 条；例如
+`1-500` 和 `501-1000` 合法，空值、`all` 和 `1-501` 返回 `400`。分页范围不影响响应中的
+完整任务总数。
 
 ```json
 {
-  "error": "Invalid crontab rule at: minute, line 3, value 99"
+  "status": "pending",
+  "lookup_id": "result-0123456789abcdef",
+  "message": "result list is loading; poll /api/results/lookups/result-0123456789abcdef"
 }
 ```
 
-## `GET /api/whitelist`
+### `GET /api/results/lookups/{lookup_id}`
 
-用途：读取 `/config/exclude.conf` 中当前有效的白名单条目。空行、注释行和无法解析的行不会出现在结果中。
-
-调用：
-
-```sh
-curl -u admin:secret http://localhost:8080/api/whitelist
-```
-
-响应示例：
+只有创建 lookup 的用户可轮询。成功响应：
 
 ```json
 {
+  "lookup_id": "result-0123456789abcdef",
   "status": "success",
-  "entries": [
-    {
-      "path": "/scan/trusted",
-      "line": 1
-    },
-    {
-      "path": "/scan/sample file.zip",
-      "line": 2
-    }
+  "results": [
+    {"id":"manual-1783433000","type":"manual","date":"20260707173640","result":"clean","action":"warn"}
+  ],
+  "total": 1,
+  "started_at": "2026-08-04T19:00:00+08:00",
+  "updated_at": "2026-08-04T19:00:00+08:00"
+}
+```
+
+列表、总数、排序和分页均由 SQLite 完成，并始终包含 `user_id` 条件。
+
+响应字段及可能值：
+
+| 字段 | 类型 | 可能值及含义 |
+|---|---|---|
+| `lookup_id` | string | 创建查询时生成的 `result-<随机ID>`；在该 lookup 生命周期内不变。 |
+| `status` | string | `pending`：查询尚未完成；`success`：查询成功；`failed`：查询失败。 |
+| `results` | array | `success` 时为本次分页范围内的任务数组；无匹配任务时为空数组。`pending` 或 `failed` 时可能省略。 |
+| `results[].id` | string | 任务 ID，形式为 `manual-<Unix秒>` 或 `cron-<Unix秒>`，冲突时可能带三位序号后缀。 |
+| `results[].type` | string | `manual`：手动扫描；`cron`：定时扫描。 |
+| `results[].date` | string | 任务开始时间，格式为 `YYYYMMDDHHMMSS`，使用服务端时区。 |
+| `results[].result` | string | `unknown`：等待中或运行中；`clean`：未检出威胁；`found`：检出威胁；`error`：扫描失败。 |
+| `results[].action` | string | `warn`：仅记录；`move`：移动到隔离区；`remove`：直接删除检出文件。值来自 `history_jobs.action`。 |
+| `total` | integer | 当前用户符合查询条件的历史任务总数，不受当前分页范围限制；未完成时为 `0`。 |
+| `error` | string | 仅在 `failed` 时出现，内容为查询失败原因。 |
+| `started_at` | string | lookup 创建时间，RFC3339 格式。 |
+| `updated_at` | string | lookup 最近一次状态更新时间，RFC3339 格式。 |
+
+接口状态码：`202` 对应 `pending`，`200` 对应 `success`，`500` 对应 `failed`；lookup 不存在或不属于当前用户时返回 `404`。
+
+结果、统计和隔离区 lookup 共用当前用户最多两个 pending 查询的配额；达到上限时创建接口
+返回 `429`。每个用户最多保留 10 个 lookup，超出时淘汰最旧的非 pending 条目。查询执行
+最多 30 秒，terminal 状态保留 15 分钟；服务退出和账户删除会取消尚未结束的查询。后台
+清理器每分钟运行一次，创建新查询时也会顺带清理过期条目。
+
+### `POST /api/results/statistics/lookups?scope=N`
+
+创建当前用户过去 `N` 个本地自然日的扫描统计查询。`scope` 必须显式提供，且必须是
+`1` 到 `31` 之间的正整数。统计范围包含请求当天及之前的 `N-1` 天；当前日只统计到
+请求发生时。日期边界使用服务进程的本地时区（即容器时区）。
+
+创建成功返回 `202 Accepted`：
+
+```json
+{
+  "status": "pending",
+  "lookup_id": "statistics-0123456789abcdef",
+  "scope": 3,
+  "message": "history statistics are loading; poll /api/results/statistics/lookups/statistics-0123456789abcdef"
+}
+```
+
+缺少 `scope`、非整数、零、负数或大于 `31` 时返回 `400 Bad Request`，且不会创建
+lookup。
+
+### `GET /api/results/statistics/lookups/{lookup_id}`
+
+只有创建 lookup 的用户可以轮询。查询尚未完成时返回 `202 Accepted` 和
+`status: pending`；成功后返回 `200 OK`：
+
+```json
+{
+  "lookup_id": "statistics-0123456789abcdef",
+  "status": "success",
+  "scope": 3,
+  "total": 10,
+  "20260803": {"unknown":1,"clean":2,"found":1,"error":0},
+  "20260804": {"unknown":0,"clean":0,"found":0,"error":0},
+  "20260805": {"unknown":1,"clean":4,"found":0,"error":1},
+  "started_at": "2026-08-05T12:00:00+08:00",
+  "updated_at": "2026-08-05T12:00:01+08:00"
+}
+```
+
+响应字段及可能值：
+
+| 字段 | 类型 | 可能值及含义 |
+|---|---|---|
+| `lookup_id` | string | 创建时生成的 `statistics-<随机ID>`。 |
+| `status` | string | `pending`：正在统计；`success`：统计完成；`failed`：查询失败。 |
+| `scope` | integer | 创建 lookup 时指定的天数，范围为 `1–31`。 |
+| `total` | integer | 当前用户在统计范围内的任务总数；等于所有日期四种结果计数之和。 |
+| `YYYYMMDD` | object | 对应容器本地自然日的结果计数；范围内无任务的日期也会返回。 |
+| `YYYYMMDD.unknown` | integer | `result` 为 `unknown` 的任务数；数据库中的其他未知结果也归入此项。 |
+| `YYYYMMDD.clean` | integer | `result` 为 `clean`、即未检出威胁的任务数。 |
+| `YYYYMMDD.found` | integer | `result` 为 `found`、即检出威胁的任务数。 |
+| `YYYYMMDD.error` | integer | `result` 为 `error`、即扫描失败的任务数。 |
+| `error` | string | 仅在 `failed` 时出现，内容为查询失败原因。 |
+| `started_at` | string | lookup 创建时间，RFC3339 格式。 |
+| `updated_at` | string | lookup 最近一次状态更新时间，RFC3339 格式。 |
+
+统计直接从 `history.db` 的 `history_jobs` 表读取，始终包含当前 `users.id` 条件。接口按日和
+结果在 SQLite 中聚合，不读取任务 JSON。异常结果归入 `unknown`。状态码为：等待时
+`202`、成功时 `200`、失败时 `500`；lookup 不存在或属于其他用户时返回 `404`。
+
+### `POST /api/results/detection`
+
+```json
+{"job_id":"manual-1783433000"}
+```
+
+后端先通过 SQLite 验证任务属于当前用户，再读取任务日志和检出日志：
+
+```json
+{
+  "job_id": "manual-1783433000",
+  "detections": [
+    {"source_file":"/scan/eicar.txt","detection_reason":"Eicar-Test-Signature"}
+  ],
+  "original": "raw detection log",
+  "log": "full scan log"
+}
+```
+
+### `POST /api/results/clean`
+
+请求 query 或 JSON 中必须包含 `clean_all=Y`：
+
+```json
+{"clean_all":"Y"}
+```
+
+只删除当前用户的任务 JSON、普通日志、检出日志和 SQLite 索引。admin 也不能清理其他用户历史。
+
+## 11. 隔离区
+
+隔离元数据格式：
+
+```text
+"原始路径" owner_user_id
+```
+
+旧单字段 `.rec` 不会被列出或自动归属。
+
+### `POST /api/quarantine/lookups`
+
+创建当前用户的异步隔离区查询。隔离区不使用 `scope`，查询会分批读取目录并返回该用户的
+完整隔离条目列表，但仍受上述共享 pending 配额、30 秒执行超时和 lookup 保留规则约束。
+
+### `GET /api/quarantine/lookups/{lookup_id}`
+
+只有创建 lookup 的用户可轮询。成功响应：
+
+```json
+{
+  "lookup_id": "quarantine-0123456789abcdef",
+  "status": "success",
+  "subjects": [
+    {"name":"eicar.txt","source_file":"/scan/eicar.txt"}
   ]
 }
 ```
 
-说明：
+### `DELETE /api/quarantine/delete/{filename}`
 
-- `path` 是解析后的白名单路径。
-- `line` 是该条目在 `/config/exclude.conf` 中的行号。
+也接受 POST。只有 `.rec` owner ID 与当前 `users.id` 一致时才删除隔离文件和元数据。
 
-## `POST /api/whitelist`
+### `POST /api/quarantine/recover/{filename}`
 
-用途：新增白名单条目。后端会先确认扫描锁不存在，再更新 `/config/exclude.conf`，随后执行 `/exclude.sh` 重新生成 ClamAV allow-list 数据库，并请求 `clamd` reload 数据库。
+恢复前验证 owner ID。TimeDock 模式下，元数据中的原路径还必须位于用户当前绑定的账户目录内；即使文件来自该用户此前绑定的账户目录，也不会恢复到当前授权范围之外。原路径已经存在时拒绝覆盖；跨文件系统时使用复制、保留权限、删除隔离文件的回退流程。
 
-请求体：
+### `POST /api/quarantine/clean`
 
-```json
-{
-  "path": "/scan/trusted"
-}
-```
+请求必须包含 `clean_all=Y`。只删除当前用户的隔离文件和 `.rec`，不会清空整个隔离目录。
 
-调用：
+## 12. 持久化与配置文件
 
-```sh
-curl -u admin:secret \
-  -H "Content-Type: application/json" \
-  -d '{"path":"/scan/trusted"}' \
-  http://localhost:8080/api/whitelist
-```
+| 路径 | 用途 |
+|---|---|
+| `/data/users.db` | 用户、密码哈希和 session |
+| `/data/history.db` | 历史任务索引 |
+| `/config/clamavweb.conf` | 服务端配置 |
+| `/config/cron_scan.conf` | 所有用户 cron 规则 |
+| `/config/exclude.conf` | 所有用户白名单条目 |
+| `/state/jobs/*.json` | version 3 任务事实文件 |
+| `/log/*.log` | 扫描和检出日志 |
+| `/quarantine/*` | 隔离文件及 owner 元数据 |
 
-成功响应：
+`/data`、`/config`、`/state`、`/log` 和 `/quarantine` 都应持久化。`USER_DATABASE_FILE` 和 `HISTORY_DATABASE_FILE` 可分别覆盖两个数据库路径。历史索引库可以从 version 3 JSON 重建，但用户和 session 只能从用户库恢复。用户 ID 是其他资产的所有权依据，因此重建 `users.db` 时必须同时清理 cron、白名单、任务状态和隔离区资产。
 
-```json
-{
-  "status": "success",
-  "entries": [
-    {
-      "path": "/scan/trusted",
-      "line": 1
-    }
-  ],
-  "message": "Exclude allow-list refreshed."
-}
-```
+当前用户 ID 与资产格式不兼容早期的“用户名 owner / version 2 任务”开发数据。检测到旧 `users.db` 或 `history.db` schema 时服务会拒绝启动并提示重建；升级开发环境时应同时清理旧用户库、历史库、cron 规则、白名单、任务 JSON 和隔离区数据，不进行自动归属迁移。
 
-忙碌响应：
-
-```json
-{
-  "status": "busy",
-  "message": "clamav is running"
-}
-```
-
-失败响应：
-
-```json
-{
-  "status": "failed",
-  "message": "script output",
-  "error": "error message"
-}
-```
-
-ClamAV 休眠响应：
-
-```json
-{
-  "status": "failed",
-  "message": null,
-  "error": "ClamAV is sleeping"
-}
-```
-
-说明：
-
-- `path` 必须存在，且真实路径必须位于 `/scan` 下。
-- 如果路径已经存在于白名单中，后端不会重复写入，但仍会执行 `/exclude.sh` 刷新 allow-list 数据库。
-- 如果扫描锁目录存在，返回 `409 Conflict`，`status` 为 `busy`。
-- 如果 `/state/sleep.lock` 存在，返回 `409 Conflict` 和上述休眠响应，不修改白名单，也不执行刷新或唤醒。
-- 如果 `/exclude.sh` 或 `clamd` reload 失败，返回 `failed`。
-
-## `DELETE /api/whitelist`
-
-用途：删除白名单条目。后端会先确认扫描锁不存在，再更新 `/config/exclude.conf`，随后执行 `/exclude.sh` 重新生成 ClamAV allow-list 数据库，并请求 `clamd` reload 数据库。
-
-请求体：
-
-```json
-{
-  "path": "/scan/trusted"
-}
-```
-
-调用：
-
-```sh
-curl -u admin:secret \
-  -X DELETE \
-  -H "Content-Type: application/json" \
-  -d '{"path":"/scan/trusted"}' \
-  http://localhost:8080/api/whitelist
-```
-
-成功响应：
-
-```json
-{
-  "status": "success",
-  "entries": [],
-  "message": "Exclude allow-list refreshed."
-}
-```
-
-说明：
-
-- 删除不存在的条目会返回 `400 Bad Request`，`status` 为 `failed`。
-- 如果扫描锁目录存在，返回 `409 Conflict`，`status` 为 `busy`。
-- 如果 `/state/sleep.lock` 存在，返回与 POST 相同的 `409 Conflict` 休眠响应，不修改白名单，也不执行刷新或唤醒。
-- 如果 `/exclude.sh` 或 `clamd` reload 失败，返回 `failed`。
-
-## `POST /api/results/lookups`
-
-用途：启动一次历史扫描结果列表查询。后端会异步扫描 `/state/jobs` 下符合 job ID 规范的任务状态文件，避免文件数量较多时阻塞前端。
-
-查询参数：
-
-| 参数 | 必填 | 说明 |
-| --- | --- | --- |
-| `scope` | 否 | 返回范围，支持 `all` 或数字范围如 `1-10`，默认 `all`。范围按 `date` 倒序后的结果序号计算，序号从 `1` 开始。 |
-
-只会匹配以下文件名：
-
-```text
-manual-YYYYMMDDHHMMSS.json
-cron-YYYYMMDDHHMMSS.json
-```
-
-调用：
-
-```sh
-curl -u admin:secret \
-  -X POST \
-  http://localhost:8080/api/results/lookups
-
-curl -u admin:secret \
-  -X POST \
-  'http://localhost:8080/api/results/lookups?scope=1-10'
-```
-
-响应状态码：`202 Accepted`
-
-响应示例：
-
-```json
-{
-  "status": "pending",
-  "lookup_id": "result-5f7c2e9b0a61b432",
-  "message": "result list is loading; poll /api/results/lookups/result-5f7c2e9b0a61b432"
-}
-```
-
-说明：
-
-- 前端收到 `lookup_id` 后，应调用 `GET /api/results/lookups/{lookup_id}` 轮询结果。
-- 后端会忽略非法 job ID 文件、非 JSON 后缀文件和其他普通文件。
-- 后端会先根据文件名提取 `type` 和 `date`，按 `date` 倒序排序后应用 `scope`，然后只读取范围内的 JSON 文件。目录枚举仍会遍历 `/state/jobs`，但范围外的任务状态文件不会被打开解析。
-- 如果 `scope` 格式非法，直接返回 `400`，不会创建异步查询任务。
-
-## `GET /api/results/lookups/{lookup_id}`
-
-用途：获取历史扫描结果列表查询状态和最终结果。
-
-调用：
-
-```sh
-curl -u admin:secret \
-  http://localhost:8080/api/results/lookups/result-5f7c2e9b0a61b432
-```
-
-查询中响应：
-
-```json
-{
-  "lookup_id": "result-5f7c2e9b0a61b432",
-  "status": "pending",
-  "total": 0,
-  "started_at": "2026-07-07T17:40:00+08:00",
-  "updated_at": "2026-07-07T17:40:00+08:00"
-}
-```
-
-完成响应：
-
-```json
-{
-  "lookup_id": "result-5f7c2e9b0a61b432",
-  "status": "success",
-  "total": 2,
-  "results": [
-    {
-      "id": "manual-20260707173642",
-      "type": "manual",
-      "date": "20260707173642",
-      "result": "found"
-    },
-    {
-      "id": "cron-20260707094101",
-      "type": "cron",
-      "date": "20260707094101",
-      "result": "clean"
-    }
-  ],
-  "started_at": "2026-07-07T17:40:00+08:00",
-  "updated_at": "2026-07-07T17:40:01+08:00"
-}
-```
-
-说明：
-
-- `id` 是 job ID，不含 `.json` 后缀。
-- `type` 来自 job ID 前缀，可能为 `manual` 或 `cron`。
-- `date` 是 job ID 中的 `YYYYMMDDHHMMSS` 时间部分。
-- `result` 来自 `/state/jobs/<job_id>.json` 中的 `result` 字段，可能为 `clean`、`found`、`error` 或 `null`。
-- `total` 是 `/state/jobs` 下所有符合 job ID 文件名规范的文件总数，不受 `scope` 范围限制。
-- 结果按 `date` 倒序排列。
-
-## `POST /api/results/detection`
-
-用途：查询指定 job ID 对应的扫描日志和 ClamAV detection 日志。后端会先读取 `/log/<job_id>.log` 作为普通扫描日志，再尝试读取 `/log/clamav_detection_<job_id>.log`，并从 detection 日志中提取 `Source file` 和 `Detection reason`。
-
-请求体：
-
-```json
-{
-  "job_id": "manual-20260707173642"
-}
-```
-
-调用：
-
-```sh
-curl -u admin:secret \
-  -H "Content-Type: application/json" \
-  -d '{"job_id":"manual-20260707173642"}' \
-  http://localhost:8080/api/results/detection
-```
-
-找到日志时响应：
-
-```json
-{
-  "job_id": "manual-20260707173642",
-  "detections": [
-    {
-      "source_file": "/scan/eicar.txt",
-      "detection_reason": "Eicar-Test-Signature"
-    }
-  ],
-  "original": "2026-07-07 17:37:10 ------------ ClamAV Detection ------------\n...",
-  "log": "2026-07-07 17:36:42 [INFO] Scan started\n..."
-}
-```
-
-未找到 detection 日志时响应：
-
-```json
-{
-  "job_id": "manual-20260707173642",
-  "detections": [],
-  "original": "",
-  "log": "2026-07-07 17:36:42 [INFO] Scan started\n..."
-}
-```
-
-说明：
-
-- 未找到 detection 日志不是错误，通常表示该任务没有检出威胁；此时仍会返回普通扫描日志。
-- `job_id` 必须符合 `manual-YYYYMMDDHHMMSS` 或 `cron-YYYYMMDDHHMMSS`。
-- `detections` 返回所有检出记录；仅有单条记录时也返回数组。
-- `original` 返回完整 detection 日志内容；如果 detection 日志不存在，则为空字符串。
-- `log` 返回 `/log/<job_id>.log` 的完整内容；如果普通扫描日志不存在，则为空字符串。
-
-## `POST /api/results/clean`
-
-用途：清理历史扫描结果相关文件。当前只支持清理全部。
-
-清理范围：
-
-- `/log` 下所有以 `manual-`、`cron-`、`clamav_detection` 开头且以 `.log` 结尾的文件。
-- `/state/jobs` 下所有以 `manual-`、`cron-` 开头且以 `.json` 结尾的文件。
-
-请求体：
-
-```json
-{
-  "clean_all": "Y"
-}
-```
-
-也可以用查询参数：
-
-```sh
-curl -u admin:secret \
-  -X POST \
-  "http://localhost:8080/api/results/clean?clean_all=Y"
-```
-
-成功响应：
-
-```json
-{
-  "status": "success",
-  "deleted": 12
-}
-```
-
-失败响应：
-
-```json
-{
-  "status": "failed",
-  "deleted": 3,
-  "error": "error message"
-}
-```
-
-说明：
-
-- `deleted` 是成功删除的目录项数量。
-- 当前必须传 `clean_all=Y`，否则返回 `400 Bad Request`。
-
-## `POST /api/quarantine/clean`
-
-用途：清理隔离区。当前只支持清理全部。
-
-清理范围：
-
-- `/quarantine` 下所有子项，包括文件和子目录。
-
-请求体：
-
-```json
-{
-  "clean_all": "Y"
-}
-```
-
-也可以用查询参数：
-
-```sh
-curl -u admin:secret \
-  -X POST \
-  "http://localhost:8080/api/quarantine/clean?clean_all=Y"
-```
-
-成功响应：
-
-```json
-{
-  "status": "success",
-  "deleted": 4
-}
-```
-
-失败响应：
-
-```json
-{
-  "status": "failed",
-  "deleted": 1,
-  "error": "error message"
-}
-```
-
-说明：
-
-- `deleted` 是成功删除的隔离区子项数量。
-- 当前必须传 `clean_all=Y`，否则返回 `400 Bad Request`。
-
-## `POST /api/quarantine/lookups`
-
-用途：启动一次隔离区文件列表查询。查询行为与 `POST /api/results/lookups` 一致，先返回 `lookup_id`，前端再轮询 `GET /api/quarantine/lookups/{lookup_id}`。
-
-调用：
-
-```sh
-curl -u admin:secret \
-  -X POST \
-  http://localhost:8080/api/quarantine/lookups
-```
-
-响应状态码：`202 Accepted`
-
-响应示例：
-
-```json
-{
-  "status": "pending",
-  "lookup_id": "quarantine-5f7c2e9b0a61b432",
-  "message": "quarantine list is loading; poll /api/quarantine/lookups/quarantine-5f7c2e9b0a61b432"
-}
-```
-
-## `GET /api/quarantine/lookups/{lookup_id}`
-
-用途：获取隔离区文件列表查询状态和最终结果。
-
-查询中响应：
-
-```json
-{
-  "lookup_id": "quarantine-5f7c2e9b0a61b432",
-  "status": "pending",
-  "started_at": "2026-07-07T18:10:00+08:00",
-  "updated_at": "2026-07-07T18:10:00+08:00"
-}
-```
-
-完成响应：
-
-```json
-{
-  "lookup_id": "quarantine-5f7c2e9b0a61b432",
-  "status": "success",
-  "subjects": [
-    {
-      "name": "eicar.txt",
-      "source_file": "/scan/eicar.txt"
-    }
-  ],
-  "started_at": "2026-07-07T18:10:00+08:00",
-  "updated_at": "2026-07-07T18:10:01+08:00"
-}
-```
-
-说明：
-
-- `subjects[].name` 是隔离区内的文件名。
-- `subjects[].source_file` 来自同名 `.rec` 文件内容，例如 `/quarantine/eicar.txt.rec`。
-- `.rec` 文件本身不会作为隔离区主体返回。
-- ClamAV 在隔离移动时可能生成的内部锁文件 `clamav-quarantine-lock` 不会作为隔离区主体返回。
-
-## `POST /api/quarantine/delete/{filename}`
-
-用途：删除隔离区指定文件。删除成功后，后端会一并删除同名 `.rec` 文件。
-
-调用：
-
-```sh
-curl -u admin:secret \
-  -X POST \
-  http://localhost:8080/api/quarantine/delete/eicar.txt
-```
-
-成功响应：
-
-```json
-{
-  "status": "success"
-}
-```
-
-失败响应：
-
-```json
-{
-  "status": "failed",
-  "error": "error message"
-}
-```
-
-说明：
-
-- `{filename}` 必须是单个文件名，不能包含路径分隔符。
-- 不允许直接删除 `.rec` 文件。
-
-## `POST /api/quarantine/recover/{filename}`
-
-用途：恢复隔离区指定文件。后端会读取同名 `.rec` 文件，取其中半角双引号包裹的源文件路径，将隔离文件恢复到该路径；同一文件系统内优先移动，跨 Docker 挂载或跨设备时自动改为复制后删除隔离文件。恢复成功后删除 `.rec` 文件。
-
-调用：
-
-```sh
-curl -u admin:secret \
-  -X POST \
-  http://localhost:8080/api/quarantine/recover/eicar.txt
-```
-
-成功响应：
-
-```json
-{
-  "status": "success"
-}
-```
-
-失败响应：
-
-```json
-{
-  "status": "failed",
-  "error": "error message"
-}
-```
-
-说明：
-
-- `.rec` 内容格式必须类似：`"/scan/eicar.txt"`。
-- 如果目标源文件路径已存在，恢复会失败，避免覆盖现有文件。
-- 恢复失败时不会删除 `.rec` 文件。
-
-## 状态码
-
-| 状态码 | 场景 |
-| --- | --- |
-| `200` | 请求成功。 |
-| `201` | 定时扫描规则已创建。 |
-| `202` | 扫描批次已接受。 |
-| `400` | 请求参数错误，例如路径不在 `/scan` 下、action 不合法。 |
-| `401` | 未提供 Basic Auth 或账号密码错误。 |
-| `403` | 目录存在但不可读。 |
-| `404` | 路径或扫描批次不存在。 |
-| `405` | HTTP 方法不允许。 |
-| `409` | 白名单编辑时扫描锁存在，ClamAV 正在运行。 |
+`clamavweb.conf` 的全部字段、默认值和校验规则见 [`server_conf.md`](server_conf.md)。

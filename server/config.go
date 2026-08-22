@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,42 +9,40 @@ import (
 )
 
 type config struct {
-	Addr           string
-	StatusFile     string
-	JobsDir        string
-	ScanLockDir    string
-	SleepLockDir   string
-	LogDir         string
-	QuarantineDir  string
-	ScanScript     string
-	StartupScript  string
-	CronConfigFile string
-	CronScript     string
-	ExcludeConfig  string
-	ExcludeScript  string
-	ClamdConf      string
-	ClamdSocket    string
-	BrowseRoots    []string
-	MaxLogBytes    int64
-	CommandTimout  time.Duration
-	WakeTimeout    time.Duration
-	Accounts       []account
+	Addr                string
+	StatusFile          string
+	JobsDir             string
+	ScanLockDir         string
+	SleepLockDir        string
+	LogDir              string
+	QuarantineDir       string
+	ScanScript          string
+	StartupScript       string
+	CronConfigFile      string
+	CronScript          string
+	ExcludeConfig       string
+	ExcludeScript       string
+	ClamdConf           string
+	ClamdSocket         string
+	BrowseRoots         []string
+	MaxLogBytes         int64
+	CommandTimout       time.Duration
+	WakeTimeout         time.Duration
+	DataDir             string
+	UserDatabaseFile    string
+	HistoryDatabaseFile string
+	AppConfigFile       string
+	IsTimeDock          bool
+	AdminRegisterToken  string
 }
 
-type account struct {
-	Username string
-	Password string
-}
-
-func loadConfig() config {
-	accounts, err := parseAccounts(os.Getenv("SCANNER_ACCOUNTS"))
-	if err != nil {
-		log.Fatalf("invalid SCANNER_ACCOUNTS: %v", err)
-	}
-	if len(accounts) == 0 {
-		log.Fatal("SCANNER_ACCOUNTS is required; set it to username:password pairs separated by comma, semicolon, or newline")
-	}
+func loadConfig() (config, error) {
 	statusDir := env("STATUS_DIR", "/state")
+	dataDir := env("DATA_DIR", "/data")
+	isTimeDock, err := parseYNFlag("IS_TIMEDOCK", os.Getenv("IS_TIMEDOCK"))
+	if err != nil {
+		return config{}, err
+	}
 	return config{
 		Addr:           env("SCANNER_ADDR", ":8080"),
 		StatusFile:     env("STATUS_FILE", filepath.Join(statusDir, "status.json")),
@@ -68,8 +65,24 @@ func loadConfig() config {
 		// startup.sh waits up to 20 minutes (240 attempts * 5 seconds).
 		// Keep the caller alive slightly longer so the script owns the timeout
 		// and can terminate a partially started /init process itself.
-		WakeTimeout: 21 * time.Minute,
-		Accounts:    accounts,
+		WakeTimeout:         21 * time.Minute,
+		DataDir:             dataDir,
+		UserDatabaseFile:    env("USER_DATABASE_FILE", filepath.Join(dataDir, "users.db")),
+		HistoryDatabaseFile: env("HISTORY_DATABASE_FILE", filepath.Join(dataDir, "history.db")),
+		AppConfigFile:       env("CLAMAVWEB_CONFIG_FILE", "/config/clamavweb.conf"),
+		IsTimeDock:          isTimeDock,
+		AdminRegisterToken:  os.Getenv("ADMIN_REGISTER_TOKEN"),
+	}, nil
+}
+
+func parseYNFlag(name, value string) (bool, error) {
+	switch strings.TrimSpace(value) {
+	case "", "N":
+		return false, nil
+	case "Y":
+		return true, nil
+	default:
+		return false, fmt.Errorf("%s must be Y or N", name)
 	}
 }
 
@@ -78,37 +91,4 @@ func env(name, fallback string) string {
 		return value
 	}
 	return fallback
-}
-
-func parseAccounts(value string) ([]account, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return nil, nil
-	}
-
-	fields := strings.FieldsFunc(value, func(r rune) bool {
-		return r == ',' || r == ';' || r == '\n' || r == '\r'
-	})
-	accounts := make([]account, 0, len(fields))
-	seen := make(map[string]bool, len(fields))
-	for _, field := range fields {
-		field = strings.TrimSpace(field)
-		if field == "" {
-			continue
-		}
-		username, password, ok := strings.Cut(field, ":")
-		username = strings.TrimSpace(username)
-		if !ok || username == "" || password == "" {
-			return nil, fmt.Errorf("account %q must use username:password with non-empty values", field)
-		}
-		if seen[username] {
-			return nil, fmt.Errorf("duplicate username %q", username)
-		}
-		seen[username] = true
-		accounts = append(accounts, account{
-			Username: username,
-			Password: password,
-		})
-	}
-	return accounts, nil
 }
