@@ -1,7 +1,5 @@
 .git
 .gitignore
-frontend/node_modules
-server/web/dist
 ClamAV-Web/node_modules
 ClamAV-Web/dist
 scan
@@ -15,6 +13,4 @@ test-tmp
 skills-lock.jon
 .agents
 .codex
-frontend
-server/web
 *_test.go

@@ -65,7 +65,7 @@ flowchart LR
     └── src/features/          # 按页面拆分的业务功能
 ```
 
-`frontend/` 与 `server/web/src/` 是历史前端目录；当前生产前端唯一来源是 **`ClamAV-Web/`**。Dockerfile 只会构建该目录，并将 `dist/` 复制到 Go 的 `server/web/dist` 嵌入路径。
+旧版前端源码已从 `frontend/` 与 `server/web/` 清理；当前生产前端唯一来源是 **`ClamAV-Web/`**。Dockerfile 只会构建该目录，并将 `dist/` 复制到 Go 的 `web-dist` 嵌入路径。
 
 ## 启动链路
 
