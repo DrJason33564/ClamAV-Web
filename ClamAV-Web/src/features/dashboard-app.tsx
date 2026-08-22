@@ -30,9 +30,13 @@ import { Separator } from "@/components/ui/separator"
 import { Spinner } from "@/components/ui/spinner"
 import { Toaster } from "@/components/ui/toast"
 import { ApiError, api } from "@/lib/api"
+import { APP_VERSION } from "@/lib/app-meta"
 import type { CurrentUser, FirstRunResponse, StatusResponse } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
+const AboutPage = React.lazy(async () => ({
+  default: (await import("@/features/about-page")).AboutPage,
+}))
 const CronPage = React.lazy(async () => ({
   default: (await import("@/features/cron-page")).CronPage,
 }))
@@ -62,6 +66,7 @@ const WhitelistPage = React.lazy(async () => ({
 }))
 
 type PageKey =
+  | "about"
   | "status"
   | "manual"
   | "cron"
@@ -95,6 +100,7 @@ function navigate(page: PageKey) {
 
 function readPage(isAdmin: boolean): PageKey {
   const value = window.location.hash.slice(1) as PageKey
+  if (value === "about") return value
   const entry = pages.find(({ key }) => key === value)
   return entry && (!entry.admin || isAdmin) ? entry.key : "status"
 }
@@ -177,7 +183,8 @@ function Dashboard() {
 
   const isAdmin = user.role === "admin"
   let content: React.ReactNode
-  if (page === "manual") content = <ManualScanPage />
+  if (page === "about") content = <AboutPage />
+  else if (page === "manual") content = <ManualScanPage />
   else if (page === "cron") content = <CronPage />
   else if (page === "queue") content = <QueuePage />
   else if (page === "whitelist") content = <WhitelistPage />
@@ -207,7 +214,7 @@ function Dashboard() {
   )
 
   return (
-    <div className="min-h-svh bg-muted/30">
+    <div className="flex min-h-svh flex-col bg-muted/30">
       <header className="border-b bg-background">
         <div className="mx-auto flex max-w-screen-2xl items-center gap-1 px-4 py-2 lg:px-6">
           <img
@@ -271,7 +278,7 @@ function Dashboard() {
           </DropdownMenu>
         </div>
       </header>
-      <div className="mx-auto grid max-w-screen-2xl gap-4 p-4 lg:grid-cols-[13rem_minmax(0,1fr)] lg:p-6">
+      <div className="mx-auto grid w-full max-w-screen-2xl flex-1 gap-4 p-4 lg:grid-cols-[13rem_minmax(0,1fr)] lg:p-6">
         <aside className="self-start overflow-x-auto rounded-xl border bg-background p-2 lg:overflow-visible">
           <nav className="flex min-w-max gap-1 lg:min-w-0 lg:flex-col">
             {visiblePages.map(({ key, label, icon: Icon }, index) => (
@@ -318,6 +325,13 @@ function Dashboard() {
           </React.Suspense>
         </main>
       </div>
+      <footer className="border-t bg-background">
+        <div className="mx-auto flex max-w-screen-2xl justify-center px-4 py-2 lg:px-6">
+          <Button variant="link" size="sm" render={<a href="#about" />}>
+            ClamAV-Web {APP_VERSION}
+          </Button>
+        </div>
+      </footer>
     </div>
   )
 }
