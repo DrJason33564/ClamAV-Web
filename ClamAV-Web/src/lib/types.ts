@@ -21,7 +21,6 @@ export type StatusSource = {
   clamd?: {
     status?: string
     last_checked_at?: string
-    message?: string
   }
   scan?: {
     active_job_id?: string | null

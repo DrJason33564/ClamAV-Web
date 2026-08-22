@@ -322,7 +322,7 @@ WEB_FIRSTRUN_COMPLETED=2
 {
   "source": {
     "version": 1,
-    "clamd": {"status":"ready","message":"clamd is ready."},
+    "clamd": {"status":"ready"},
     "scan": {
       "active_job_id": null,
       "last_job_id": "manual-1783433000",

@@ -107,8 +107,7 @@ func TestSleepClamAVWritesCompleteStatusWhenAlreadySleeping(t *testing.T) {
   "updated_at": "2026-07-29T12:00:00+0800",
   "clamd": {
     "status": "ready",
-    "last_checked_at": "2026-07-29T12:00:00+0800",
-    "message": "clamd is ready."
+    "last_checked_at": "2026-07-29T12:00:00+0800"
   },
   "scan": {
     "active_job_id": null,
@@ -139,8 +138,11 @@ func TestSleepClamAVWritesCompleteStatusWhenAlreadySleeping(t *testing.T) {
 		t.Fatal(err)
 	}
 	clamd := root["clamd"].(map[string]any)
-	if clamd["status"] != "sleep" || clamd["message"] != "clamd is sleeping." {
+	if clamd["status"] != "sleep" {
 		t.Fatalf("unexpected clamd status: %#v", clamd)
+	}
+	if _, exists := clamd["message"]; exists {
+		t.Fatalf("unexpected clamd message field: %#v", clamd)
 	}
 	if clamd["last_checked_at"] != "2026-07-29T12:00:00+0800" {
 		t.Fatalf("clamd fields were not preserved: %#v", clamd)

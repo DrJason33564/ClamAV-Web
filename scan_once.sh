@@ -32,7 +32,6 @@ now_iso() {
 
 write_status() {
     clamd_status="$1"
-    message="$2"
     tmp_status="$(mktemp "${STATUS_DIR}/.status.XXXXXX")"
 
     cat > "$tmp_status" <<EOF_STATUS
@@ -41,8 +40,7 @@ write_status() {
   "updated_at": "$(now_iso)",
   "clamd": {
     "status": "$clamd_status",
-    "last_checked_at": "$(now_iso)",
-    "message": "$(json_escape "$message")"
+    "last_checked_at": "$(now_iso)"
   },
   "scan": {
     "active_job_id": ${ACTIVE_JOB_JSON:-null},
@@ -660,7 +658,7 @@ if [ ! -e "$TARGET" ]; then
     FINISHED_AT="$(now_unix)"
     write_job_state "finished" "$FINISHED_AT" "0" "clean" "null" "Scan target does not exist, skipped."
     ACTIVE_JOB_JSON="null"
-    write_status "ready" "Scan target does not exist, skipped."
+    write_status "ready"
     exit 0
 fi
 
@@ -669,7 +667,7 @@ if [ "$ACTION" = "move" ] && [ ! -d "$QUARANTINE_DIR" ]; then
     FINISHED_AT="$(now_unix)"
     write_job_state "failed" "$FINISHED_AT" "2" "error" "null" "Quarantine path is not a directory."
     ACTIVE_JOB_JSON="null"
-    write_status "error" "Quarantine path is not a directory."
+    write_status "error"
     exit 2
 fi
 
@@ -693,7 +691,7 @@ CLAMDSCAN_PID="$!"
 CLAMDSCAN_PID_JSON="$CLAMDSCAN_PID"
 printf '%s\n' "$CLAMDSCAN_PID" > "$LOCK_DIR/pid"
 printf '%s\n' "$JOB_ID" > "$LOCK_DIR/job_id"
-write_status "running" "Scan is running."
+write_status "running"
 write_job_state "running" "null" "null" "unknown" "\"$(json_escape "$DETECTION_LOG")\"" "Scan is running."
 wait "$CLAMDSCAN_PID"
 rc="$?"
@@ -713,7 +711,7 @@ case "$rc" in
     0)
         log "[INFO] Scan finished cleanly: $TARGET"
         write_job_state "finished" "$FINISHED_AT" "$rc" "clean" "null" "Scan finished cleanly."
-        write_status "ready" "Scan finished cleanly."
+        write_status "ready"
         ;;
     1)
         log "[ALERT] Threat found while scanning: $TARGET"
@@ -724,7 +722,7 @@ case "$rc" in
         if [ "$ACTION" = "move" ] && [ "$QUARANTINE_FAILURE_COUNT" -gt 0 ]; then
             log "[ERROR] Quarantine summary: detected=$DETECTION_COUNT succeeded=$QUARANTINE_SUCCESS_COUNT failed=$QUARANTINE_FAILURE_COUNT"
             write_job_state "failed" "$FINISHED_AT" "74" "error" "\"$(json_escape "$DETECTION_LOG")\"" "Threats were detected, but one or more files failed to move to quarantine."
-            write_status "error" "Threats were detected, but one or more files could not be moved to quarantine."
+            write_status "error"
             exit 74
         fi
         log_applied_action
@@ -732,12 +730,12 @@ case "$rc" in
             log "[INFO] Quarantine summary: detected=$DETECTION_COUNT succeeded=$QUARANTINE_SUCCESS_COUNT failed=0"
         fi
         write_job_state "finished" "$FINISHED_AT" "$rc" "found" "\"$(json_escape "$DETECTION_LOG")\"" "Threat found while scanning."
-        write_status "ready" "Threat found while scanning."
+        write_status "ready"
         ;;
     *)
         log "[ERROR] Scan failed for $TARGET, exit code: $rc"
         write_job_state "failed" "$FINISHED_AT" "$rc" "error" "null" "Scan failed with exit code $rc."
-        write_status "error" "Scan failed with exit code $rc."
+        write_status "error"
         ;;
 esac
 

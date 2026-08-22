@@ -368,7 +368,6 @@ func writeClamdSleepStatus(path string) error {
 		root["clamd"] = clamd
 	}
 	clamd["status"] = "sleep"
-	clamd["message"] = "clamd is sleeping."
 
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".status.*")

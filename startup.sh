@@ -35,10 +35,6 @@ export CRON_CONFIG_FILE EXCLUDE_CONFIG_FILE LOG_SCRIPT CONFIG_SCRIPT
 . "$LOG_SCRIPT"
 . "$CONFIG_SCRIPT"
 
-json_escape() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
-
 now_iso() {
     date '+%Y-%m-%dT%H:%M:%S%z'
 }
@@ -57,7 +53,6 @@ usage() {
 }
 
 write_ready_status() {
-    message="$1"
     tmp_status="$(mktemp "${STATUS_DIR}/.status.XXXXXX")"
 
     # Keep the base status file available before the WebUI exists. Scan jobs
@@ -68,8 +63,7 @@ write_ready_status() {
   "updated_at": "$(now_iso)",
   "clamd": {
     "status": "ready",
-    "last_checked_at": "$(now_iso)",
-    "message": "$(json_escape "$message")"
+    "last_checked_at": "$(now_iso)"
   },
   "scan": {
     "active_job_id": null,
@@ -88,7 +82,7 @@ wait_for_clamd() {
     while [ "$i" -lt "${CLAMD_WAIT_RETRIES:-180}" ]; do
         if clamdscan --config-file=/etc/clamav/clamd.conf --ping=1 >/dev/null 2>&1; then
             startup_log "[INFO] clamd is ready."
-            write_ready_status "clamd is ready."
+            write_ready_status
             return 0
         fi
 

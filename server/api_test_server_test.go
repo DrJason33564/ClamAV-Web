@@ -266,7 +266,6 @@ func templateStatus(w http.ResponseWriter, r *http.Request) {
 			"clamd": map[string]any{
 				"status":          state.status,
 				"last_checked_at": timestamp,
-				"message":         state.message,
 			},
 			"scan": map[string]any{
 				"active_job_id":   nil,
@@ -734,8 +733,11 @@ func TestTemplateAPIResponses(t *testing.T) {
 		}
 		source := body["source"].(map[string]any)
 		clamd := source["clamd"].(map[string]any)
-		if body["ping"] != clamd["status"] || body["ping_message"] != clamd["message"] {
+		if body["ping"] != clamd["status"] || body["ping_message"] == "" {
 			t.Fatalf("status fields do not match: %#v", body)
+		}
+		if _, exists := clamd["message"]; exists {
+			t.Fatalf("unexpected clamd message field: %#v", clamd)
 		}
 		if body["is_timedock"] != false {
 			t.Fatalf("unexpected is_timedock value: %#v", body["is_timedock"])

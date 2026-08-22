@@ -54,9 +54,8 @@ curl -u test:anything http://localhost:8081/api/status
 - `source.scan.last_job_id` 恒为 `manual-20260728070000`。
 - `checked_at` 为本次请求的处理时间。
 - `source.clamd.status` 从 `ready`、`error`、`timeout` 中随机选择。
-- `source.clamd.message` 与所选状态匹配。
 - `ping` 与 `source.clamd.status` 相同。
-- `ping_message` 与 `source.clamd.message` 相同。
+- `ping_message` 与所选状态匹配。
 - `is_timedock` 固定为 `false`。
 
 状态与消息的对应关系：
