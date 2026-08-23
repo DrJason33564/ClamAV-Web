@@ -14,6 +14,15 @@ import (
 
 type databaseSchema func(context.Context, *sql.DB) error
 
+const historyDetectionsSchema = `
+CREATE TABLE IF NOT EXISTS history_detections (
+    job_id TEXT NOT NULL REFERENCES history_jobs(job_id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK(sequence >= 0),
+    source_file TEXT NOT NULL,
+    detection_reason TEXT NOT NULL,
+    PRIMARY KEY(job_id, sequence)
+);`
+
 func openSQLiteDatabase(path string, initialize databaseSchema) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
@@ -128,10 +137,39 @@ CREATE INDEX IF NOT EXISTS history_jobs_user_started ON history_jobs(user_id, st
 	if err := requireSQLiteColumnType(ctx, db, "history_jobs", "user_id", "TEXT"); err != nil {
 		return fmt.Errorf("incompatible history database; recreate history.db: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, unixepoch())"); err != nil {
-		return fmt.Errorf("record history database schema: %w", err)
+	version, err := historyDatabaseSchemaVersion(ctx, db)
+	if err != nil {
+		return fmt.Errorf("read history database schema: %w", err)
+	}
+	if version == 0 {
+		// A new database has no version 2 rows to backfill, so it can start at
+		// schema 3 immediately. Existing version 2 databases are upgraded by the
+		// history indexer after its non-destructive full refresh.
+		if _, err := db.ExecContext(ctx, historyDetectionsSchema); err != nil {
+			return fmt.Errorf("initialize history detections: %w", err)
+		}
+		if _, err := db.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES(3, unixepoch())"); err != nil {
+			return fmt.Errorf("record history database schema: %w", err)
+		}
+		return nil
+	}
+	if version >= 3 {
+		if _, err := db.ExecContext(ctx, historyDetectionsSchema); err != nil {
+			return fmt.Errorf("initialize history detections: %w", err)
+		}
 	}
 	return nil
+}
+
+func historyDatabaseSchemaVersion(ctx context.Context, db *sql.DB) (int, error) {
+	var version sql.NullInt64
+	if err := db.QueryRowContext(ctx, "SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil {
+		return 0, err
+	}
+	if !version.Valid {
+		return 0, nil
+	}
+	return int(version.Int64), nil
 }
 
 func requireSQLiteColumnType(ctx context.Context, db *sql.DB, table, column, wantType string) error {

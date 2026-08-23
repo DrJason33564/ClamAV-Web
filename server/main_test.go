@@ -904,6 +904,25 @@ func TestResultLookupRejectsInvalidScope(t *testing.T) {
 
 func TestReadDetectionResult(t *testing.T) {
 	tmp := t.TempDir()
+	jobsDir := filepath.Join(tmp, "jobs")
+	logDir := filepath.Join(tmp, "logs")
+	for _, dir := range []string{jobsDir, logDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	historyDB, err := openHistoryDatabase(filepath.Join(tmp, "history.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = historyDB.Close() })
+	insertJob := func(jobID, jobType string) {
+		t.Helper()
+		if _, err := historyDB.Exec(`INSERT INTO history_jobs(job_id,job_type,status,result,action,started_at,finished_at,user_id,json_file,file_mtime_ns,indexed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+			jobID, jobType, "finished", "found", "warn", 1783433000, 1783433010, testAliceUserID, filepath.Join(jobsDir, jobID+".json"), 1, time.Now().Unix()); err != nil {
+			t.Fatal(err)
+		}
+	}
 	jobID := "manual-20260707173642"
 	body := strings.Join([]string{
 		"2026-07-07 17:37:10 ------------ ClamAV Detection ------------",
@@ -916,16 +935,27 @@ func TestReadDetectionResult(t *testing.T) {
 		"2026-07-07 17:37:11 [DETECTION] Detection reason : Eicar-Test-Signature-2",
 		"2026-07-07 17:37:10 ------------------------------------------",
 	}, "\n")
-	if err := os.WriteFile(filepath.Join(tmp, "clamav_detection_"+jobID+".log"), []byte(body), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(logDir, "clamav_detection_"+jobID+".log"), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	jobLog := "2026-07-07 17:36:42 [INFO] Scan started\n2026-07-07 17:37:10 [ALERT] Threat found\n"
-	if err := os.WriteFile(filepath.Join(tmp, jobID+".log"), []byte(jobLog), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(logDir, jobID+".log"), []byte(jobLog), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	insertJob(jobID, "manual")
+	indexedDetections := []detectionItem{
+		{SourceFile: "/indexed/eicar.txt", DetectionReason: "Indexed-Signature"},
+		{SourceFile: "/indexed/eicar2.txt", DetectionReason: "Indexed-Signature-2"},
+	}
+	for sequence, detection := range indexedDetections {
+		if _, err := historyDB.Exec(`INSERT INTO history_detections(job_id,sequence,source_file,detection_reason) VALUES(?,?,?,?)`,
+			jobID, sequence, detection.SourceFile, detection.DetectionReason); err != nil {
+			t.Fatal(err)
+		}
+	}
 
-	s := &server{cfg: config{LogDir: tmp}}
-	result, err := s.readDetectionResult(jobID)
+	s := &server{cfg: config{JobsDir: jobsDir, LogDir: logDir}, historyDB: historyDB}
+	result, err := s.readDetectionResult(jobID, testAliceUserID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -935,10 +965,10 @@ func TestReadDetectionResult(t *testing.T) {
 	if len(result.Detections) != 2 {
 		t.Fatalf("expected 2 detections, got %#v", result.Detections)
 	}
-	if result.Detections[0].SourceFile != "/scan/eicar.txt" || result.Detections[0].DetectionReason != "Eicar-Test-Signature" {
+	if result.Detections[0].SourceFile != "/indexed/eicar.txt" || result.Detections[0].DetectionReason != "Indexed-Signature" {
 		t.Fatalf("unexpected first detection: %#v", result.Detections[0])
 	}
-	if result.Detections[1].SourceFile != "/scan/eicar2.txt" || result.Detections[1].DetectionReason != "Eicar-Test-Signature-2" {
+	if result.Detections[1].SourceFile != "/indexed/eicar2.txt" || result.Detections[1].DetectionReason != "Indexed-Signature-2" {
 		t.Fatalf("unexpected second detection: %#v", result.Detections[1])
 	}
 	if result.Original != body {
@@ -950,10 +980,11 @@ func TestReadDetectionResult(t *testing.T) {
 
 	missingJobID := "cron-20260707173643"
 	missingJobLog := "cron scan log\n"
-	if err := os.WriteFile(filepath.Join(tmp, missingJobID+".log"), []byte(missingJobLog), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(logDir, missingJobID+".log"), []byte(missingJobLog), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	missing, err := s.readDetectionResult(missingJobID)
+	insertJob(missingJobID, "cron")
+	missing, err := s.readDetectionResult(missingJobID, testAliceUserID)
 	if err != nil {
 		t.Fatal(err)
 	}
