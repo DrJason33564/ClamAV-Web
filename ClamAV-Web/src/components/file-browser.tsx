@@ -26,9 +26,165 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { Spinner } from "@/components/ui/spinner"
 import { api } from "@/lib/api"
 import { errorMessage } from "@/lib/format"
 import type { BrowseResponse } from "@/lib/types"
+
+const filenameScrollDelay = 2000
+const filenameEdgeDelay = 1200
+const filenameScrollSpeed = 24
+
+type MarqueeFilenameProps = {
+  name: string
+  visible: boolean
+}
+
+function MarqueeFilename({ name, visible }: MarqueeFilenameProps) {
+  const elementRef = React.useRef<HTMLSpanElement>(null)
+
+  React.useEffect(() => {
+    const currentElement = elementRef.current
+    if (!currentElement) return
+    const element: HTMLSpanElement = currentElement
+
+    // Drive scrollLeft directly so the marquee covers the exact overflow distance.
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)")
+    let animationFrame = 0
+    let delayTimer = 0
+    let direction: 1 | -1 = 1
+    let lastFrameTime = 0
+    let moving = false
+    let hovered = false
+    let resumeOnMouseLeave = false
+
+    function hasOverflow() {
+      return element.scrollWidth - element.clientWidth > 1
+    }
+
+    function stop() {
+      window.cancelAnimationFrame(animationFrame)
+      window.clearTimeout(delayTimer)
+      animationFrame = 0
+      delayTimer = 0
+      lastFrameTime = 0
+      moving = false
+    }
+
+    function canAnimate() {
+      return visible && !hovered && !reducedMotion.matches && hasOverflow()
+    }
+
+    function schedule(delay = filenameScrollDelay) {
+      stop()
+      if (!canAnimate()) {
+        resumeOnMouseLeave = hovered && visible && hasOverflow()
+        return
+      }
+      resumeOnMouseLeave = false
+      delayTimer = window.setTimeout(() => {
+        moving = true
+        animationFrame = window.requestAnimationFrame(step)
+      }, delay)
+    }
+
+    function step(timestamp: number) {
+      if (hovered) {
+        resumeOnMouseLeave = true
+        stop()
+        return
+      }
+      if (!canAnimate()) {
+        stop()
+        return
+      }
+
+      if (!lastFrameTime) lastFrameTime = timestamp
+      const elapsed = Math.min(timestamp - lastFrameTime, 64)
+      lastFrameTime = timestamp
+
+      const maximum = element.scrollWidth - element.clientWidth
+      const next =
+        element.scrollLeft + direction * filenameScrollSpeed * (elapsed / 1000)
+
+      if (direction === 1 && next >= maximum) {
+        element.scrollLeft = maximum
+        direction = -1
+        schedule(filenameEdgeDelay)
+        return
+      }
+      if (direction === -1 && next <= 0) {
+        element.scrollLeft = 0
+        direction = 1
+        schedule(filenameScrollDelay)
+        return
+      }
+
+      element.scrollLeft = next
+      animationFrame = window.requestAnimationFrame(step)
+    }
+
+    function pauseOnMouseEnter() {
+      hovered = true
+      if (moving) {
+        resumeOnMouseLeave = true
+        stop()
+      }
+    }
+
+    function resumeOnMouseExit() {
+      hovered = false
+      if (!resumeOnMouseLeave) return
+      resumeOnMouseLeave = false
+      schedule(0)
+    }
+
+    function handleReducedMotionChange() {
+      if (reducedMotion.matches) stop()
+      else schedule(filenameScrollDelay)
+    }
+
+    const resizeObserver = new ResizeObserver(() => {
+      if (!hasOverflow()) {
+        stop()
+        element.scrollLeft = 0
+      } else {
+        schedule(filenameScrollDelay)
+      }
+    })
+
+    element.addEventListener("mouseenter", pauseOnMouseEnter)
+    element.addEventListener("mouseleave", resumeOnMouseExit)
+    reducedMotion.addEventListener("change", handleReducedMotionChange)
+    resizeObserver.observe(element)
+
+    if (visible) {
+      element.scrollLeft = 0
+      schedule(filenameScrollDelay)
+    } else {
+      element.scrollLeft = 0
+    }
+
+    return () => {
+      stop()
+      resizeObserver.disconnect()
+      reducedMotion.removeEventListener("change", handleReducedMotionChange)
+      element.removeEventListener("mouseenter", pauseOnMouseEnter)
+      element.removeEventListener("mouseleave", resumeOnMouseExit)
+    }
+  }, [name, visible])
+
+  return (
+    <span
+      ref={elementRef}
+      data-slot="file-browser-entry-name"
+      title={name}
+      className="block max-w-[798px] min-w-0 overflow-hidden whitespace-nowrap"
+    >
+      {name}
+    </span>
+  )
+}
 
 type FileBrowserProps = {
   mode?: "single" | "multiple"
@@ -44,26 +200,84 @@ export function FileBrowser({
   const [data, setData] = React.useState<BrowseResponse | null>(null)
   const [loading, setLoading] = React.useState(false)
   const [error, setError] = React.useState("")
+  const [visibleEntries, setVisibleEntries] = React.useState<
+    ReadonlySet<string>
+  >(() => new Set())
+  const requestIdRef = React.useRef(0)
+  const listRef = React.useRef<HTMLDivElement>(null)
 
   const load = React.useCallback(async (path = "") => {
+    // Only the newest navigation response may replace the directory currently shown.
+    const requestId = ++requestIdRef.current
     setLoading(true)
     setError("")
     try {
-      setData(
-        await api<BrowseResponse>(
-          `/api/browse?path=${encodeURIComponent(path)}`
-        )
+      const nextData = await api<BrowseResponse>(
+        `/api/browse?path=${encodeURIComponent(path)}`
       )
+      if (requestId === requestIdRef.current) setData(nextData)
     } catch (nextError) {
-      setError(errorMessage(nextError))
+      if (requestId === requestIdRef.current) {
+        setError(errorMessage(nextError))
+      }
     } finally {
-      setLoading(false)
+      if (requestId === requestIdRef.current) setLoading(false)
     }
   }, [])
 
   React.useEffect(() => {
-    queueMicrotask(() => void load())
+    let active = true
+    queueMicrotask(() => {
+      if (active) void load()
+    })
+    return () => {
+      active = false
+      requestIdRef.current += 1
+    }
   }, [load])
+
+  React.useEffect(() => {
+    const list = listRef.current
+    if (!list) return
+
+    const entries = list.querySelectorAll<HTMLElement>(
+      '[data-slot="file-browser-entry"]'
+    )
+    const entryPaths = new Set(
+      Array.from(entries, (entry) => entry.dataset.entryPath).filter(
+        (path): path is string => Boolean(path)
+      )
+    )
+    const observer = new IntersectionObserver(
+      (observedEntries) => {
+        setVisibleEntries((current) => {
+          const next = new Set(
+            Array.from(current).filter((path) => entryPaths.has(path))
+          )
+          let changed = next.size !== current.size
+
+          for (const observedEntry of observedEntries) {
+            const path = (observedEntry.target as HTMLElement).dataset.entryPath
+            if (!path) continue
+            if (observedEntry.isIntersecting) {
+              if (!next.has(path)) {
+                next.add(path)
+                changed = true
+              }
+            } else if (next.delete(path)) {
+              changed = true
+            }
+          }
+
+          return changed ? next : current
+        })
+      },
+      { threshold: 0.01 }
+    )
+
+    entries.forEach((entry) => observer.observe(entry))
+    return () => observer.disconnect()
+  }, [data])
 
   function toggle(path: string, checked: boolean) {
     if (mode === "single") {
@@ -83,9 +297,13 @@ export function FileBrowser({
     ) ?? data?.roots[0]
 
   return (
-    <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center gap-2">
+    <div data-slot="file-browser" className="flex flex-col gap-4">
+      <div
+        data-slot="file-browser-toolbar"
+        className="flex flex-wrap items-center gap-2"
+      >
         <Select
+          disabled={loading}
           items={(data?.roots ?? []).map((root) => ({
             label: root,
             value: root,
@@ -129,68 +347,109 @@ export function FileBrowser({
         </span>
       </div>
 
-      {error && <ErrorAlert message={error} />}
+      {error && (
+        <div data-slot="file-browser-error">
+          <ErrorAlert message={error} />
+        </div>
+      )}
 
-      <div className="flex min-h-64 flex-col overflow-hidden rounded-xl border">
-        {data?.entries.length ? (
-          data.entries.map((entry) => {
-            const checked = value.includes(entry.path)
-            return (
-              <div
-                key={entry.path}
-                className="flex min-w-0 items-center gap-3 border-b px-3 py-2 last:border-b-0"
-              >
-                <Checkbox
-                  aria-label={`选择 ${entry.name}`}
-                  checked={checked}
-                  onCheckedChange={(nextChecked) =>
-                    toggle(entry.path, nextChecked === true)
-                  }
-                />
-                {entry.is_dir ? (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="min-w-0 justify-start"
-                    onClick={() => void load(entry.path)}
+      <div
+        data-slot="file-browser-list"
+        aria-busy={loading}
+        className="relative min-h-64 rounded-xl border"
+      >
+        <div
+          ref={listRef}
+          data-slot="file-browser-list-viewport"
+          className="flex min-h-64 flex-col overflow-auto rounded-[inherit]"
+        >
+          {data?.entries.length ? (
+            data.entries.map((entry) => {
+              const checked = value.includes(entry.path)
+              const nameVisible = !loading && visibleEntries.has(entry.path)
+              return (
+                <div
+                  key={entry.path}
+                  data-slot="file-browser-entry"
+                  data-entry-path={entry.path}
+                  className="flex w-full min-w-[64rem] items-center gap-3 border-b px-3 py-2 last:border-b-0"
+                >
+                  <Checkbox
+                    aria-label={`选择 ${entry.name}`}
+                    checked={checked}
+                    onCheckedChange={(nextChecked) =>
+                      toggle(entry.path, nextChecked === true)
+                    }
+                  />
+                  {entry.is_dir ? (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="min-w-0 justify-start"
+                      onClick={() => void load(entry.path)}
+                    >
+                      <FolderIcon data-icon="inline-start" />
+                      <MarqueeFilename
+                        name={entry.name}
+                        visible={nameVisible}
+                      />
+                    </Button>
+                  ) : (
+                    <div
+                      className={buttonVariants({
+                        variant: "ghost",
+                        size: "sm",
+                        className: "min-w-0 justify-start",
+                      })}
+                    >
+                      <FileIcon data-icon="inline-start" aria-hidden="true" />
+                      <MarqueeFilename
+                        name={entry.name}
+                        visible={nameVisible}
+                      />
+                    </div>
+                  )}
+                  <span
+                    data-slot="file-browser-entry-path"
+                    title={entry.path}
+                    className="ml-auto min-w-0 flex-1 truncate text-xs text-muted-foreground"
                   >
-                    <FolderIcon data-icon="inline-start" />
-                    <span className="truncate">{entry.name}</span>
-                  </Button>
-                ) : (
-                  <div
-                    className={buttonVariants({
-                      variant: "ghost",
-                      size: "sm",
-                      className: "min-w-0 justify-start",
-                    })}
-                  >
-                    <FileIcon data-icon="inline-start" aria-hidden="true" />
-                    <span className="truncate">{entry.name}</span>
-                  </div>
-                )}
-                <span className="ml-auto hidden truncate text-xs text-muted-foreground md:block">
-                  {entry.path}
-                </span>
-              </div>
-            )
-          })
-        ) : (
-          <Empty>
-            <EmptyHeader>
-              <EmptyMedia variant="icon">
-                <FolderOpenIcon />
-              </EmptyMedia>
-              <EmptyTitle>{loading ? "正在加载" : "目录为空"}</EmptyTitle>
-              <EmptyDescription>
-                {loading ? "正在读取目录内容" : "此目录中没有可显示的项目"}
-              </EmptyDescription>
-            </EmptyHeader>
-          </Empty>
+                    {entry.path}
+                  </span>
+                </div>
+              )
+            })
+          ) : (
+            <Empty>
+              <EmptyHeader>
+                <EmptyMedia variant="icon">
+                  <FolderOpenIcon />
+                </EmptyMedia>
+                <EmptyTitle>{loading ? "正在加载" : "目录为空"}</EmptyTitle>
+                <EmptyDescription>
+                  {loading ? "正在读取目录内容" : "此目录中没有可显示的项目"}
+                </EmptyDescription>
+              </EmptyHeader>
+            </Empty>
+          )}
+        </div>
+        {loading && (
+          <div
+            data-slot="file-browser-loading"
+            className="absolute inset-0 grid animate-in place-items-center rounded-[inherit] bg-black/10 duration-100 fade-in-0 supports-backdrop-filter:backdrop-blur-xs"
+          >
+            <div className="flex flex-col items-center gap-2 text-sm">
+              <Spinner className="size-6" aria-label="正在读取目录内容" />
+              <span>正在读取目录内容</span>
+            </div>
+          </div>
         )}
       </div>
 
-      <div className="flex min-h-7 flex-wrap gap-2">
+      <div
+        data-slot="file-browser-selection"
+        className="flex min-h-7 flex-wrap gap-2"
+      >
         {value.map((path) => (
           <Badge key={path} variant="secondary">
             {path}
