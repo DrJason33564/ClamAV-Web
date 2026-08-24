@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,7 +45,7 @@ func loadConfig() (config, error) {
 		return config{}, err
 	}
 	return config{
-		Addr:           env("SCANNER_ADDR", ":8080"),
+		Addr:           net.JoinHostPort(env("SCANNER_ADDR", ""), env("SCANNER_PORT", "8080")),
 		StatusFile:     env("STATUS_FILE", filepath.Join(statusDir, "status.json")),
 		JobsDir:        env("JOBS_DIR", filepath.Join(statusDir, "jobs")),
 		ScanLockDir:    env("SCAN_LOCK_DIR", filepath.Join(statusDir, "scan.lock")),

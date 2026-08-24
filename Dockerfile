@@ -6,7 +6,7 @@ RUN npm ci
 COPY ClamAV-Web/ ./
 RUN npm run build
 
-FROM --platform=$BUILDPLATFORM golang:bookworm AS scanner-builder
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS scanner-builder
 
 WORKDIR /src/server
 ARG TARGETOS
