@@ -18,6 +18,8 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from "@/components/ui/empty"
+import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
+import { Input } from "@/components/ui/input"
 import {
   Select,
   SelectContent,
@@ -34,6 +36,33 @@ import type { BrowseResponse } from "@/lib/types"
 const filenameScrollDelay = 2000
 const filenameEdgeDelay = 1200
 const filenameScrollSpeed = 24
+const addressDebounceDelay = 3000
+
+function normalizeBrowserPath(value: string, roots: string[]) {
+  if (!value.startsWith("/") || value.includes("\0")) return null
+
+  const segments: string[] = []
+  for (const segment of value.split("/")) {
+    if (!segment || segment === ".") continue
+    if (segment === "..") {
+      if (!segments.length) return null
+      segments.pop()
+      continue
+    }
+    segments.push(segment)
+  }
+
+  const normalized = `/${segments.join("/")}`
+  const withinRoot = roots.some(
+    (root) =>
+      normalized === root ||
+      (root === "/"
+        ? normalized.startsWith("/")
+        : normalized.startsWith(`${root}/`))
+  )
+
+  return withinRoot ? normalized : null
+}
 
 type MarqueeFilenameProps = {
   name: string
@@ -200,30 +229,64 @@ export function FileBrowser({
   const [data, setData] = React.useState<BrowseResponse | null>(null)
   const [loading, setLoading] = React.useState(false)
   const [error, setError] = React.useState("")
+  const [addressInput, setAddressInput] = React.useState("")
+  const [addressTouched, setAddressTouched] = React.useState(false)
+  const [addressRequestError, setAddressRequestError] = React.useState(false)
   const [visibleEntries, setVisibleEntries] = React.useState<
     ReadonlySet<string>
   >(() => new Set())
   const requestIdRef = React.useRef(0)
+  const addressDebounceTimerRef = React.useRef<number | null>(null)
+  const selectionRef = React.useRef({ mode, value, onValueChange })
   const listRef = React.useRef<HTMLDivElement>(null)
+  const addressInputId = React.useId()
 
-  const load = React.useCallback(async (path = "") => {
-    // Only the newest navigation response may replace the directory currently shown.
-    const requestId = ++requestIdRef.current
-    setLoading(true)
-    setError("")
-    try {
-      const nextData = await api<BrowseResponse>(
-        `/api/browse?path=${encodeURIComponent(path)}`
-      )
-      if (requestId === requestIdRef.current) setData(nextData)
-    } catch (nextError) {
-      if (requestId === requestIdRef.current) {
-        setError(errorMessage(nextError))
-      }
-    } finally {
-      if (requestId === requestIdRef.current) setLoading(false)
-    }
+  React.useEffect(() => {
+    selectionRef.current = { mode, value, onValueChange }
+  }, [mode, onValueChange, value])
+
+  const clearAddressDebounce = React.useCallback(() => {
+    if (addressDebounceTimerRef.current === null) return
+    window.clearTimeout(addressDebounceTimerRef.current)
+    addressDebounceTimerRef.current = null
   }, [])
+
+  const load = React.useCallback(
+    async (path = "", source: "navigation" | "address" = "navigation") => {
+      // Only the newest navigation response may replace the directory currently shown.
+      const requestId = ++requestIdRef.current
+      setLoading(true)
+      setError("")
+      try {
+        const nextData = await api<BrowseResponse>(
+          `/api/browse?path=${encodeURIComponent(path)}`
+        )
+        if (requestId !== requestIdRef.current) return
+
+        setData(nextData)
+        setAddressInput(nextData.path)
+        setAddressTouched(false)
+        setAddressRequestError(false)
+
+        if (source === "address" && !nextData.target.is_dir) {
+          const selection = selectionRef.current
+          selection.onValueChange(
+            selection.mode === "single"
+              ? [nextData.target.path]
+              : Array.from(new Set([...selection.value, nextData.target.path]))
+          )
+        }
+      } catch (nextError) {
+        if (requestId === requestIdRef.current) {
+          setError(errorMessage(nextError))
+          if (source === "address") setAddressRequestError(true)
+        }
+      } finally {
+        if (requestId === requestIdRef.current) setLoading(false)
+      }
+    },
+    []
+  )
 
   React.useEffect(() => {
     let active = true
@@ -232,9 +295,10 @@ export function FileBrowser({
     })
     return () => {
       active = false
+      clearAddressDebounce()
       requestIdRef.current += 1
     }
-  }, [load])
+  }, [clearAddressDebounce, load])
 
   React.useEffect(() => {
     const list = listRef.current
@@ -291,6 +355,44 @@ export function FileBrowser({
     )
   }
 
+  function navigate(path = "") {
+    clearAddressDebounce()
+    setAddressTouched(false)
+    setAddressRequestError(false)
+    void load(path)
+  }
+
+  function submitAddress(value: string) {
+    clearAddressDebounce()
+    setAddressTouched(true)
+    const normalized = normalizeBrowserPath(value, data?.roots ?? [])
+    if (!normalized) return
+    void load(normalized, "address")
+  }
+
+  function handleAddressChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const nextValue = event.target.value
+    setAddressInput(nextValue)
+    setAddressTouched(true)
+    setAddressRequestError(false)
+    setError("")
+    clearAddressDebounce()
+
+    const normalized = normalizeBrowserPath(nextValue, data?.roots ?? [])
+    if (!normalized) return
+    addressDebounceTimerRef.current = window.setTimeout(() => {
+      addressDebounceTimerRef.current = null
+      void load(normalized, "address")
+    }, addressDebounceDelay)
+  }
+
+  const normalizedAddress = normalizeBrowserPath(
+    addressInput,
+    data?.roots ?? []
+  )
+  const addressInvalid =
+    addressRequestError || (addressTouched && normalizedAddress === null)
+
   const activeRoot =
     data?.roots.find(
       (root) => data.path === root || data.path.startsWith(`${root}/`)
@@ -309,7 +411,7 @@ export function FileBrowser({
             value: root,
           }))}
           value={activeRoot}
-          onValueChange={(root) => void load(root ?? "")}
+          onValueChange={(root) => navigate(root ?? "")}
         >
           <SelectTrigger className="min-w-48">
             <SelectValue placeholder="扫描根目录" />
@@ -328,7 +430,7 @@ export function FileBrowser({
           variant="outline"
           size="sm"
           disabled={!data?.parent || loading}
-          onClick={() => void load(data?.parent)}
+          onClick={() => navigate(data?.parent)}
         >
           <ChevronUpIcon data-icon="inline-start" />
           上一级
@@ -337,7 +439,7 @@ export function FileBrowser({
           variant="ghost"
           size="sm"
           disabled={loading}
-          onClick={() => void load(data?.path)}
+          onClick={() => navigate(data?.path)}
         >
           <RefreshCwIcon data-icon="inline-start" />
           刷新
@@ -346,6 +448,31 @@ export function FileBrowser({
           {data?.path || "正在读取目录…"}
         </span>
       </div>
+
+      <FieldGroup data-slot="file-browser-address" className="gap-0">
+        <Field data-invalid={addressInvalid} data-disabled={!data || loading}>
+          <FieldLabel htmlFor={addressInputId} className="sr-only">
+            文件浏览器地址
+          </FieldLabel>
+          <Input
+            id={addressInputId}
+            data-slot="file-browser-address-input"
+            value={addressInput}
+            aria-label="文件浏览器地址"
+            aria-invalid={addressInvalid}
+            autoComplete="off"
+            disabled={!data || loading}
+            placeholder="输入扫描根目录内的绝对路径"
+            spellCheck={false}
+            onChange={handleAddressChange}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter") return
+              event.preventDefault()
+              submitAddress(addressInput)
+            }}
+          />
+        </Field>
+      </FieldGroup>
 
       {error && (
         <div data-slot="file-browser-error">
@@ -386,7 +513,7 @@ export function FileBrowser({
                       variant="ghost"
                       size="sm"
                       className="min-w-0 justify-start"
-                      onClick={() => void load(entry.path)}
+                      onClick={() => navigate(entry.path)}
                     >
                       <FolderIcon data-icon="inline-start" />
                       <MarqueeFilename

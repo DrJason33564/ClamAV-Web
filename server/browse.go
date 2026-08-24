@@ -19,11 +19,17 @@ type browseEntry struct {
 	Modified string `json:"modified"`
 }
 
+type browseTarget struct {
+	Path  string `json:"path"`
+	IsDir bool   `json:"is_dir"`
+}
+
 type browseResponse struct {
 	Path    string        `json:"path"`
 	Parent  string        `json:"parent,omitempty"`
 	Entries []browseEntry `json:"entries"`
 	Roots   []string      `json:"roots"`
+	Target  browseTarget  `json:"target"`
 }
 
 func (s *server) handleBrowse(w http.ResponseWriter, r *http.Request) {
@@ -49,7 +55,8 @@ func (s *server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, err)
 		return
 	}
-	if !info.IsDir() {
+	target := browseTarget{Path: path, IsDir: info.IsDir()}
+	if !target.IsDir {
 		path = filepath.Dir(path)
 	}
 
@@ -118,6 +125,7 @@ func (s *server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 		Parent:  parent,
 		Entries: entries,
 		Roots:   s.cfg.BrowseRoots,
+		Target:  target,
 	})
 }
 

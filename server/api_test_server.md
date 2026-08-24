@@ -94,7 +94,8 @@ curl -u test:anything http://localhost:8081/api/status
 ### 文件浏览
 
 `GET /api/browse` 返回从 `/scan` 开始的固定三层目录树。目录数据仅存在于测试服务
-内存中，不要求本机实际存在这些路径。
+内存中，不要求本机实际存在这些路径。响应中的 `target` 包含规范化目标路径及
+`is_dir`；请求文件路径时返回其父目录内容，并在 `target` 中保留该文件。
 
 ```text
 /scan
@@ -130,6 +131,16 @@ curl -u test:anything http://localhost:8081/api/status
 curl -u test:anything \
   'http://localhost:8081/api/browse?path=/scan/documents/reports'
 ```
+
+也可以直接请求文件：
+
+```sh
+curl -u test:anything \
+  'http://localhost:8081/api/browse?path=/scan/documents/notes.txt'
+```
+
+此时响应 `path` 为 `/scan/documents`，`target` 为
+`{"path":"/scan/documents/notes.txt","is_dir":false}`。
 
 请求测试树以外的路径时返回 `404 Not Found`。
 

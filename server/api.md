@@ -410,7 +410,19 @@ sleep/wake 均为幂等操作。
 
 ### `GET /api/browse?path=/scan`
 
-列出 `/scan` 下的文件和目录。响应包含 `path`、`parent`、`entries` 和 `roots`。路径为空时默认 `/scan`。
+列出 `/scan` 下的文件和目录。响应包含 `path`、`parent`、`entries`、`roots` 和 `target`。路径为空时默认 `/scan`。
+
+`target` 返回经过后端校验和规范化的请求目标，其中 `path` 为目标路径，`is_dir` 表示目标是否为目录。目录请求的 `target.path` 与响应 `path` 相同；文件请求的 `target.path` 为文件路径，响应 `path` 则为文件所在目录。
+
+```json
+{
+  "path": "/scan/docs",
+  "parent": "/scan",
+  "entries": [],
+  "roots": ["/scan"],
+  "target": {"path": "/scan/docs/example.dat", "is_dir": false}
+}
+```
 
 如果路径指向文件，则返回文件所在目录。目录排在文件之前；符号链接不会出现在 `entries` 中，直接请求符号链接路径会返回 `400`。
 

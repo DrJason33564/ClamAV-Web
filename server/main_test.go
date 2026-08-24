@@ -431,6 +431,21 @@ func TestBrowseHidesSymbolicLinks(t *testing.T) {
 	if len(body.Entries) != 2 || body.Entries[0].Name != "directory" || body.Entries[1].Name != "regular.dat" {
 		t.Fatalf("symbolic links were exposed by browse API: %#v", body.Entries)
 	}
+	if body.Target.Path != root || !body.Target.IsDir {
+		t.Fatalf("unexpected directory target: %#v", body.Target)
+	}
+
+	fileResponse := httptest.NewRecorder()
+	s.handleBrowse(fileResponse, httptest.NewRequest(http.MethodGet, "/api/browse?path="+regular, nil))
+	if fileResponse.Code != http.StatusOK {
+		t.Fatalf("browse file failed: %d %s", fileResponse.Code, fileResponse.Body.String())
+	}
+	if err := json.NewDecoder(fileResponse.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Path != root || body.Target.Path != regular || body.Target.IsDir {
+		t.Fatalf("file browse did not return its parent and target: %#v", body)
+	}
 }
 
 func TestBatchSnapshotsFromJobs(t *testing.T) {
