@@ -29,22 +29,30 @@ var (
 )
 
 type indexedJobDocument struct {
-	Version    int    `json:"version"`
-	JobID      string `json:"job_id"`
-	Type       string `json:"type"`
-	Status     string `json:"status"`
-	Result     string `json:"result"`
-	Action     string `json:"action"`
-	StartedAt  int64  `json:"started_at"`
-	FinishedAt *int64 `json:"finished_at"`
-	UserID     string `json:"user_id"`
+	Version      int     `json:"version"`
+	JobID        string  `json:"job_id"`
+	Type         string  `json:"type"`
+	Status       string  `json:"status"`
+	Result       string  `json:"result"`
+	Action       string  `json:"action"`
+	StartedAt    int64   `json:"started_at"`
+	FinishedAt   *int64  `json:"finished_at"`
+	UserID       string  `json:"user_id"`
+	DetectionLog *string `json:"detection_log"`
 }
 
 type historyIndexer struct {
 	db      *sql.DB
 	jobsDir string
+	logDir  string
 	mu      sync.Mutex
 	logger  *applog.Logger
+}
+
+type historyRefreshOptions struct {
+	force            bool
+	reconcileDeleted bool
+	removeInvalid    bool
 }
 
 func (h *historyIndexer) debug(message string, args ...any) {
@@ -68,10 +76,48 @@ func (h *historyIndexer) error(message string, args ...any) {
 func (h *historyIndexer) refresh(ctx context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	started := time.Now()
-	indexedMtimes, err := h.loadIndexedMtimesLocked(ctx)
+	return h.refreshLocked(ctx, historyRefreshOptions{reconcileDeleted: true, removeInvalid: true})
+}
+
+// upgradeSchema backfills schema 2 without applying the normal stale-file
+// deletion pass. The caller skips its ordinary startup refresh when upgraded
+// is true so this startup remains non-destructive.
+func (h *historyIndexer) upgradeSchema(ctx context.Context) (upgraded bool, err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	version, err := historyDatabaseSchemaVersion(ctx, h.db)
 	if err != nil {
-		return err
+		return false, err
+	}
+	switch version {
+	case 3:
+		return false, nil
+	case 2:
+		if _, err := h.db.ExecContext(ctx, historyDetectionsSchema); err != nil {
+			return false, fmt.Errorf("create history detections table: %w", err)
+		}
+		if err := h.refreshLocked(ctx, historyRefreshOptions{force: true}); err != nil {
+			return false, err
+		}
+		if _, err := h.db.ExecContext(ctx, "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(3, unixepoch())"); err != nil {
+			return false, fmt.Errorf("record history schema 3: %w", err)
+		}
+		return true, nil
+	default:
+		return false, fmt.Errorf("unsupported history database schema version %d", version)
+	}
+}
+
+func (h *historyIndexer) refreshLocked(ctx context.Context, options historyRefreshOptions) error {
+	started := time.Now()
+	indexedMtimes := make(map[string]int64)
+	if !options.force || options.reconcileDeleted {
+		var err error
+		indexedMtimes, err = h.loadIndexedMtimesLocked(ctx)
+		if err != nil {
+			return err
+		}
 	}
 	entries, err := os.ReadDir(h.jobsDir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -91,16 +137,18 @@ func (h *historyIndexer) refresh(ctx context.Context) error {
 			h.warn("history job stat failed", "path", path, "error", err)
 			continue
 		}
-		if indexed && oldMtime == info.ModTime().UnixNano() {
+		if !options.force && indexed && oldMtime == info.ModTime().UnixNano() {
 			continue
 		}
-		if err := h.indexCurrentFileLocked(ctx, path, info); err != nil {
+		if err := h.indexCurrentFileLocked(ctx, path, info, options.removeInvalid); err != nil {
 			h.warn("history job skipped", "path", path, "error", err)
 		}
 	}
-	for path := range indexedMtimes {
-		if _, err := h.db.ExecContext(ctx, "DELETE FROM history_jobs WHERE json_file=?", path); err != nil {
-			return err
+	if options.reconcileDeleted {
+		for path := range indexedMtimes {
+			if _, err := h.db.ExecContext(ctx, "DELETE FROM history_jobs WHERE json_file=?", path); err != nil {
+				return err
+			}
 		}
 	}
 	h.debug("history index refresh completed", "duration_ms", time.Since(started).Milliseconds())
@@ -150,16 +198,20 @@ func (h *historyIndexer) refreshFileLocked(ctx context.Context, path string) err
 	}
 	// An fsnotify event is authoritative even when a filesystem exposes coarse
 	// mtime resolution and two atomic replacements happen within one tick.
-	return h.indexCurrentFileLocked(ctx, path, info)
+	return h.indexCurrentFileLocked(ctx, path, info, true)
 }
 
-func (h *historyIndexer) indexCurrentFileLocked(ctx context.Context, path string, info os.FileInfo) error {
+func (h *historyIndexer) indexCurrentFileLocked(ctx context.Context, path string, info os.FileInfo, removeInvalid bool) error {
 	if !info.Mode().IsRegular() {
-		_, _ = h.db.ExecContext(ctx, "DELETE FROM history_jobs WHERE json_file=?", path)
+		if removeInvalid {
+			_, _ = h.db.ExecContext(ctx, "DELETE FROM history_jobs WHERE json_file=?", path)
+		}
 		return fmt.Errorf("job state is not a regular file")
 	}
 	if err := h.indexFile(ctx, path, filepath.Base(path), info.ModTime().UnixNano()); err != nil {
-		_, _ = h.db.ExecContext(ctx, "DELETE FROM history_jobs WHERE json_file=?", path)
+		if removeInvalid {
+			_, _ = h.db.ExecContext(ctx, "DELETE FROM history_jobs WHERE json_file=?", path)
+		}
 		return err
 	}
 	return nil
@@ -189,15 +241,54 @@ func (h *historyIndexer) indexFile(ctx context.Context, path, name string, mtime
 	if job.Action != "warn" && job.Action != "move" && job.Action != "remove" {
 		return errors.New("invalid job action")
 	}
-	_, err = h.db.ExecContext(ctx, `
+	detections, err := h.readJobDetections(job)
+	if err != nil {
+		return err
+	}
+
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err = tx.ExecContext(ctx, `
 INSERT INTO history_jobs(job_id,job_type,status,result,action,started_at,finished_at,user_id,json_file,file_mtime_ns,indexed_at)
 VALUES(?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(job_id) DO UPDATE SET
  job_type=excluded.job_type,status=excluded.status,result=excluded.result,action=excluded.action,
  started_at=excluded.started_at,finished_at=excluded.finished_at,user_id=excluded.user_id,json_file=excluded.json_file,
  file_mtime_ns=excluded.file_mtime_ns,indexed_at=excluded.indexed_at`,
-		job.JobID, job.Type, job.Status, job.Result, job.Action, job.StartedAt, job.FinishedAt, job.UserID, path, mtimeNS, time.Now().Unix())
-	return err
+		job.JobID, job.Type, job.Status, job.Result, job.Action, job.StartedAt, job.FinishedAt, job.UserID, path, mtimeNS, time.Now().Unix()); err != nil {
+		return err
+	}
+	// Replacing the child rows in the same transaction prevents stale findings
+	// when a job is atomically rewritten with a different result or log.
+	if _, err := tx.ExecContext(ctx, "DELETE FROM history_detections WHERE job_id=?", job.JobID); err != nil {
+		return err
+	}
+	for sequence, detection := range detections {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO history_detections(job_id,sequence,source_file,detection_reason) VALUES(?,?,?,?)`,
+			job.JobID, sequence, detection.SourceFile, detection.DetectionReason); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (h *historyIndexer) readJobDetections(job indexedJobDocument) ([]detectionItem, error) {
+	if job.Result != "found" || job.DetectionLog == nil {
+		return nil, nil
+	}
+	detectionPath := filepath.Clean(strings.TrimSpace(*job.DetectionLog))
+	expectedPath := filepath.Clean(filepath.Join(h.logDir, "clamav_detection_"+job.JobID+".log"))
+	if detectionPath == "." || detectionPath != expectedPath {
+		return nil, errors.New("invalid detection log path")
+	}
+	data, err := os.ReadFile(detectionPath)
+	if err != nil {
+		return nil, fmt.Errorf("read detection log: %w", err)
+	}
+	return parse_detection_log(string(data)), nil
 }
 
 type historyIndexRequest struct {

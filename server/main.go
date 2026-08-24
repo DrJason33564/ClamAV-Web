@@ -133,9 +133,16 @@ func run() error {
 		historyIntervalChanged:   make(chan struct{}, 1),
 		clamavSleepTimer:         newClamAVSleepTimerState(),
 	}
-	s.history = &historyIndexer{db: historyDB, jobsDir: cfg.JobsDir, logger: logger}
-	if err := s.history.refresh(context.Background()); err != nil {
-		s.error("history", "initial history index refresh failed", "error", err)
+	s.history = &historyIndexer{db: historyDB, jobsDir: cfg.JobsDir, logDir: cfg.LogDir, logger: logger}
+	upgraded, err := s.history.upgradeSchema(context.Background())
+	if err != nil {
+		s.error("history", "history database schema upgrade failed", "error", err)
+		return fmt.Errorf("upgrade history database: %w", err)
+	}
+	if !upgraded {
+		if err := s.history.refresh(context.Background()); err != nil {
+			s.error("history", "initial history index refresh failed", "error", err)
+		}
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

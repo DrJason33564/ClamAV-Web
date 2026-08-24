@@ -410,7 +410,19 @@ sleep/wake 均为幂等操作。
 
 ### `GET /api/browse?path=/scan`
 
-列出 `/scan` 下的文件和目录。响应包含 `path`、`parent`、`entries` 和 `roots`。路径为空时默认 `/scan`。
+列出 `/scan` 下的文件和目录。响应包含 `path`、`parent`、`entries`、`roots` 和 `target`。路径为空时默认 `/scan`。
+
+`target` 返回经过后端校验和规范化的请求目标，其中 `path` 为目标路径，`is_dir` 表示目标是否为目录。目录请求的 `target.path` 与响应 `path` 相同；文件请求的 `target.path` 为文件路径，响应 `path` 则为文件所在目录。
+
+```json
+{
+  "path": "/scan/docs",
+  "parent": "/scan",
+  "entries": [],
+  "roots": ["/scan"],
+  "target": {"path": "/scan/docs/example.dat", "is_dir": false}
+}
+```
 
 如果路径指向文件，则返回文件所在目录。目录排在文件之前；符号链接不会出现在 `entries` 中，直接请求符号链接路径会返回 `400`。
 
@@ -614,7 +626,7 @@ TimeDock 模式下，新增和删除请求中的路径都必须位于当前用�
 
 ## 10. 历史任务与 SQLite 索引
 
-服务启动时扫描一次 `/state/jobs`，运行期间监听任务 JSON 的新增、替换、修改和删除并进行单文件增量索引；`HISTORY_INDEX_REFRESH_INTERVAL` 控制周期完整刷新，作为文件事件丢失或监听不可用时的兜底。只接受包含合法 `user_id` 的 version 3 JSON，其他版本、旧文件名和无 owner ID 文件不会进入索引。
+服务启动时扫描一次 `/state/jobs`，运行期间监听任务 JSON 的新增、替换、修改和删除并进行单文件增量索引；`HISTORY_INDEX_REFRESH_INTERVAL` 控制周期完整刷新，作为文件事件丢失或监听不可用时的兜底。只接受包含合法 `user_id` 的 version 3 JSON，其他版本、旧文件名和无 owner ID 文件不会进入索引。`found` 任务的检出文件和检出原因也会写入历史索引。
 
 周期完整刷新会批量读取已索引文件的 mtime，并在内存中完成比对；mtime 未变化时不会重复解析 JSON。文件事件触发的增量索引不依赖 mtime，以免同一时间粒度内的连续原子替换被跳过。文件删除、损坏或变成非 version 3 后，相应索引会被删除。
 
@@ -741,7 +753,7 @@ lookup。
 {"job_id":"manual-1783433000"}
 ```
 
-后端先通过 SQLite 验证任务属于当前用户，再读取任务日志和检出日志：
+后端先通过 SQLite 验证任务属于当前用户；`detections` 来自历史索引，原始检出日志和任务日志仍从对应日志文件读取：
 
 ```json
 {

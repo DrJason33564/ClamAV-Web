@@ -61,11 +61,6 @@ type detectionLookupResponse struct {
 	Log        string          `json:"log"`
 }
 
-type detectionItem struct {
-	SourceFile      string `json:"source_file"`
-	DetectionReason string `json:"detection_reason"`
-}
-
 func (s *server) handleResultLookupStart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
@@ -313,18 +308,27 @@ func (s *server) handleDetectionResult(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) readDetectionResult(jobID string, userIDs ...string) (*detectionLookupResponse, error) {
+	var jsonFile string
 	if len(userIDs) > 0 {
 		userID := userIDs[0]
-		var jsonFile string
 		if err := s.historyDB.QueryRow("SELECT json_file FROM history_jobs WHERE job_id=? AND user_id=?", jobID, userID).Scan(&jsonFile); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil, nil
 			}
 			return nil, err
 		}
-		if filepath.Dir(jsonFile) != filepath.Clean(s.cfg.JobsDir) {
-			return nil, errors.New("indexed job path is outside jobs directory")
+	} else if err := s.historyDB.QueryRow("SELECT json_file FROM history_jobs WHERE job_id=?", jobID).Scan(&jsonFile); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
 		}
+		return nil, err
+	}
+	if filepath.Dir(jsonFile) != filepath.Clean(s.cfg.JobsDir) {
+		return nil, errors.New("indexed job path is outside jobs directory")
+	}
+	detections, err := s.readIndexedDetections(jobID)
+	if err != nil {
+		return nil, err
 	}
 	logText, err := s.readJobLog(jobID)
 	if err != nil {
@@ -337,20 +341,40 @@ func (s *server) readDetectionResult(jobID string, userIDs ...string) (*detectio
 		if errors.Is(err, os.ErrNotExist) {
 			return &detectionLookupResponse{
 				JobID:      jobID,
-				Detections: []detectionItem{},
+				Detections: detections,
 				Log:        logText,
 			}, nil
 		}
 		return nil, err
 	}
 	original := string(data)
-	detections := parseDetectionLog(original)
 	return &detectionLookupResponse{
 		JobID:      jobID,
 		Detections: detections,
 		Original:   original,
 		Log:        logText,
 	}, nil
+}
+
+func (s *server) readIndexedDetections(jobID string) ([]detectionItem, error) {
+	rows, err := s.historyDB.Query(`
+SELECT source_file,detection_reason
+FROM history_detections
+WHERE job_id=?
+ORDER BY sequence`, jobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	detections := make([]detectionItem, 0)
+	for rows.Next() {
+		var detection detectionItem
+		if err := rows.Scan(&detection.SourceFile, &detection.DetectionReason); err != nil {
+			return nil, err
+		}
+		detections = append(detections, detection)
+	}
+	return detections, rows.Err()
 }
 
 func (s *server) readJobLog(jobID string) (string, error) {
@@ -363,33 +387,4 @@ func (s *server) readJobLog(jobID string) (string, error) {
 		return "", err
 	}
 	return string(data), nil
-}
-
-func parseDetectionLog(content string) []detectionItem {
-	detections := make([]detectionItem, 0)
-	current := detectionItem{}
-	for _, line := range strings.Split(content, "\n") {
-		if strings.Contains(line, "Source file") {
-			if current.SourceFile != "" || current.DetectionReason != "" {
-				detections = append(detections, current)
-			}
-			current = detectionItem{SourceFile: detectionLineValue(line)}
-			continue
-		}
-		if strings.Contains(line, "Detection reason") {
-			current.DetectionReason = detectionLineValue(line)
-		}
-	}
-	if current.SourceFile != "" || current.DetectionReason != "" {
-		detections = append(detections, current)
-	}
-	return detections
-}
-
-func detectionLineValue(line string) string {
-	pos := strings.LastIndex(line, ":")
-	if pos < 0 {
-		return ""
-	}
-	return strings.TrimSpace(line[pos+1:])
 }

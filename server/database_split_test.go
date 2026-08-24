@@ -26,13 +26,19 @@ func TestUserAndHistorySchemasAreSeparated(t *testing.T) {
 			t.Fatalf("expected %s to exist only in the user database", table)
 		}
 	}
-	if !sqliteTableExists(t, historyDB, "history_jobs") || sqliteTableExists(t, userDB, "history_jobs") {
-		t.Fatal("expected history_jobs to exist only in the history database")
+	for _, table := range []string{"history_jobs", "history_detections"} {
+		if !sqliteTableExists(t, historyDB, table) || sqliteTableExists(t, userDB, table) {
+			t.Fatalf("expected %s to exist only in the history database", table)
+		}
 	}
 	// Database migration versions are independent of the version 3 job JSON schema.
 	for name, db := range map[string]*sql.DB{"user": userDB, "history": historyDB} {
 		var version int
-		if err := db.QueryRow("SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil || version != 2 {
+		wantVersion := 2
+		if name == "history" {
+			wantVersion = 3
+		}
+		if err := db.QueryRow("SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil || version != wantVersion {
 			t.Fatalf("unexpected %s database schema version: %d err=%v", name, version, err)
 		}
 	}

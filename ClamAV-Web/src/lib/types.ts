@@ -13,6 +13,7 @@ export type BrowseResponse = {
   parent?: string
   entries: BrowseEntry[]
   roots: string[]
+  target: Pick<BrowseEntry, "path" | "is_dir">
 }
 
 export type StatusSource = {

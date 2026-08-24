@@ -327,14 +327,37 @@ func templateBrowse(w http.ResponseWriter, r *http.Request) {
 	if path == "" {
 		path = "/scan"
 	}
-	entries, ok := templateBrowseTree[path]
+	targetPath := path
+	directoryPath := path
+	isDirectory := true
+	entries, ok := templateBrowseTree[directoryPath]
+	if !ok {
+		separator := strings.LastIndex(path, "/")
+		if separator > 0 {
+			directoryPath = path[:separator]
+			parentEntries, parentOK := templateBrowseTree[directoryPath]
+			if parentOK {
+				for _, entry := range parentEntries {
+					if entry["path"] == path && entry["is_dir"] == false {
+						entries = parentEntries
+						isDirectory = false
+						ok = true
+						break
+					}
+				}
+			}
+		}
+	}
 	if !ok {
 		writeTemplateJSON(w, http.StatusNotFound, map[string]any{"error": "test path not found"})
 		return
 	}
-	response := map[string]any{"path": path, "entries": entries, "roots": []string{"/scan"}}
-	if path != "/scan" {
-		response["parent"] = path[:strings.LastIndex(path, "/")]
+	response := map[string]any{
+		"path": directoryPath, "entries": entries, "roots": []string{"/scan"},
+		"target": map[string]any{"path": targetPath, "is_dir": isDirectory},
+	}
+	if directoryPath != "/scan" {
+		response["parent"] = directoryPath[:strings.LastIndex(directoryPath, "/")]
 	}
 	writeTemplateJSON(w, http.StatusOK, response)
 }
@@ -813,6 +836,19 @@ func TestTemplateAPIResponses(t *testing.T) {
 		}
 		if len(body["entries"].([]any)) != len(templateBrowseTree["/scan/documents"]) {
 			t.Fatalf("unexpected browse entries: %#v", body["entries"])
+		}
+		target := body["target"].(map[string]any)
+		if target["path"] != "/scan/documents" || target["is_dir"] != true {
+			t.Fatalf("unexpected browse target: %#v", target)
+		}
+
+		response, body = request(http.MethodGet, "/api/browse?path=/scan/documents/notes.txt")
+		if response.Code != http.StatusOK || body["path"] != "/scan/documents" {
+			t.Fatalf("unexpected file browse response: %d %#v", response.Code, body)
+		}
+		target = body["target"].(map[string]any)
+		if target["path"] != "/scan/documents/notes.txt" || target["is_dir"] != false {
+			t.Fatalf("unexpected file browse target: %#v", target)
 		}
 	})
 
