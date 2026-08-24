@@ -133,7 +133,8 @@ docker run -d \
 
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
-| `SCANNER_ADDR` | `:8080` | Web 服务监听地址。 |
+| `SCANNER_ADDR` | 空 | Web 服务监听地址；为空时监听全部 IPv4 和 IPv6 地址。IPv6 地址无需添加方括号。 |
+| `SCANNER_PORT` | `8080` | Web 服务监听端口，仅填写不带冒号的端口数字。 |
 | `ADMIN_REGISTER_TOKEN` | 无 | 首次管理员注册的必填令牌；推荐通过 Docker secret 注入。 |
 | `SCANNER_COOKIE_SECURE` | `false` | HTTPS 反向代理后设为 `true`。 |
 | `IS_TIMEDOCK` | `N` | `Y` 时启用 TimeDock 模式。 |
