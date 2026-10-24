@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,7 +11,7 @@ import (
 )
 
 type config struct {
-	Addr                string
+	ListenAddrs         []string
 	StatusFile          string
 	JobsDir             string
 	ScanLockDir         string
@@ -44,8 +45,12 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	addrs, err := parseListenAddresses(env("SCANNER_ADDR", ""), env("SCANNER_PORT", "8080"))
+	if err != nil {
+		return config{}, err
+	}
 	return config{
-		Addr:           net.JoinHostPort(env("SCANNER_ADDR", ""), env("SCANNER_PORT", "8080")),
+		ListenAddrs:    addrs,
 		StatusFile:     env("STATUS_FILE", filepath.Join(statusDir, "status.json")),
 		JobsDir:        env("JOBS_DIR", filepath.Join(statusDir, "jobs")),
 		ScanLockDir:    env("SCAN_LOCK_DIR", filepath.Join(statusDir, "scan.lock")),
@@ -92,4 +97,30 @@ func env(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// parseListenAddresses keeps wildcard binds separate from explicit IP lists.
+func parseListenAddresses(value, port string) ([]string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "any" {
+		return []string{net.JoinHostPort("", port)}, nil
+	}
+	parts := strings.Split(value, ",")
+	addrs := make([]string, 0, len(parts))
+	seen := make(map[netip.Addr]bool)
+	for _, part := range parts {
+		ip, err := netip.ParseAddr(strings.TrimSpace(part))
+		if err != nil || ip.Zone() != "" {
+			return nil, fmt.Errorf("SCANNER_ADDR contains invalid IP %q", part)
+		}
+		ip = ip.Unmap()
+		if ip.IsUnspecified() && len(parts) != 1 {
+			return nil, fmt.Errorf("SCANNER_ADDR wildcard IP must be used alone")
+		}
+		if !seen[ip] {
+			addrs = append(addrs, net.JoinHostPort(ip.String(), port))
+			seen[ip] = true
+		}
+	}
+	return addrs, nil
 }

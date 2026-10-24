@@ -94,6 +94,11 @@ HTTP 请求触发的 Argon2id 哈希与校验共享 5 个并发槽位，满载�
 取 IP 规则不可自行假设，必须遵守 [server/server_conf.md](server/server_conf.md) 中的
 `SERVER_TRUSTED_REVERSEPROXY` 定义。
 
+HTTP 监听支持通过 `SCANNER_ADDR` 指定多个 IP，所有 listener 共享同一个 HTTP Server 和
+业务实例，使用统一的认证与中间件。启动时先完成全部绑定，失败则回收已有监听；运行异常
+与退出信号均进入统一关闭流程，等待最多 5 秒，超时则强制关闭连接。错误同时写入 Go 日志
+和容器标准输出。地址格式与限制见 [服务端配置](server/server_conf.md)。
+
 HTTP Server 使用固定的连接级安全边界：请求头读取最多 10 秒、完整请求读取最多 30 秒、
 keep-alive 空闲最多 60 秒，请求头最多 64 KiB。响应写入上限为 25 分钟，特意高于 ClamAV
 唤醒流程的 21 分钟上限。这些值不是运行时配置项；直接暴露服务时由 Go 后端兜底，使用反向

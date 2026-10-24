@@ -3,9 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -190,27 +188,22 @@ func run() error {
 	mux.HandleFunc("/api/quarantine/recover/", s.handleQuarantineRecover)
 	mux.HandleFunc("/api/quarantine/clean", s.handleQuarantineClean)
 
-	httpServer := newHTTPServer(cfg.Addr, securityHeaders(s.logRequests(s.requireAuth(mux))))
-	listener, err := net.Listen("tcp", cfg.Addr)
+	reportHTTPError := func(err error) {
+		s.error("startup", "http service failed", "error", err)
+		_, _ = fmt.Fprintf(os.Stdout, "http service error: %v\n", err)
+	}
+	listeners, err := listenHTTP(cfg.ListenAddrs)
 	if err != nil {
-		s.error("startup", "http server listen failed", "address", cfg.Addr, "error", err)
+		reportHTTPError(err)
 		return err
 	}
-	// Keep the successful listen event in both the rotated application log and
-	// the container's standard output for docker logs and similar collectors.
-	s.info("startup", "clamav scanner web service listening", "address", cfg.Addr)
-	_, _ = fmt.Fprintf(os.Stdout, "clamav scanner web service listening on %s\n", cfg.Addr)
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer shutdownCancel()
-		s.info("startup", "shutdown signal received")
-		if err := httpServer.Shutdown(shutdownCtx); err != nil {
-			s.error("startup", "http server shutdown failed", "error", err)
-		}
-	}()
-	if err := httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		s.error("startup", "http server stopped unexpectedly", "error", err)
+	for _, listener := range listeners {
+		address := listener.Addr().String()
+		s.info("startup", "clamav scanner web service listening", "address", address)
+		_, _ = fmt.Fprintf(os.Stdout, "clamav scanner web service listening on %s\n", address)
+	}
+	httpServer := newHTTPServer("", securityHeaders(s.logRequests(s.requireAuth(mux))))
+	if err := serveHTTP(ctx, httpServer, listeners, 5*time.Second, reportHTTPError); err != nil {
 		return err
 	}
 	s.info("startup", "clamav scanner web service stopped")
