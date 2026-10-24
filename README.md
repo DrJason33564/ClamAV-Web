@@ -133,7 +133,7 @@ docker run -d \
 
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
-| `SCANNER_ADDR` | 空 | Web 服务监听地址；为空时监听全部 IPv4 和 IPv6 地址。IPv6 地址无需添加方括号。 |
+| `SCANNER_ADDR` | 空 | Web 服务监听地址；空值或 `any` 监听全部地址；多个 IP 用半角逗号分隔，共用同一端口。IPv6 无需方括号；不支持主机名。详见服务端配置。 |
 | `SCANNER_PORT` | `8080` | Web 服务监听端口，仅填写不带冒号的端口数字。 |
 | `ADMIN_REGISTER_TOKEN` | 无 | 首次管理员注册的必填令牌；推荐通过 Docker secret 注入。 |
 | `SCANNER_COOKIE_SECURE` | `false` | HTTPS 反向代理后设为 `true`。 |
