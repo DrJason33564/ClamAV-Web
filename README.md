@@ -15,7 +15,7 @@
 [![Go](https://img.shields.io/github/go-mod/go-version/DrJason33564/ClamAV-Web?filename=server%2Fgo.mod)](server/go.mod)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=black)](ClamAV-Web/package.json)
 
-[GitHub](https://github.com/DrJason33564/ClamAV-Web) · [Docker Hub](https://hub.docker.com/r/tinkerbell37745/clamav-timedock) · [快速开始](#-快速开始) · [开发](DEV.md) · [API](server/api.md)
+[GitHub](https://github.com/DrJason33564/ClamAV-Web) · [Docker Hub](https://hub.docker.com/r/tinkerbell37745/clamav-timedock) · [快速开始](#-快速开始) · [开发](DEV.md) · [API](doc/api.md)
 
 </div>
 
@@ -127,7 +127,7 @@ docker run -d \
 - 用户的扫描队列、规则、信任区、历史、日志、查询任务和隔离区相互隔离。admin 只拥有用户与全局服务管理权，不能查看其他用户的业务数据。
 - `move`、`remove`、清空历史与清空隔离区会修改或删除数据。建议先使用“仅告警”，并使用 EICAR 等安全测试样本验证流程。
 
-如在 HTTPS 反向代理后部署，请设置 `SCANNER_COOKIE_SECURE=true`；若需要读取真实客户端 IP，只能在可信代理前提下配置 `SERVER_TRUSTED_REVERSEPROXY`。完整语义见 [服务端配置](server/server_conf.md)。
+如在 HTTPS 反向代理后部署，请设置 `SCANNER_COOKIE_SECURE=true`；若需要读取真实客户端 IP，只能在可信代理前提下配置 `SERVER_TRUSTED_REVERSEPROXY`。完整语义见 [服务端配置](doc/config.md)。
 
 ## ⚙️ 常用配置
 
@@ -147,7 +147,7 @@ docker run -d \
 | `LOG_FILE_NUM` | `5` | Go 后端日志文件总数（包含当前文件）。 |
 | `LOG_LEVEL` | `warn` | Go 后端最低日志等级。 |
 
-服务配置保存在 `/config/clamavweb.conf`，管理 API 可调整登录限制、历史索引间隔和 ClamAV 自动休眠时间，供前端设置页接入；日志配置需手工修改并重启服务，不通过界面或 API 暴露。配置项范围、默认值及反向代理规则见 [server/server_conf.md](server/server_conf.md)。
+服务配置保存在 `/config/clamavweb.conf`，管理 API 可调整登录限制、历史索引间隔和 ClamAV 自动休眠时间，供前端设置页接入；日志配置需手工修改并重启服务，不通过界面或 API 暴露。配置项范围、默认值及反向代理规则见 [doc/config.md](doc/config.md)。
 
 ## 📖 使用要点
 
@@ -174,7 +174,7 @@ cd server
 go test ./...
 ```
 
-更完整的架构、开发流程、测试与扩展约定，请阅读 [DEV.md](DEV.md)。请求与响应详情请阅读 [server/api.md](server/api.md)。
+更完整的架构、开发流程、测试与扩展约定，请阅读 [DEV.md](DEV.md)。请求与响应详情请阅读 [doc/api.md](doc/api.md)。持久化格式见 [任务文件](doc/job_file_schema.md) 与 [历史数据库](doc/history_db_schema.md)。
 
 ## 🙏 致谢
 

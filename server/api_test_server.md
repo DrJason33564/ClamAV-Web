@@ -1,7 +1,7 @@
 # Template API Test Server
 
 `api_test_server_test.go` 提供一个仅用于前端联调的模板化 HTTP API 服务。它覆盖
-[`api.md`](api.md) 中记录的全部后端接口，但不会调用 ClamAV、扫描脚本或配置脚本，
+[API 文档](../doc/api.md) 中记录的全部后端接口，但不会调用 ClamAV、扫描脚本或配置脚本，
 也不会读写真实的扫描目录、状态目录、日志、白名单、定时规则或隔离区。
 
 > 此服务仅用于开发和测试。不要将它作为真实服务部署。

@@ -1,6 +1,8 @@
 # ClamAV TimeDock 后端 API
 
-本文档按业务模块记录 Go 后端提供的 HTTP API。服务默认监听 `:8080`。
+本文档只记录 HTTP 接口的认证、请求、响应与调用行为。服务默认监听 `:8080`。
+
+配置文件格式见 [config.md](config.md)，任务文件格式见 [job_file_schema.md](job_file_schema.md)，历史数据库表结构与索引实现见 [history_db_schema.md](history_db_schema.md)。
 
 ## 1. 通用约定
 
@@ -68,7 +70,7 @@ admin 额外拥有的权限仅包括：
 - `401`：未登录、Cookie 失效或密码错误；
 - `403`：角色权限不足或跨来源请求被拒绝；
 - `404`：资源不存在或资源不属于当前用户；
-- `409`：扫描锁、休眠状态、最后一名 admin 或用户删除冲突；
+- `409`：扫描忙碌、休眠状态、索引重建、最后一名 admin 或用户删除冲突；
 - `429`：登录请求达到单 IP/全局限制，或全局 Argon2 处理容量已满；响应包含 `Retry-After`；
 - `500`：后端、文件系统、SQLite 或外部命令失败。
 
@@ -78,8 +80,7 @@ admin 额外拥有的权限仅包括：
 
 - 用户名格式：`[A-Za-z0-9._-]{1,64}`；
 - 用户 ID 由后端生成，为同时包含小写字母和数字的 8 位 `[a-z0-9]` 字符串，不作为登录凭证；
-- 任务 JSON 的时间为 Unix 秒时间戳；
-- API 中 Go 运行时对象的时间仍可能使用 RFC3339；
+- API 时间字段按具体响应说明使用 RFC3339 或格式化日期字符串；
 - 文件浏览、手动扫描、cron 和白名单路径限制在 `/scan`；
 - 文件浏览不会返回符号链接；扫描、cron、白名单和隔离区恢复路径的任意现有层级包含符号链接时都会被拒绝。
 
@@ -95,19 +96,13 @@ admin 额外拥有的权限仅包括：
 {"first_run":"not_completed"}
 ```
 
-`WEB_FIRSTRUN_COMPLETED=2` 时返回 `completed`，其他情况返回 `not_completed`。
+首次运行已完成时返回 `completed`，尚未完成时返回 `not_completed`。
 
 ### `POST /api/first-run/complete`
 
 需要 admin。完成前必须至少存在一名状态为 `active` 的 admin。
 
-成功后原子更新 `/config/clamavweb.conf`：
-
-```text
-WEB_FIRSTRUN_COMPLETED=2
-```
-
-响应：
+成功后持久保存首次运行已完成状态。响应：
 
 ```json
 {"status":"success","first_run":"completed"}
@@ -154,7 +149,7 @@ WEB_FIRSTRUN_COMPLETED=2
 }
 ```
 
-密码使用带独立随机 salt 的 Argon2id 哈希保存，数据库不保存明文密码。
+密码不会以明文返回。
 
 ### `POST /api/auth/login`
 
@@ -174,17 +169,16 @@ WEB_FIRSTRUN_COMPLETED=2
 
 登录限制按客户端 IP 和全局十分钟窗口计数，用户名变化不会产生新的限额。所有进入处理
 流程的登录请求都会计数。达到单 IP 上限后仅该 IP 进入冷却；达到全局上限后所有登录进入
-冷却。冷却期间返回 `429` 和 `Retry-After`，且不查询数据库或执行 Argon2，其他 API 不受
-影响。
+冷却。冷却期间返回 `429` 和 `Retry-After`，其他 API 不受影响。
 
-所有由 HTTP 请求触发的 Argon2id 哈希和校验共享全局 5 个并发槽位，包括登录、注册、修改
+所有密码相关操作共享全局 5 个并发槽位，包括登录、注册、修改
 密码、删除账户和管理员设置密码。槽位满载时请求不排队，立即返回 `429` 和
-`Retry-After: 1`，且不执行新的 Argon2 运算。登录计数限流与该并发边界相互独立。
+`Retry-After: 1`，请求不会进入密码处理阶段。登录计数限流与该并发边界相互独立。
 
 默认仅使用连接的 `RemoteAddr`。设置 `SERVER_TRUSTED_REVERSEPROXY` 后，可使用英文半角
 逗号配置多个可信 IPv4/IPv6 地址；只有直接来源匹配列表中任意地址的请求才优先使用
 `X-Forwarded-For` 首项，头缺失或非法时回退到 `RemoteAddr`。完整配置语义见
-[`server_conf.md`](server_conf.md)。
+[配置说明](config.md)。
 
 ### `POST /api/auth/logout`
 
@@ -341,9 +335,9 @@ WEB_FIRSTRUN_COMPLETED=2
 }
 ```
 
-运行状态由 Go 内存生成，API 会过滤 `active_job_id`，并从 SQLite 查询当前用户自己的最近任务。不会返回其他用户任务。
+`active_job_id` 和最近任务字段仅返回当前用户可见的任务，不会返回其他用户任务。
 
-`ping` 与 `ping_message` 来自 Unix socket `PING`。clamd ready 时，后端通过 Unix socket 发送 `VERSION`，将响应解析为 `clamd_version`、`database_version` 和 `database_date`；查询或解析失败时这三个字段为空字符串。
+`ping` 与 `ping_message` 表示引擎连通性。引擎就绪时返回程序及病毒库版本；探测失败时相应版本字段为空字符串。
 
 上述实时状态由后端缓存 5 秒；`checked_at` 是当前缓存结果的探测完成时间。缓存期内的并发状态请求不会重复执行 ping 或 VERSION 查询，ClamAV 休眠或唤醒成功后缓存立即失效。
 
@@ -382,12 +376,12 @@ WEB_FIRSTRUN_COMPLETED=2
 
 历史刷新间隔允许范围为 5–86400 秒。`clamav_sleep_timer` 为 `0` 时关闭定时休眠，启用时
 必须是至少 600 的整数；空字符串不被接受。修改后立即重启对应计时器。登录限制和可信反代字段的范围、默认值及安全要求
-见 [`server_conf.md`](server_conf.md)。修改任一登录限制会清空当前登录计数与冷却状态；可信
+见 [配置说明](config.md)。修改任一登录限制会清空当前登录计数与冷却状态；可信
 反代修改立即应用。传入空字符串可取消可信反代。
 
 ### `POST /api/clamav/sleep`
 
-仅 admin。扫描锁存在时返回 `409`。成功响应：
+仅 admin。存在排队或活动扫描时返回 `409`。成功响应：
 
 ```json
 {"status":"sleeping","message":"ClamAV entered sleep mode."}
@@ -395,7 +389,7 @@ WEB_FIRSTRUN_COMPLETED=2
 
 ### `POST /api/clamav/wake`
 
-仅 admin。执行 `/startup.sh --wake`，成功响应：
+仅 admin。唤醒引擎，成功响应：
 
 ```json
 {"status":"awake","message":"ClamAV woke successfully."}
@@ -403,8 +397,7 @@ WEB_FIRSTRUN_COMPLETED=2
 
 sleep/wake 均为幂等操作。
 
-定时休眠使用同一套 sleep 逻辑。服务启动、手动扫描成功启动及手动唤醒后会开始或重置计时；
-休眠成功后暂停计时。扫描正在运行时不会强制关闭 ClamAV，定时器会在完整间隔后重试。
+自动休眠的配置与生效规则见 [配置说明](config.md#3-clamav-定时休眠)。
 
 ## 6. 文件浏览
 
@@ -456,7 +449,7 @@ sleep/wake 均为幂等操作。
 
 - `action`：`warn`、`move` 或 `remove`，默认 `warn`；
 - `wait` 只为兼容旧请求保留；
-- `LOCK_FILE` 为可选 JSON 布尔值，默认 false；true 时按目录层级、每批最多 128 个普通文件尝试非阻塞 flock，锁在 FILDES 提交完成后释放。加锁失败记录 warn 后继续；null、字符串和数字返回 400。
+- `LOCK_FILE` 为可选 JSON 布尔值，默认 `false`。为 `true` 时尝试在扫描前锁定文件，提交给引擎后释放；锁定失败会记录警告并继续扫描。`null`、字符串和数字返回 `400`。
 - owner ID 从登录 Cookie 对应的用户记录获得，客户端不能指定。
 
 TimeDock 模式下，每个 `targets` 路径都必须位于当前用户匹配到的账户目录内；直接构造请求不能绕过文件浏览器的目录限制。
@@ -472,13 +465,7 @@ ClamAV 休眠时返回 `409`，请求不会进入队列。
 
 ### 队列调度规则
 
-ClamAV 扫描全局串行。每次选择下一任务时：
-
-1. 收集当前拥有等待任务的用户；
-2. 随机选择一名用户；
-3. 执行该用户队列中的第一项。
-
-同一用户内部保持 FIFO，并可重排。该策略避免先清空某个用户的完整队列再处理其他用户。
+扫描全局串行。同一用户等待任务默认保持 FIFO，并可通过重排接口调整；跨用户不承诺先到先执行，也不暴露其他用户队列位置。调度实现见 [开发指南](../DEV.md)。
 
 ### `GET /api/scans?scope=all`
 
@@ -516,47 +503,11 @@ ClamAV 扫描全局串行。每次选择下一任务时：
 
 只能取消当前用户尚未开始的任务。
 
-### 任务文件 version 4
-
-由 Go HistoryStore 生成；旧 version 3 文件仍可读取和重建：
-
-```json
-{
-  "version": 4,
-  "job_id": "manual-1783433000000000000",
-  "type": "manual",
-  "user_id": "a1b2c3d4",
-  "status": "finished",
-  "target": "/scan/docs",
-  "action": "warn",
-  "started_at": 1783433000,
-  "finished_at": 1783433010,
-  "result": "clean"
-}
-```
-
-新任务 ID 使用 `manual-<Unix纳秒>` 或 `cron-<Unix纳秒>`，由 Go 保证进程内唯一；旧 Unix 秒 ID 及三位后缀继续支持。运行中 finished_at 为 null，重启后未完成任务记为中断失败。
-
-version 4 另含 LOCK_FILE、detections、summary（scanned、scan_errors、action_succeeded、action_failed、detections、errors）。汇总优先级为 found > error > clean：有检出同时有扫描或处置错误仍为 finished/found；无检出但有错误为 failed/error；单文件错误不终止目录中的后续扫描。完整错误和处置结果单独记录。
-
 ## 8. 定时扫描
 
-调度由 Go 内部 robfig/cron/v3 执行，使用容器 TZ。所有触发进入同一内存队列；停机期间不补跑，规则重载按实际分钟去重。日期与星期均受限时按 OR 匹配，星期日同时支持 0/7。
+规则的 HTTP 字段为 `enabled`、`minute`、`hour`、`day`、`month`、`weekday`、`target`、`action`、`wake`；后五段时间字段使用字符串表示。支持范围、步长和列表，星期日可为 `0` 或 `7`。`wake` 为布尔值，表示引擎休眠时是否主动唤醒；为 `false` 时，休眠期间触发的任务会记录失败。
 
-cron 配置实际结构：
-
-```text
-分钟 小时 日期 月份 星期 "扫描路径" action owner_user_id wake
-```
-
-例如：
-
-```text
-30 3 * * * /scan warn a1b2c3d4 N
-0 */6 * * * "/scan/Team A" move a1b2c3d4 Y
-```
-
-`wake` 只能为 `Y` 或 `N`。`Y` 表示由 Go 队列在扫描前通过 startup.sh --wake 唤醒睡眠状态的 ClamAV；`N` 表示不主动唤醒。
+规则文件的语法与调度规则见 [配置说明](config.md#9-定时扫描规则-cron_scanconf)。
 
 ### `GET /api/cron/rules`
 
@@ -578,7 +529,7 @@ cron 配置实际结构：
 }
 ```
 
-后端生成规则 ID，并强制将当前 `users.id` 写入 owner 字段。`wake` 为 `true` 时规则文件写入 `Y`，为 `false` 时写入 `N`。
+后端生成规则 ID，规则归属当前登录用户；客户端不能指定其他 owner。
 
 TimeDock 模式下，新增、完整更新和重新启用规则时都会校验 `target` 位于当前用户账户目录内。
 
@@ -598,15 +549,11 @@ TimeDock 模式下，新增、完整更新和重新启用规则时都会校验 `
 
 ### `POST /api/cron/reload`
 
-校验完整配置并热更新 robfig/cron/v3 调度器。响应只返回当前用户规则。规则文件的读写和 reload 使用进程内互斥，避免多用户并发保存导致丢失更新。
+重新加载有效的定时规则，响应只返回当前用户规则。配置非法时返回 `400`，保留此前生效的调度。
 
 ## 9. 白名单
 
-`/config/exclude.conf` 每行格式：
-
-```text
-"路径" owner_user_id
-```
+文件格式见 [配置说明](config.md#10-信任区条目-excludeconf)。
 
 ### `GET /api/whitelist`
 
@@ -618,23 +565,21 @@ TimeDock 模式下，新增、完整更新和重新启用规则时都会校验 `
 {"path":"/scan/trusted file.dat"}
 ```
 
-后端写入当前 `users.id`，然后重新生成 SHA-256 allow-list 并让 ClamAV reload。
+将条目加入当前用户信任区，并请求引擎应用更新。响应成功表示重载请求已接受，不表示已通过扫描验证新签名库生效。
 
 TimeDock 模式下，新增和删除请求中的路径都必须位于当前用户账户目录内。
 
 ### `DELETE /api/whitelist`
 
-请求体同 POST，只删除 `path + 当前用户` 匹配的行。相同路径属于其他用户时不会被删除。
+请求体同 POST，只删除 `path + 当前用户` 匹配的条目。相同路径属于其他用户时不会被删除。
 
-扫描运行或 ClamAV 休眠时不允许修改白名单。
+存在排队或活动扫描、或 ClamAV 休眠时不允许修改白名单。
 
 注意：ClamAV allow-list 对共享 clamd 实例全局生效。API 所有权隔离不能改变一个用户的信任哈希会影响所有扫描这一 clamd 固有行为。
 
-## 10. 历史任务与 SQLite 索引
+## 10. 历史任务与索引管理
 
-服务启动时扫描一次 `/state/jobs`，运行期间监听任务 JSON 的新增、替换、修改和删除并进行单文件增量索引；`HISTORY_INDEX_REFRESH_INTERVAL` 控制周期完整刷新，作为文件事件丢失或监听不可用时的兜底。只接受包含合法 `user_id` 的 version 3 JSON，其他版本、旧文件名和无 owner ID 文件不会进入索引。`found` 任务的检出文件和检出原因也会写入历史索引。
-
-周期完整刷新会批量读取已索引文件的 mtime，并在内存中完成比对；mtime 未变化时不会重复解析 JSON。文件事件触发的增量索引不依赖 mtime，以免同一时间粒度内的连续原子替换被跳过。文件删除、损坏或变成非 version 3 后，相应索引会被删除。
+任务文件格式见 [任务文件说明](job_file_schema.md)，索引存储与重建机制见 [历史数据库说明](history_db_schema.md)。除明确标注的管理员全局索引重建外，以下接口仅返回当前用户可见的历史。
 
 ### `POST /api/results/lookups?scope=1-20`
 
@@ -667,7 +612,7 @@ TimeDock 模式下，新增和删除请求中的路径都必须位于当前用�
 }
 ```
 
-列表、总数、排序和分页均由 SQLite 完成，并始终包含 `user_id` 条件。
+列表、总数、排序和分页均限定在当前用户的历史中。
 
 响应字段及可能值：
 
@@ -676,11 +621,11 @@ TimeDock 模式下，新增和删除请求中的路径都必须位于当前用�
 | `lookup_id` | string | 创建查询时生成的 `result-<随机ID>`；在该 lookup 生命周期内不变。 |
 | `status` | string | `pending`：查询尚未完成；`success`：查询成功；`failed`：查询失败。 |
 | `results` | array | `success` 时为本次分页范围内的任务数组；无匹配任务时为空数组。`pending` 或 `failed` 时可能省略。 |
-| `results[].id` | string | 任务 ID，新任务形式为 `manual-<Unix纳秒>` 或 `cron-<Unix纳秒>`；兼容旧 Unix 秒和三位序号后缀。 |
+| `results[].id` | string | 任务 ID，应作为不透明字符串传递；持久化命名规则见 [任务文件说明](job_file_schema.md)。 |
 | `results[].type` | string | `manual`：手动扫描；`cron`：定时扫描。 |
 | `results[].date` | string | 任务开始时间，格式为 `YYYYMMDDHHMMSS`，使用服务端时区。 |
 | `results[].result` | string | `unknown`：等待中或运行中；`clean`：未检出威胁；`found`：检出威胁；`error`：扫描失败。 |
-| `results[].action` | string | `warn`：仅记录；`move`：移动到隔离区；`remove`：直接删除检出文件。值来自 `history_jobs.action`。 |
+| `results[].action` | string | `warn`：仅记录；`move`：移动到隔离区；`remove`：直接删除检出文件。取值与提交扫描时的处理方式一致。 |
 | `total` | integer | 当前用户符合查询条件的历史任务总数，不受当前分页范围限制；未完成时为 `0`。 |
 | `error` | string | 仅在 `failed` 时出现，内容为查询失败原因。 |
 | `started_at` | string | lookup 创建时间，RFC3339 格式。 |
@@ -690,8 +635,7 @@ TimeDock 模式下，新增和删除请求中的路径都必须位于当前用�
 
 结果、统计和隔离区 lookup 共用当前用户最多两个 pending 查询的配额；达到上限时创建接口
 返回 `429`。每个用户最多保留 10 个 lookup，超出时淘汰最旧的非 pending 条目。查询执行
-最多 30 秒，terminal 状态保留 15 分钟；服务退出和账户删除会取消尚未结束的查询。后台
-清理器每分钟运行一次，创建新查询时也会顺带清理过期条目。
+最多 30 秒，terminal 状态保留 15 分钟；服务退出和账户删除会取消尚未结束的查询。
 
 ### `POST /api/results/statistics/lookups?scope=N`
 
@@ -749,8 +693,7 @@ lookup。
 | `started_at` | string | lookup 创建时间，RFC3339 格式。 |
 | `updated_at` | string | lookup 最近一次状态更新时间，RFC3339 格式。 |
 
-统计直接从 `history.db` 的 `history_jobs` 表读取，始终包含当前 `users.id` 条件。接口按日和
-结果在 SQLite 中聚合，不读取任务 JSON。异常结果归入 `unknown`。状态码为：等待时
+统计仅包含当前用户历史，按日和结果聚合；异常结果归入 `unknown`。状态码为：等待时
 `202`、成功时 `200`、失败时 `500`；lookup 不存在或属于其他用户时返回 `404`。
 
 ### `POST /api/results/detection`
@@ -759,7 +702,7 @@ lookup。
 {"job_id":"manual-1783433000"}
 ```
 
-后端先通过 SQLite 验证任务属于当前用户；`detections` 来自历史索引，原始检出日志和任务日志仍从对应日志文件读取：
+只返回当前用户所属任务的结构化检出、原始检出日志和扫描日志：
 
 ```json
 {
@@ -780,7 +723,7 @@ lookup。
 {"status":"success","checked":120,"updated":120,"failed":0}
 ```
 
-成功返回 200。存在损坏文件时返回 200、status=partial，failed 计数增加并保留这些文件上次有效索引；完整枚举后才清理确实缺失的索引。重复重建返回 409；普通用户返回 403；数据库错误或请求取消会回滚事务。索引重建与即时索引、周期刷新及清理串行，扫描可继续执行。
+成功返回 `200`：`checked` 为检查的任务条目数，`updated` 为成功重建数，`failed` 为无法解析的条目数。存在损坏文件时仍返回 `200`、`status=partial`，并保留这些文件此前的有效索引；缺失文件对应的索引会被清理。重复重建返回 `409`，普通用户返回 `403`，后端错误返回 `500`。重建失败不会发布部分数据库更新，扫描可继续执行。
 
 ### `POST /api/results/clean`
 
@@ -790,21 +733,15 @@ lookup。
 {"clean_all":"Y"}
 ```
 
-只删除当前用户的任务 JSON、普通日志、检出日志和 SQLite 索引。admin 也不能清理其他用户历史。
+只清理当前用户已结束任务的历史及相关日志；正在运行的任务保留。admin 也不能清理其他用户历史。
 
 ## 11. 隔离区
 
-隔离元数据格式：
-
-```text
-"原始路径" owner_user_id
-```
-
-旧单字段 `.rec` 不会被列出或自动归属。
+隔离记录的内部格式见 [配置与关联文件说明](config.md#13-隔离元数据-rec)。
 
 ### `POST /api/quarantine/lookups`
 
-创建当前用户的异步隔离区查询。隔离区不使用 `scope`，查询会分批读取目录并返回该用户的
+创建当前用户的异步隔离区查询。隔离区不使用 `scope`，返回该用户的
 完整隔离条目列表，但仍受上述共享 pending 配额、30 秒执行超时和 lookup 保留规则约束。
 
 ### `GET /api/quarantine/lookups/{lookup_id}`
@@ -823,31 +760,12 @@ lookup。
 
 ### `DELETE /api/quarantine/delete/{filename}`
 
-也接受 POST。只有 `.rec` owner ID 与当前 `users.id` 一致时才删除隔离文件和元数据。
+也接受 POST。只删除当前用户所属的隔离文件及其恢复记录。
 
 ### `POST /api/quarantine/recover/{filename}`
 
-恢复前验证 owner ID。TimeDock 模式下，元数据中的原路径还必须位于用户当前绑定的账户目录内；即使文件来自该用户此前绑定的账户目录，也不会恢复到当前授权范围之外。原路径已经存在时拒绝覆盖；跨文件系统时使用复制、保留权限、删除隔离文件的回退流程。
+恢复前验证 owner ID。TimeDock 模式下，元数据中的原路径还必须位于用户当前绑定的账户目录内；即使文件来自该用户此前绑定的账户目录，也不会恢复到当前授权范围之外。原路径已经存在时拒绝覆盖；恢复成功后移除隔离区副本和恢复记录。
 
 ### `POST /api/quarantine/clean`
 
 请求必须包含 `clean_all=Y`。只删除当前用户的隔离文件和 `.rec`，不会清空整个隔离目录。
-
-## 12. 持久化与配置文件
-
-| 路径 | 用途 |
-|---|---|
-| `/data/users.db` | 用户、密码哈希和 session |
-| `/data/history.db` | 历史任务索引 |
-| `/config/clamavweb.conf` | 服务端配置 |
-| `/config/cron_scan.conf` | 所有用户 cron 规则 |
-| `/config/exclude.conf` | 所有用户白名单条目 |
-| `/state/jobs/*.json` | version 3 任务事实文件 |
-| `/log/*.log` | 扫描和检出日志 |
-| `/quarantine/*` | 隔离文件及 owner 元数据 |
-
-`/data`、`/config`、`/state`、`/log` 和 `/quarantine` 都应持久化。`USER_DATABASE_FILE` 和 `HISTORY_DATABASE_FILE` 可分别覆盖两个数据库路径。历史索引库可以从 version 3/4 JSON 重建，但用户和 session 只能从用户库恢复。用户 ID 是其他资产的所有权依据，因此重建 `users.db` 时必须同时清理 cron、白名单、任务状态和隔离区资产。
-
-当前用户 ID 与资产格式不兼容早期的“用户名 owner / version 2 任务”开发数据。检测到旧 `users.db` 或 `history.db` schema 时服务会拒绝启动并提示重建；升级开发环境时应同时清理旧用户库、历史库、cron 规则、白名单、任务 JSON 和隔离区数据，不进行自动归属迁移。
-
-`clamavweb.conf` 的全部字段、默认值和校验规则见 [`server_conf.md`](server_conf.md)。

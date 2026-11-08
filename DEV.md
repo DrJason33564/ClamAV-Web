@@ -1,6 +1,6 @@
 # ClamAV-Web 开发指南
 
-本文面向维护者和贡献者，说明项目边界、前后端协作方式、运行链路与常用开发操作。用户部署说明请参阅 [README.md](README.md)，完整接口契约请参阅 [server/api.md](server/api.md)。
+本文面向维护者和贡献者，说明项目边界、前后端协作方式、运行链路与常用开发操作。用户部署说明请参阅 [README.md](README.md)，完整接口契约请参阅 [doc/api.md](doc/api.md)。
 
 ## 项目概览
 
@@ -48,6 +48,11 @@ flowchart LR
 ├── startup.sh                 # PID 1：初始化、启动、监控与优雅关闭
 ├── exclude.sh                 # 从 exclude.conf 生成 ClamAV 排除项
 ├── config/                    # 镜像内置的默认配置示例
+├── doc/                       # 接口、配置与持久化格式文档
+│   ├── api.md                 # HTTP API 契约
+│   ├── config.md              # 配置文件格式与运行参数
+│   ├── job_file_schema.md     # 任务文件 v3/v4 与版本跨度
+│   └── history_db_schema.md   # 历史数据库 schema v3
 ├── server/                    # Go API、认证、SQLite、队列和业务逻辑
 │   ├── main.go                # 服务装配与路由
 │   ├── auth.go / users.go     # 账户、session、登录限制与 admin 管理
@@ -59,9 +64,7 @@ flowchart LR
 │   ├── whitelist.go           # SHA-256 allow-list
 │   ├── history_*.go           # 历史索引、查询与统计
 │   ├── quarantine.go          # 隔离查询、恢复和清理
-│   ├── internal/applog/      # Go 日志等级、脱敏、并发写入与轮转
-│   ├── api.md                 # API 契约
-│   └── server_conf.md         # 运行时服务配置说明
+│   └── internal/applog/       # Go 日志等级、脱敏、并发写入与轮转
 └── ClamAV-Web/                # React 前端
     └── src/features/          # 按页面拆分的业务功能
 ```
@@ -92,13 +95,13 @@ flowchart LR
 密码使用 Argon2id 和每个密码独立 salt，当前参数每次运算约占用 19 MiB 工作内存。所有由
 HTTP 请求触发的 Argon2id 哈希与校验共享 5 个并发槽位，满载时立即返回 `429`，以将这部分
 峰值工作内存约束在 95 MiB。登录限流以客户端 IP 和全局十分钟窗口计数；可信反向代理的
-取 IP 规则不可自行假设，必须遵守 [server/server_conf.md](server/server_conf.md) 中的
+取 IP 规则不可自行假设，必须遵守 [doc/config.md](doc/config.md) 中的
 `SERVER_TRUSTED_REVERSEPROXY` 定义。
 
 HTTP 监听支持通过 `SCANNER_ADDR` 指定多个 IP，所有 listener 共享同一个 HTTP Server 和
 业务实例，使用统一的认证与中间件。启动时先完成全部绑定，失败则回收已有监听；运行异常
 与退出信号均进入统一关闭流程，等待最多 5 秒，超时则强制关闭连接。错误同时写入 Go 日志
-和容器标准输出。地址格式与限制见 [服务端配置](server/server_conf.md)。
+和容器标准输出。地址格式与限制见 [服务端配置](doc/config.md)。
 
 HTTP Server 使用固定的连接级安全边界：请求头读取最多 10 秒、完整请求读取最多 30 秒、
 keep-alive 空闲最多 60 秒，请求头最多 64 KiB。响应写入上限为 25 分钟，特意高于 ClamAV
@@ -110,6 +113,8 @@ Go 服务统一为静态资源、API 和错误响应设置 MIME 嗅探、点击�
 `style-src 'unsafe-inline'`。HSTS 不由后端发送，应由确认始终使用 HTTPS 的反向代理配置。
 
 ### 状态与持久化
+
+完整字段和版本边界分别见 [任务文件格式](doc/job_file_schema.md)、[历史数据库结构](doc/history_db_schema.md) 和 [配置文件说明](doc/config.md)。
 
 | 位置 | 所有者 | 内容 |
 | --- | --- | --- |
@@ -254,6 +259,8 @@ go test ./...
 | 文档 | 内容 |
 | --- | --- |
 | [README.md](README.md) | 产品介绍、部署与使用说明。 |
-| [server/api.md](server/api.md) | 全部 HTTP API、状态码与请求/响应示例。 |
-| [server/server_conf.md](server/server_conf.md) | `/config/clamavweb.conf` 与相关环境变量。 |
+| [doc/api.md](doc/api.md) | 全部 HTTP API、状态码与请求/响应示例。 |
+| [doc/config.md](doc/config.md) | 全部运行配置、关联文件格式和环境变量。 |
+| [doc/job_file_schema.md](doc/job_file_schema.md) | 任务文件 v3/v4、字段含义及生效跨度。 |
+| [doc/history_db_schema.md](doc/history_db_schema.md) | 历史数据库 schema v3 的表、约束与索引实现。 |
 | [server/api_test_server.md](server/api_test_server.md) | 面向运行中服务的 API 测试说明。 |
