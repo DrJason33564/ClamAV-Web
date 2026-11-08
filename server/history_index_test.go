@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -12,81 +11,7 @@ import (
 	"time"
 )
 
-func TestHistoryIndexerWatchesOnlyChangedJobFiles(t *testing.T) {
-	jobsDir := filepath.Join(t.TempDir(), "jobs")
-	if err := os.MkdirAll(jobsDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	historyDB, err := openHistoryDatabase(filepath.Join(t.TempDir(), "history.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = historyDB.Close() })
-
-	oldDebounce := historyIndexEventDebounce
-	oldRetry := historyWatchRetryInterval
-	historyIndexEventDebounce = 20 * time.Millisecond
-	historyWatchRetryInterval = 20 * time.Millisecond
-	t.Cleanup(func() {
-		historyIndexEventDebounce = oldDebounce
-		historyWatchRetryInterval = oldRetry
-	})
-
-	indexer := &historyIndexer{db: historyDB, jobsDir: jobsDir}
-	s := &server{
-		historyDB: historyDB,
-		history:   indexer,
-		appConfig: &appConfigStore{cfg: appConfig{HistoryIndexRefreshInterval: 3600}},
-	}
-
-	// This valid job exists before the watcher starts. A later event for another
-	// path must not cause an opportunistic full-directory scan.
-	unannouncedID := "cron-1783500000"
-	unannouncedPath := filepath.Join(jobsDir, unannouncedID+".json")
-	writeJobDocumentAtomically(t, unannouncedPath, indexedJobDocument{
-		Version: 3, JobID: unannouncedID, Type: "cron", Status: "finished", Result: "clean",
-		Action: "warn", StartedAt: 1783500000, UserID: testAliceUserID,
-	})
-
-	ctx, cancel := context.WithCancel(t.Context())
-	t.Cleanup(cancel)
-	go s.runHistoryIndexer(ctx)
-
-	// Give the watcher a chance to attach, then repeat the atomic publication
-	// while polling. Repetition avoids depending on scheduler timing in the test.
-	time.Sleep(50 * time.Millisecond)
-	jobID := "cron-1783500001"
-	jobPath := filepath.Join(jobsDir, jobID+".json")
-	waitForHistoryState(t, historyDB, jobID, "running", func() {
-		writeJobDocumentAtomically(t, jobPath, indexedJobDocument{
-			Version: 3, JobID: jobID, Type: "cron", Status: "running", Result: "unknown",
-			Action: "move", StartedAt: 1783500001, UserID: testAliceUserID,
-		})
-	})
-
-	var unannouncedCount int
-	if err := historyDB.QueryRow("SELECT COUNT(*) FROM history_jobs WHERE job_id=?", unannouncedID).Scan(&unannouncedCount); err != nil {
-		t.Fatal(err)
-	}
-	if unannouncedCount != 0 {
-		t.Fatalf("event refresh unexpectedly scanned unrelated job file; count=%d", unannouncedCount)
-	}
-
-	finishedAt := int64(1783500010)
-	waitForHistoryState(t, historyDB, jobID, "finished", func() {
-		writeJobDocumentAtomically(t, jobPath, indexedJobDocument{
-			Version: 3, JobID: jobID, Type: "cron", Status: "finished", Result: "found",
-			Action: "move", StartedAt: 1783500001, FinishedAt: &finishedAt, UserID: testAliceUserID,
-		})
-	})
-
-	if err := os.Remove(jobPath); err != nil {
-		t.Fatal(err)
-	}
-	waitForHistoryDeletion(t, historyDB, jobID)
-}
-
-func TestHistoryEventRefreshDoesNotTrustUnchangedMtime(t *testing.T) {
+func TestExplicitRefreshDoesNotTrustUnchangedMtime(t *testing.T) {
 	jobsDir := t.TempDir()
 	historyDB, err := openHistoryDatabase(filepath.Join(t.TempDir(), "history.db"))
 	if err != nil {
@@ -127,22 +52,6 @@ func TestHistoryEventRefreshDoesNotTrustUnchangedMtime(t *testing.T) {
 	}
 	if status != "finished" {
 		t.Fatalf("event refresh skipped an atomic replacement with unchanged mtime; status=%q", status)
-	}
-}
-
-func TestHistoryWatchRetryDelayUsesCappedExponentialBackoff(t *testing.T) {
-	want := []time.Duration{
-		5 * time.Second,
-		10 * time.Second,
-		20 * time.Second,
-		40 * time.Second,
-		60 * time.Second,
-		60 * time.Second,
-	}
-	for i, wantDelay := range want {
-		if got := historyWatchRetryDelay(i + 1); got != wantDelay {
-			t.Fatalf("attempt %d: expected retry delay %s, got %s", i+1, wantDelay, got)
-		}
 	}
 }
 
@@ -343,34 +252,6 @@ func TestHistorySchema2UpgradeBackfillsWithoutDeletingJobs(t *testing.T) {
 	}
 	if err := historyDB.QueryRow("SELECT COUNT(*) FROM history_detections WHERE job_id=? AND source_file='/scan/backfill.txt' AND detection_reason='Backfill-Signature'", jobID).Scan(&detectionCount); err != nil || detectionCount != 1 {
 		t.Fatalf("schema upgrade did not backfill detection: count=%d err=%v", detectionCount, err)
-	}
-}
-
-func TestHistoryWatcherStopsAfterRetryLimit(t *testing.T) {
-	oldRetry := historyWatchRetryInterval
-	oldMaxRetry := historyWatchMaxRetryInterval
-	oldMaxCount := historyWatchMaxConsecutiveRetryCount
-	historyWatchRetryInterval = time.Millisecond
-	historyWatchMaxRetryInterval = 2 * time.Millisecond
-	historyWatchMaxConsecutiveRetryCount = 3
-	t.Cleanup(func() {
-		historyWatchRetryInterval = oldRetry
-		historyWatchMaxRetryInterval = oldMaxRetry
-		historyWatchMaxConsecutiveRetryCount = oldMaxCount
-	})
-
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-	defer cancel()
-	done := make(chan struct{})
-	missingJobsDir := filepath.Join(t.TempDir(), "missing")
-	go func() {
-		watchHistoryJobFiles(ctx, missingJobsDir, make(chan historyIndexRequest, 1), nil)
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-ctx.Done():
-		t.Fatal("history watcher did not stop after reaching its retry limit")
 	}
 }
 

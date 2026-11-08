@@ -4,13 +4,13 @@
 
 ## 项目概览
 
-ClamAV-Web 是一个单镜像应用：上游 `clamav/clamav:stable_base-debian` 提供扫描引擎与病毒库更新，项目在其上增加 shell 编排、Go Web API、React 管理界面和 cron 调度。
+ClamAV-Web 是一个单镜像应用：上游 `clamav/clamav:stable_base-debian` 提供扫描引擎与病毒库更新，项目在其上增加 shell 编排、Go Web API、React 管理界面和 Go 定时调度。
 
 | 层 | 技术与职责 |
 | --- | --- |
-| 容器与编排 | Docker 多阶段构建；`startup.sh` 同时监管 ClamAV、cron 和 Go 服务。 |
-| 扫描执行 | POSIX shell 调用 `clamdscan`，写入任务状态、日志、锁和隔离结果。 |
-| 后端 | Go 1.25、标准库 `net/http`、SQLite（`modernc.org/sqlite`）、fsnotify、Argon2id。 |
+| 容器与编排 | Docker 多阶段构建；`startup.sh` 监管 ClamAV 和 Go 服务。 |
+| 扫描执行 | Go 遍历目录，通过 Unix socket / FILDES 扫描，统一生成任务结果、日志和隔离记录。 |
+| 后端 | Go 1.25、标准库 `net/http`、SQLite（`modernc.org/sqlite`）、robfig/cron/v3、Argon2id。 |
 | 前端 | React 19、TypeScript、Vite 8、Tailwind CSS 4、Base UI / shadcn 风格组件。 |
 | 持久化 | 文件系统中的配置、状态、日志与隔离文件；SQLite 保存用户、session 与历史索引。 |
 
@@ -24,22 +24,21 @@ flowchart LR
   W --> H[(history.db)]
   W --> C[/config\ncron / allow-list / app config/]
   W --> Q[内存扫描队列]
-  Q --> S[scan_once.sh]
-  R[cron] --> S
-  S --> D[clamdscan → clamd]
-  S --> T[/state/jobs + status.json/]
-  T -->|fsnotify 增量通知| W
-  S --> L[/log/]
-  W -->|structured backend log| L
-  S --> Z[/quarantine/]
+  R[robfig/cron] --> Q
+  Q --> S[Go ScanExecutor]
+  S --> D[Unix socket / FILDES → clamd]
+  S --> T[HistoryStore → /state/jobs]
+  T --> H
+  S --> L[Go 日志管理器 → /log]
+  S --> Z[Go 文件处置 → /quarantine]
 ```
 
 关键约束：
 
-- 手动扫描经 Go 的内存队列串行执行；cron 任务也通过扫描锁与它协调。重启后等待中的内存任务不会恢复。
+- 手动和定时扫描经同一个 Go 内存队列串行执行；引擎休眠、扫描及白名单更新使用进程内同步。重启后等待中的内存任务不会恢复。
 - 前后端只允许访问 `/scan`。浏览 API 隐藏符号链接，所有接收文件路径的业务 API 都拒绝包含符号链接的路径；`IS_TIMEDOCK=Y` 时还会按登录用户的 `timedock_account` 追加目录限制。
 - 业务资源按不可变的 `users.id` 隔离，用户名只用于登录、显示和日志。admin 不是“全局数据查看者”，只额外拥有用户管理、服务配置和 ClamAV 全局控制权限。
-- 正在扫描时，白名单变更、部分清理与账户删除会受锁或状态约束，避免破坏运行中的任务。
+- 正在扫描时，白名单变更、部分清理与账户删除会受内存状态约束，避免破坏运行中的任务。
 
 ## 目录导览
 
@@ -47,14 +46,16 @@ flowchart LR
 .
 ├── Dockerfile                 # 前端构建 → Go 编译 → ClamAV 运行镜像
 ├── startup.sh                 # PID 1：初始化、启动、监控与优雅关闭
-├── scan_once.sh               # 单次扫描、任务文件、日志、检出处理
-├── cron.sh / config.sh        # cron 规则生成、加载与校验
 ├── exclude.sh                 # 从 exclude.conf 生成 ClamAV 排除项
 ├── config/                    # 镜像内置的默认配置示例
 ├── server/                    # Go API、认证、SQLite、队列和业务逻辑
 │   ├── main.go                # 服务装配与路由
 │   ├── auth.go / users.go     # 账户、session、登录限制与 admin 管理
-│   ├── scans.go / cron.go     # 手动队列与定时规则
+│   ├── scans.go / cron*.go    # 统一队列、定时规则与 robfig/cron 调度
+│   ├── scan_executor.go       # 遍历、文件锁、扫描与格式化事件
+│   ├── clamd_client.go        # socket 协议与文件描述符传递
+│   ├── history_store.go       # 任务结果生成、增量索引及全量重建
+│   ├── scan_actions.go        # 隔离、失败清理与回滚
 │   ├── whitelist.go           # SHA-256 allow-list
 │   ├── history_*.go           # 历史索引、查询与统计
 │   ├── quarantine.go          # 隔离查询、恢复和清理
@@ -71,11 +72,11 @@ flowchart LR
 
 1. Docker 前端阶段在 `ClamAV-Web/` 执行 `npm ci && npm run build`。
 2. Go 阶段复制 `server/*.go`、`server/internal/` 和前端 `dist/`，以静态链接方式编译 `/server`。
-3. 运行阶段的 `startup.sh` 创建持久化目录和缺失配置，校验 cron，生成排除规则。
+3. 运行阶段的 `startup.sh` 创建持久化目录和缺失配置，生成排除规则。
 4. `startup.sh` 启动上游 `/init`，等待 `clamd` 可 ping。
-5. 就绪后重载 cron、以后台进程启动 cron 与 Go 服务；任一受监管服务意外退出，容器结束。
+5. 就绪后启动 Go 服务，由其校验规则并启动内存调度器；Go 服务退出时容器结束。
 
-`/startup.sh --wake` 是管理员唤醒 ClamAV 时使用的专用路径：它只重启/确认 ClamAV 并清除休眠锁，不会重复启动 Web 服务或 cron。
+`/startup.sh --wake` 是管理员唤醒 ClamAV 时使用的专用路径：它只重启/确认 ClamAV 并清除休眠锁，不会重复启动 Web 服务或调度器。
 
 ## 后端设计
 
@@ -114,42 +115,38 @@ Go 服务统一为静态资源、API 和错误响应设置 MIME 嗅探、点击�
 | --- | --- | --- |
 | `/data/users.db` | Go | users、密码哈希、sessions。 |
 | `/data/history.db` | Go | 由任务 JSON 增量更新、并可周期重建的历史索引。 |
-| `/state/jobs/*.json` | shell | 每次扫描的版本化任务状态。 |
-| `/state/status.json` | shell | ClamAV 与最近扫描状态。 |
-| `/config/cron_scan.conf` | Go + shell | 带元数据的定时扫描规则。 |
+| `/state/jobs/*.json` | Go HistoryStore | 每次扫描的 version 4 任务结果，兼容读取 version 3。 |
+| `/config/cron_scan.conf` | Go | 带元数据的定时扫描规则。 |
 | `/config/exclude.conf` | Go + shell | 信任区相关的文件哈希与规则来源。 |
 | `/config/clamavweb.conf` | Go | 服务配置；日志三项只在启动时读取，其他管理项支持 API 更新。 |
 | `/log/clamavweb.log*` | Go | 结构化后端日志及按大小轮转的历史文件。 |
-| `/log` 其余文件、`/quarantine` | shell | 启动/扫描/检出日志与隔离文件。 |
+| `/log` 扫描与检出日志、`/quarantine` | Go | 扫描记录、检出记录与隔离文件；启动和白名单脚本仍使用 log.sh。 |
 
-不要绕过 API 直接修改这些文件，除非同时理解对应的锁、格式校验和重载流程。例如，cron 文件必须经 `cron.sh reload` 校验并生成 `/etc/cron.d/clamav-scheduled-scan`。
+配置和隔离文件仍使用必要的安全发布与回滚。运行状态由 Go 内存管理，不依赖 status.json、scan.lock 或 sleep.lock；startup.sh 仅清理旧休眠标记以兼容已有数据目录。
+
+### 扫描与结果
+
+ScanExecutor 通过 FILDES 逐文件扫描，目标目录按层遍历。LOCK_FILE 默认关闭；开启后，按最多 128 个直属文件一批尝试非阻塞独占 flock，文件提交后显式解锁。锁失败只记录 warn，不改变扫描结果。它是协作式锁，不阻止忽略锁的外部进程修改文件。
+
+任务汇总顺序为 found > error > clean。单文件错误会记录后继续扫描其他文件；任何有效检出都保留为 found，包括隔离/删除失败及同时有扫描错误的情况。扫描错误数、处置失败数和结构化检出保存在任务 JSON 中。断连、超时、空响应、截断记录、daemon ERROR 和非法响应均记录明确错误日志，不能被当作 clean。
 
 ### 历史索引同步
 
-服务启动时会完整扫描一次 `/state/jobs/*.json`。运行期间，Go 后端通过 fsnotify 监听任务目录，对新增、替换、修改或删除的 JSON 文件进行去抖后的单文件索引，因此 shell 和 cron 创建的任务无需等待下一次周期刷新。
+HistoryStore 独占任务结果文件生成与索引写入；文件读写、清理和索引共享进程内同步。完成文件写入后主动刷新单任务索引，不使用 fsnotify。version 4 任务文件内含结构化检出，重建不依赖日志保留周期；version 3 文件继续支持旧检出日志解析。
 
-`HISTORY_INDEX_REFRESH_INTERVAL` 仍控制周期完整刷新，作为丢失文件事件或监听不可用时的可靠性兜底。完整刷新会一次性加载数据库内全部文件 mtime，在内存中与目录内容比对；mtime 未变化的 JSON 不会重新解析，数据库中不再存在的文件会被清除。
+HISTORY_INDEX_REFRESH_INTERVAL 控制周期完整目录检查，只重读 mtime 变化的文件。管理 API 更改间隔后通过 channel 重置 timer。管理员 POST /api/results/index 会忽略 mtime 强制解析所有任务，在一个事务中重建全部用户索引；损坏文件保留上次有效索引并记录 warn，数据库失败或取消则回滚。启动时将遗留 waiting/running 任务标记为中断失败，不恢复扫描。
 
-管理 API 更新该间隔后会通过容量为一的通知 channel 唤醒索引循环；索引循环停止并排空旧
-timer 后按最新配置重新计时。连续快速修改会合并通知，但每次处理都读取最后一次成功持久化
-的值。
+### Go 定时调度与休眠
 
-监听初始化失败时按 5、10、20、40、60 秒阶梯退避，达到 60 秒后保持该间隔；每次失败都会写入完整错误、次数与下次等待时间。连续失败 10 次会停止监听、写入 error，并继续使用周期完整刷新。运行中的 watcher 每次报错也会写入 warn 并请求完整刷新，但重复刷新请求会合并，最多每 60 秒执行一次；正常的单文件事件不受该限流影响。
+使用 github.com/robfig/cron/v3 的五段解析器，采用容器 TZ / time.Local，兼容星期日 0/7、数字范围、步长和列表。日期与星期均受限时按 OR 匹配；不存在的夏令时分钟跳过，重复的实际分钟分别触发。停机期间不补跑。规则保存或 reload 后替换调度器快照，过期回调会重新校验规则；同一规则按实际分钟去重。
 
-### ClamAV 定时休眠
+所有触发进入统一队列，保持用户内 FIFO、用户间随机选择，不跳过重叠触发。定时任务 wake=true 时仍调用 startup.sh --wake；wake=false 且引擎休眠时生成失败历史。SCAN_WAIT_MAX_SECONDS 限制定时任务排队等待，0 为无限；旧 SCAN_WAIT_INTERVAL 不再使用。
 
-`sleep_wake.go` 独占自动休眠 timer。服务启动、配置变更、手动唤醒和每个手动扫描子进程成功
-启动时，只通过容量为一的通知 channel 请求重置；业务 goroutine 不直接操作 timer。调度器
-同时维护同步递增的 generation，到期并获得 `clamavPowerMu` 后再次核对 generation，避免旧
-到期事件关闭刚开始扫描的 clamd。
-
-到期休眠复用 `sleepClamAV`，因此仍受跨进程扫描锁保护。内存手动队列中存在等待或运行任务
-时也会延后休眠。成功休眠后 timer 暂停；扫描冲突或临时错误按完整配置间隔重新计时。
-`CLAMAV_SLEEP_TIMER=0` 表示关闭；管理 API 使用数值 `0` 表达相同状态，不接受空字符串。
+自动休眠 timer 的 generation 机制保留；手动和定时任务开始、完成、唤醒及配置更新都会请求重置。有等待或活动任务时拒绝休眠。白名单仍由 exclude.sh 生成，通过统一 socket 客户端请求 clamd 重载。
 
 ### 后端日志
 
-`server/internal/applog` 基于标准库 `log/slog`，是 Go 后端唯一的文件日志入口。业务模块只提交等级、消息和结构化
+`server/internal/applog` 基于标准库 `log/slog`，是 Go 后端和扫描记录的统一文件日志入口。任务扫描与检出记录通过 RecordLog 保留时间戳与可读格式，独立于后端 LOG_LEVEL，复用轮转及并发写入。业务模块只提交等级、消息和结构化
 字段；日志包统一负责过滤、单行转义、敏感字段兜底识别和轮转。明确的敏感值必须通过
 `applog.Secret(key, value)` 标记，业务代码不得自行拼接掩码。日志包仍会按字段名二次检查，
 防止普通键值调用意外泄漏密码、token、Cookie、Authorization 或 secret。
@@ -184,7 +181,7 @@ timer 后按最新配置重新计时。连续快速修改会合并通知，但�
 - Docker（建议用于完整扫描链路）；
 - Go **1.25+**；
 - Node.js 与 npm（锁定依赖使用 npm）；
-- 运行后端时可用的 ClamAV、cron、脚本及对应目录结构。
+- 运行后端时可用的 ClamAV、保留脚本及对应目录结构。
 
 ### 前端
 
@@ -214,7 +211,7 @@ npm run build
 
 ### 后端与完整环境
 
-后端依赖容器内的默认路径（如 `/scan_once.sh`、`/state`、`/config` 和 `clamd`），因此最可靠的端到端环境是完整 Docker 镜像：
+后端依赖容器内的默认路径（如 `/state`、`/config`、`/tmp/clamd.sock` 和 `clamd`），因此最可靠的端到端环境是完整 Docker 镜像：
 
 ```sh
 docker build -t clamav-web:dev .
@@ -246,8 +243,8 @@ go test ./...
 
 - 保持 API 的用户隔离：新资源必须绑定当前 `actor.ID`，用户名只用于显示和日志；跨用户访问最好返回 `404`，不要泄露资源存在性。
 - 路径输入必须使用现有安全路径校验，不能自行拼接 `/scan` 字符串。
-- 扫描和白名单操作必须尊重锁；不要引入绕过串行调度的直接扫描路径。
-- cron 规则需要兼容带空格的目标路径、owner 与 `wake` 标志。不要直接手写 `/etc/cron.d`。
+- 扫描和白名单操作必须遵守统一队列与引擎互斥；不要引入绕过串行调度的直接扫描路径。
+- cron 规则需要兼容带空格的目标路径、owner 与 `wake` 标志。由 Go 校验并热更新调度，不生成 `/etc/cron.d`。
 - SQLite 结构或数据迁移应保持幂等，并兼顾已存在的持久化数据库。
 - 生产资源由 Go `embed` 提供。只修改 React 源码而不构建前端，最终镜像不会得到更新。
 - Dockerfile 会复制 `server/*.go` 和 `server/internal/`；新增其他后端子包或非 Go 运行资源时，应同步审查 COPY 规则。

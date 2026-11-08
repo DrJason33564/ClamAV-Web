@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -27,7 +28,17 @@ const (
 )
 
 type server struct {
-	cfg                      config
+	cfg config
+	// mu owns queue reservations and engine sleep state; powerMu gates transitions.
+	engineSleeping           bool
+	scanCtx                  context.Context
+	scanWG                   sync.WaitGroup
+	indexRebuilding          atomic.Bool
+	quarantineFilesMu        sync.Mutex
+	cronMu                   sync.RWMutex
+	cronRules                []cronRule
+	cronLastMinute           map[string]int64
+	cronChanged              chan struct{}
 	mu                       sync.RWMutex
 	activeBatchID            string
 	queuedBatchIDs           []string
@@ -137,6 +148,9 @@ func run() error {
 		s.error("history", "history database schema upgrade failed", "error", err)
 		return fmt.Errorf("upgrade history database: %w", err)
 	}
+	if err := s.history.recoverInterrupted(context.Background()); err != nil {
+		return fmt.Errorf("recover interrupted scans: %w", err)
+	}
 	if !upgraded {
 		if err := s.history.refresh(context.Background()); err != nil {
 			s.error("history", "initial history index refresh failed", "error", err)
@@ -144,9 +158,21 @@ func run() error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	s.scanCtx = ctx
+	defer func() { cancel(); s.clamavPowerMu.Lock(); s.clamavPowerMu.Unlock(); s.scanWG.Wait() }()
+	s.cronChanged = make(chan struct{}, 1)
+	s.configFileMu.Lock()
+	_, cronErr := s.reloadCron()
+	s.configFileMu.Unlock()
+	if cronErr != nil {
+		return fmt.Errorf("load cron rules: %w", cronErr)
+	}
+	s.scanWG.Add(1)
+	go func() { defer s.scanWG.Done(); s.runCronScheduler(ctx) }()
 	s.lookupRuntime = newLookupRuntime(ctx)
 	defer s.lookupRuntime.stopAndWait()
-	go s.runHistoryIndexer(ctx)
+	s.scanWG.Add(1)
+	go func() { defer s.scanWG.Done(); s.runHistoryIndexer(ctx) }()
 	go s.runSessionJanitor(ctx)
 	go s.loginLimiter.runJanitor(ctx)
 	go s.runClamAVSleepTimer(ctx)
@@ -182,6 +208,7 @@ func run() error {
 	mux.HandleFunc("/api/results/statistics/lookups/", s.handleHistoryStatisticsLookup)
 	mux.HandleFunc("/api/results/detection", s.handleDetectionResult)
 	mux.HandleFunc("/api/results/clean", s.handleResultsClean)
+	mux.Handle("/api/results/index", s.adminOnly(http.HandlerFunc(s.handleResultsIndex)))
 	mux.HandleFunc("/api/quarantine/lookups", s.handleQuarantineLookupStart)
 	mux.HandleFunc("/api/quarantine/lookups/", s.handleQuarantineLookup)
 	mux.HandleFunc("/api/quarantine/delete/", s.handleQuarantineDelete)

@@ -1,15 +1,14 @@
 package main
 
 import (
-	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -171,7 +170,7 @@ func (s *server) handleCronReload(w http.ResponseWriter, r *http.Request) {
 	}
 	s.configFileMu.Lock()
 	defer s.configFileMu.Unlock()
-	message, err := s.runCronScript("reload")
+	message, err := s.reloadCron()
 	if err != nil {
 		s.error("cron", "cron reload failed", "error", err)
 		writeError(w, http.StatusBadRequest, err)
@@ -220,7 +219,11 @@ func (s *server) readCronRules(userIDs ...string) ([]cronRule, error) {
 }
 
 func (s *server) readCronConfigDoc() (cronConfigDoc, error) {
-	data, err := os.ReadFile(s.cfg.CronConfigFile)
+	return readCronConfigDoc(s.cfg.CronConfigFile)
+}
+
+func readCronConfigDoc(path string) (cronConfigDoc, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return cronConfigDoc{}, nil
@@ -237,6 +240,19 @@ func (s *server) readCronConfigDoc() (cronConfigDoc, error) {
 	doc := cronConfigDoc{Lines: lines}
 	for i := 0; i < len(lines); i++ {
 		if !strings.HasPrefix(lines[i], cronRuleMetaPrefix) {
+			text := strings.TrimSpace(lines[i])
+			if text == "" || strings.HasPrefix(text, "#") {
+				continue
+			}
+			rule, err := parseCronRuleLine(text)
+			if err != nil {
+				return doc, fmt.Errorf("invalid cron rule at line %d: %w", i+1, err)
+			}
+			hash := sha256.Sum256([]byte(fmt.Sprintf("%d:%s", i, text)))
+			rule.ID = fmt.Sprintf("%x", hash[:8])
+			rule.Enabled = true
+			rule.Line = i + 1
+			doc.Blocks = append(doc.Blocks, cronRuleBlock{MetaIndex: -1, RuleIndex: i, Rule: rule})
 			continue
 		}
 		if i+1 >= len(lines) {
@@ -264,6 +280,38 @@ func (s *server) readCronConfigDoc() (cronConfigDoc, error) {
 		})
 		i++
 	}
+	seen := map[string]bool{}
+	for _, block := range doc.Blocks {
+		if seen[block.Rule.ID] {
+			return doc, fmt.Errorf("duplicate cron rule id %s", block.Rule.ID)
+		}
+		seen[block.Rule.ID] = true
+	}
+	// Normalize metadata-free legacy rows in memory, so edits can disable or
+	// delete them without losing their owner/ID. A later save persists metadata.
+	var normalized []string
+	metaAt, ruleAt := map[int]int{}, map[int]int{}
+	original := append([]cronRuleBlock(nil), doc.Blocks...)
+	for i, block := range original {
+		ruleAt[block.RuleIndex] = i
+		if block.MetaIndex >= 0 {
+			metaAt[block.MetaIndex] = i
+		}
+	}
+	for i, line := range doc.Lines {
+		if j, ok := metaAt[i]; ok {
+			doc.Blocks[j].MetaIndex = len(normalized)
+		}
+		if j, ok := ruleAt[i]; ok {
+			if original[j].MetaIndex < 0 {
+				doc.Blocks[j].MetaIndex = len(normalized)
+				normalized = append(normalized, cronMetaLine(original[j].Rule))
+			}
+			doc.Blocks[j].RuleIndex = len(normalized)
+		}
+		normalized = append(normalized, line)
+	}
+	doc.Lines = normalized
 	return doc, nil
 }
 
@@ -336,6 +384,12 @@ func parseCronRuleLine(line string) (cronRule, error) {
 	}
 	if !validUserID(rule.UserID) {
 		return cronRule{}, errors.New("invalid rule owner user ID")
+	}
+	if err := validateCronRuleFields(rule); err != nil {
+		return cronRule{}, err
+	}
+	if !filepath.IsAbs(rule.Target) || strings.ContainsAny(rule.Target, "\x00\r\n") {
+		return cronRule{}, errors.New("invalid cron target")
 	}
 	return rule, nil
 }
@@ -413,7 +467,9 @@ func (s *server) updateCronRule(id string, req cronRule, actors ...actor) ([]cro
 	}
 	rule.ID = id
 	rule.UserID = userID
-	doc.Lines[block.MetaIndex] = cronMetaLine(rule)
+	if block.MetaIndex >= 0 {
+		doc.Lines[block.MetaIndex] = cronMetaLine(rule)
+	}
 	doc.Lines[block.RuleIndex] = cronConfigLine(rule)
 	return s.saveCronConfigDoc(doc, userID)
 }
@@ -435,7 +491,9 @@ func (s *server) setCronRuleEnabled(id string, enabled bool, actors ...actor) ([
 		}
 	}
 	rule.Enabled = enabled
-	doc.Lines[block.MetaIndex] = cronMetaLine(rule)
+	if block.MetaIndex >= 0 {
+		doc.Lines[block.MetaIndex] = cronMetaLine(rule)
+	}
 	doc.Lines[block.RuleIndex] = cronConfigLine(rule)
 	return s.saveCronConfigDoc(doc, userID)
 }
@@ -449,7 +507,11 @@ func (s *server) deleteCronRule(id string, userIDs ...string) ([]cronRule, strin
 	if err != nil {
 		return nil, "", err
 	}
-	doc.Lines = append(doc.Lines[:block.MetaIndex], doc.Lines[block.RuleIndex+1:]...)
+	start := block.MetaIndex
+	if start < 0 {
+		start = block.RuleIndex
+	}
+	doc.Lines = append(doc.Lines[:start], doc.Lines[block.RuleIndex+1:]...)
 	return s.saveCronConfigDoc(doc, userID)
 }
 
@@ -502,7 +564,7 @@ func (s *server) prepareCronRule(req cronRule, actors ...actor) (cronRule, error
 	if _, err := os.Stat(target); err != nil {
 		return cronRule{}, err
 	}
-	if strings.Contains(target, "\"") {
+	if strings.ContainsAny(target, "\"\r\n") {
 		return cronRule{}, errors.New("Invalid crontab rule at: target")
 	}
 	rule.Target = target
@@ -529,7 +591,7 @@ func validateCronRuleFields(rule cronRule) error {
 	}
 	switch rule.Action {
 	case "warn", "move", "remove":
-		return nil
+		return validateCronSchedule(rule)
 	default:
 		return errors.New("Invalid crontab rule at: action")
 	}
@@ -615,7 +677,7 @@ func (s *server) saveCronConfigDoc(doc cronConfigDoc, userIDs ...string) ([]cron
 		return nil, "", err
 	}
 
-	if _, err := s.runCronScript("validate", tmpPath); err != nil {
+	if _, err := readCronConfigDoc(tmpPath); err != nil {
 		return nil, "", err
 	}
 	if err := os.Rename(tmpPath, s.cfg.CronConfigFile); err != nil {
@@ -623,7 +685,7 @@ func (s *server) saveCronConfigDoc(doc cronConfigDoc, userIDs ...string) ([]cron
 	}
 	cleanup = false
 
-	message, err := s.runCronScript("reload")
+	message, err := s.reloadCron()
 	if err != nil {
 		return nil, "", err
 	}
@@ -634,49 +696,23 @@ func (s *server) saveCronConfigDoc(doc cronConfigDoc, userIDs ...string) ([]cron
 	return rules, message, nil
 }
 
-func (s *server) runCronScript(args ...string) (string, error) {
-	started := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, s.cfg.CronScript, args...)
-	out, err := cmd.CombinedOutput()
-	message := cronScriptMessage(string(out))
-	if ctx.Err() == context.DeadlineExceeded {
-		s.error("cron", "cron command timed out", "args", strings.Join(args, " "), "duration_ms", time.Since(started).Milliseconds())
-		return message, errors.New("cron command timed out")
-	}
+// Caller holds configFileMu. Replace the scheduler snapshot only after the
+// entire rule file validates, leaving the previous schedule on any error.
+func (s *server) reloadCron() (string, error) {
+	rules, err := s.readCronRules()
 	if err != nil {
-		if message == "" {
-			message = err.Error()
-		}
-		s.error("cron", "cron command failed", "args", strings.Join(args, " "), "duration_ms", time.Since(started).Milliseconds(), "error", err)
-		return message, errors.New(message)
+		return "", err
 	}
-	s.debug("cron", "cron command completed", "args", strings.Join(args, " "), "duration_ms", time.Since(started).Milliseconds())
-	if len(args) > 0 && args[0] == "validate" && !strings.HasPrefix(message, "Cron config is valid") {
-		return message, errors.New(message)
-	}
-	return message, nil
-}
-
-func cronScriptMessage(output string) string {
-	lines := strings.Split(strings.TrimSpace(output), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "Invalid") {
-			return line
-		}
-		if strings.HasPrefix(line, "Cron config is valid") {
-			return line
-		}
-		if strings.HasPrefix(line, "Cron rules reloaded") {
-			return line
+	s.cronMu.Lock()
+	s.cronRules = rules
+	s.cronMu.Unlock()
+	if s.cronChanged != nil {
+		select {
+		case s.cronChanged <- struct{}{}:
+		default:
 		}
 	}
-	if len(lines) == 0 {
-		return ""
-	}
-	return strings.TrimSpace(lines[len(lines)-1])
+	return fmt.Sprintf("Cron rules reloaded: %d rule(s).", len(rules)), nil
 }
 
 func cronMetaLine(rule cronRule) string {
@@ -768,7 +804,9 @@ func (s *server) disableCronRulesForUser(userID string) error {
 		}
 		rule := block.Rule
 		rule.Enabled = false
-		doc.Lines[block.MetaIndex] = cronMetaLine(rule)
+		if block.MetaIndex >= 0 {
+			doc.Lines[block.MetaIndex] = cronMetaLine(rule)
+		}
 		doc.Lines[block.RuleIndex] = cronConfigLine(rule)
 		changed = true
 	}

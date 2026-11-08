@@ -4,16 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -163,8 +159,9 @@ func TestStartScanRejectsSleepingClamAV(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &server{
-		cfg:     config{SleepLockDir: sleepLock},
-		batches: make(map[string]*scanBatch),
+		engineSleeping: true,
+		cfg:            config{},
+		batches:        make(map[string]*scanBatch),
 	}
 	req := httptest.NewRequest(http.MethodPost, "/api/scans", strings.NewReader(`{"targets":["/scan"]}`))
 	response := httptest.NewRecorder()
@@ -192,7 +189,7 @@ func TestWhitelistUpdatesRejectSleepingClamAV(t *testing.T) {
 	if err := os.Mkdir(sleepLock, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	s := &server{cfg: config{SleepLockDir: sleepLock}}
+	s := &server{engineSleeping: true, cfg: config{}}
 
 	for _, method := range []string{http.MethodPost, http.MethodDelete} {
 		t.Run(method, func(t *testing.T) {
@@ -211,127 +208,6 @@ func TestWhitelistUpdatesRejectSleepingClamAV(t *testing.T) {
 				t.Fatalf("unexpected sleeping response: %#v", body)
 			}
 		})
-	}
-}
-
-func TestStatusCachesAndCoalescesClamdProbe(t *testing.T) {
-	binDir := t.TempDir()
-	counterPath := filepath.Join(t.TempDir(), "ping-count")
-	socketPath := filepath.Join(t.TempDir(), "clamd.sock")
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = listener.Close() })
-	versionCommands := make(chan string, 2)
-	versionErrors := make(chan error, 1)
-	go func() {
-		for range 2 {
-			conn, acceptErr := listener.Accept()
-			if acceptErr != nil {
-				versionErrors <- acceptErr
-				return
-			}
-			command := make([]byte, len("VERSION\n"))
-			_, readErr := io.ReadFull(conn, command)
-			if readErr == nil {
-				_, readErr = io.WriteString(conn, "ClamAV 1.5.4/28098/Thu Aug 14 14:24:22 2026\n")
-			}
-			_ = conn.Close()
-			if readErr != nil {
-				versionErrors <- readErr
-				return
-			}
-			if string(command) != "VERSION\n" {
-				versionErrors <- fmt.Errorf("unexpected clamd command: %q", command)
-				return
-			}
-			versionCommands <- string(command)
-		}
-	}()
-
-	clamdscan := filepath.Join(binDir, "clamdscan")
-	if err := os.WriteFile(clamdscan, []byte("#!/bin/sh\nprintf x >> \"$CLAMD_PING_TEST_COUNTER\"\nsleep 0.05\nprintf PONG\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("CLAMD_PING_TEST_COUNTER", counterPath)
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	s := &server{cfg: config{
-		StatusFile:    filepath.Join(t.TempDir(), "missing-status.json"),
-		ClamdConf:     filepath.Join(t.TempDir(), "clamd.conf"),
-		ClamdSocket:   socketPath,
-		CommandTimout: time.Second,
-	}}
-	var checkedAt string
-	for range 2 {
-		response := httptest.NewRecorder()
-		s.handleStatus(response, httptest.NewRequest(http.MethodGet, "/api/status", nil))
-		if response.Code != http.StatusOK {
-			t.Fatalf("unexpected status response: %d %s", response.Code, response.Body.String())
-		}
-		var body statusResponse
-		if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
-			t.Fatal(err)
-		}
-		if body.Ping != "ready" || body.ClamdVersion != "1.5.4" || body.DatabaseVersion != "28098" || body.DatabaseDate != "Thu Aug 14 14:24:22 2026" {
-			t.Fatalf("unexpected status response: %#v", body)
-		}
-		if checkedAt == "" {
-			s.clamdStatusMu.Lock()
-			checkedAt = s.clamdStatusCache.checkedAt.Format(time.RFC3339)
-			s.clamdStatusMu.Unlock()
-			if body.CheckedAt != checkedAt {
-				t.Fatalf("checked_at does not match the cached probe: response=%q cache=%q", body.CheckedAt, checkedAt)
-			}
-		} else if body.CheckedAt != checkedAt {
-			t.Fatalf("cached checked_at changed: first=%q second=%q", checkedAt, body.CheckedAt)
-		}
-	}
-	assertPingCount(t, counterPath, 1)
-	assertVersionQueryCount(t, versionCommands, 1)
-
-	// Expire the entry and issue a burst. The cache mutex must combine every
-	// request into one new ping and VERSION probe rather than merely cache afterward.
-	s.clamdStatusMu.Lock()
-	s.clamdStatusCache.checkedAt = time.Now().Add(-clamdStatusCacheTTL)
-	s.clamdStatusMu.Unlock()
-	var callers sync.WaitGroup
-	for range 8 {
-		callers.Add(1)
-		go func() {
-			defer callers.Done()
-			status := s.cachedClamdStatus(t.Context())
-			if status.ping != "ready" || status.pingMessage != "PONG" || status.clamdVersion != "1.5.4" || status.databaseVersion != "28098" {
-				t.Errorf("unexpected cached ClamAV status: %#v", status)
-			}
-		}()
-	}
-	callers.Wait()
-	assertPingCount(t, counterPath, 2)
-	assertVersionQueryCount(t, versionCommands, 2)
-	select {
-	case err := <-versionErrors:
-		t.Fatal(err)
-	default:
-	}
-}
-
-func assertPingCount(t *testing.T, path string, want int) {
-	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(data) != want {
-		t.Fatalf("expected %d clamd ping processes, got %d", want, len(data))
-	}
-}
-
-func assertVersionQueryCount(t *testing.T, commands chan string, want int) {
-	t.Helper()
-	if len(commands) != want {
-		t.Fatalf("expected %d clamd VERSION queries, got %d", want, len(commands))
 	}
 }
 
@@ -448,59 +324,6 @@ func TestBrowseHidesSymbolicLinks(t *testing.T) {
 	}
 }
 
-func TestBatchSnapshotsFromJobs(t *testing.T) {
-	tmp := t.TempDir()
-	jobsDir := filepath.Join(tmp, "jobs")
-	if err := os.Mkdir(jobsDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	writeJob := func(name, body string) {
-		t.Helper()
-		if err := os.WriteFile(filepath.Join(jobsDir, name), []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	writeJob("web-abc-001.json", `{"job_id":"web-abc-001","status":"finished","target":"/scan/a","action":"warn","started_at":"20260706010101","finished_at":"20260706010102","result":"clean"}`)
-	writeJob("web-abc-002.json", `{"job_id":"web-abc-002","status":"finished","target":"/scan/b","action":"warn","started_at":"20260706010201","finished_at":"20260706010202","result":"found"}`)
-	writeJob("manual-20260706010303.json", `{"job_id":"manual-20260706010303","status":"finished","target":"/scan/c","action":"warn","started_at":"20260706010303","finished_at":"20260706010304","result":"clean"}`)
-
-	s := &server{cfg: config{JobsDir: jobsDir}}
-	batch := s.batchSnapshotsFromJobs()["web-abc"]
-	if batch == nil {
-		t.Fatal("expected batch to be rebuilt from job files")
-	}
-	if batch.Completed != 2 || batch.Threats != 1 || batch.Status != "finished" {
-		t.Fatalf("unexpected rebuilt batch: %#v", batch)
-	}
-	if len(batch.Targets) != 2 || batch.Targets[0] != "/scan/a" || batch.Targets[1] != "/scan/b" {
-		t.Fatalf("unexpected targets: %#v", batch.Targets)
-	}
-	manual := s.batchSnapshotsFromJobs()["manual-20260706010303"]
-	if manual == nil || manual.Completed != 1 || len(manual.JobIDs) != 1 {
-		t.Fatalf("expected manual job batch to be rebuilt, got %#v", manual)
-	}
-}
-
-func TestRunScanScriptReadsJobID(t *testing.T) {
-	tmp := t.TempDir()
-	script := filepath.Join(tmp, "scan_once.sh")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\necho JOB_ID=manual-20260707123456\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	s := &server{cfg: config{ScanScript: script}, clamavSleepTimer: newClamAVSleepTimerState()}
-	jobID, output, err := s.runScanScript([]string{"--type", "manual", "--target", "/scan", "--action", "warn"})
-	if err != nil {
-		t.Fatalf("runScanScript returned error: %v output=%q", err, output)
-	}
-	if jobID != "manual-20260707123456" {
-		t.Fatalf("unexpected job id: %q", jobID)
-	}
-	if generation := s.clamavSleepTimer.currentGeneration(); generation != 1 {
-		t.Fatalf("manual scan start did not reset sleep timer: generation=%d", generation)
-	}
-}
-
 func TestScanQueueActivateStartsFirstBatch(t *testing.T) {
 	s := &server{
 		queuedBatchIDs: []string{"web-first"},
@@ -523,40 +346,6 @@ func TestScanQueueActivateStartsFirstBatch(t *testing.T) {
 	}
 	if s.batches["web-first"].StartedAt == nil {
 		t.Fatal("expected started_at to be set when batch starts running")
-	}
-}
-
-func TestScanLockBlocksManualStartOnlyForLivePID(t *testing.T) {
-	tmp := t.TempDir()
-	lockDir := filepath.Join(tmp, "scan.lock")
-	if err := os.Mkdir(lockDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(lockDir, "pid"), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	s := &server{cfg: config{ScanLockDir: lockDir}}
-	blocked, err := s.scanLockBlocksManualStart()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !blocked {
-		t.Fatal("expected live pid lock to block manual queue start")
-	}
-
-	if err := os.WriteFile(filepath.Join(lockDir, "pid"), []byte("99999999\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	blocked, err = s.scanLockBlocksManualStart()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if blocked {
-		t.Fatal("expected stale pid lock to allow scan_once.sh to start and clean it")
-	}
-	if _, err := os.Stat(filepath.Join(lockDir, "pid")); err != nil {
-		t.Fatalf("expected scans.go to leave stale lock files untouched: %v", err)
 	}
 }
 
@@ -644,7 +433,6 @@ func TestCronRuleID(t *testing.T) {
 func TestCronConfigPreservesCommentsAndDisabledRule(t *testing.T) {
 	tmp := t.TempDir()
 	cronConfig := filepath.Join(tmp, "cron_scan.conf")
-	cronScript := filepath.Join(tmp, "cron.sh")
 	body := strings.Join([]string{
 		"# user readable header",
 		"# scanner-cron-rule id=abc123def456gh78 enabled=true",
@@ -655,9 +443,6 @@ func TestCronConfigPreservesCommentsAndDisabledRule(t *testing.T) {
 	if err := os.WriteFile(cronConfig, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(cronScript, []byte("#!/bin/sh\nif [ \"$1\" = validate ]; then echo 'Cron config is valid: 1 rule(s).'; exit 0; fi\necho 'Cron rules reloaded: 1 rule(s).'\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
 
 	scanRoot := filepath.Join(tmp, "scan")
 	if err := os.MkdirAll(filepath.Join(scanRoot, "docs"), 0o755); err != nil {
@@ -665,7 +450,6 @@ func TestCronConfigPreservesCommentsAndDisabledRule(t *testing.T) {
 	}
 	s := &server{cfg: config{
 		CronConfigFile: cronConfig,
-		CronScript:     cronScript,
 		BrowseRoots:    []string{scanRoot},
 	}}
 
@@ -722,13 +506,6 @@ func TestCronRuleWakeColumn(t *testing.T) {
 	}
 }
 
-func TestCronScriptMessage(t *testing.T) {
-	output := "2026 log noise\nInvalid crontab rule at: minute, line 2, value 99\n"
-	if got := cronScriptMessage(output); got != "Invalid crontab rule at: minute, line 2, value 99" {
-		t.Fatalf("unexpected message: %q", got)
-	}
-}
-
 func TestWhitelistEntriesParseQuotedPaths(t *testing.T) {
 	tmp := t.TempDir()
 	excludeConfig := filepath.Join(tmp, "exclude.conf")
@@ -779,14 +556,14 @@ func TestWhitelistAddDeleteAndBusyLock(t *testing.T) {
 		BrowseRoots:   []string{scanRoot},
 		ExcludeConfig: excludeConfig,
 		ExcludeScript: excludeScript,
-		ScanLockDir:   lockDir,
 	}}
 
 	if err := os.MkdirAll(lockDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if busy, err := s.scanLockActive(); err != nil || !busy {
-		t.Fatalf("expected active scan lock, busy=%v err=%v", busy, err)
+	s.activeBatchID = "active"
+	if !s.scanPendingOrActive() {
+		t.Fatal("expected active in-memory reservation")
 	}
 	if err := os.Remove(lockDir); err != nil {
 		t.Fatal(err)

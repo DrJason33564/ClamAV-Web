@@ -15,25 +15,19 @@ LOG_DIR="${SCAN_LOG_DIR:-/log}"
 STARTUP_LOG="${STARTUP_LOG_FILE:-${LOG_DIR}/startup.log}"
 STATUS_DIR="${STATUS_DIR:-/state}"
 JOBS_DIR="${JOBS_DIR:-${STATUS_DIR}/jobs}"
-STATUS_FILE="${STATUS_FILE:-${STATUS_DIR}/status.json}"
 SLEEP_LOCK_DIR="${SLEEP_LOCK_DIR:-${STATUS_DIR}/sleep.lock}"
 CLAMAV_INIT_PID_FILE="${CLAMAV_INIT_PID_FILE:-${STATUS_DIR}/clamav-init.pid}"
 QUARANTINE_DIR="${QUARANTINE_DIR:-/quarantine}"
 
 LOG_SCRIPT="${LOG_SCRIPT:-/log.sh}"
-CONFIG_SCRIPT="${CONFIG_SCRIPT:-/config.sh}"
 EXCLUDE_SCRIPT="${EXCLUDE_SCRIPT:-/exclude.sh}"
-CRON_SCRIPT="${CRON_SCRIPT:-/cron.sh}"
-SCAN_ONCE_SCRIPT="${SCAN_ONCE_SCRIPT:-/scan_once.sh}"
 INIT_CMD="${CLAMAV_INIT:-/init}"
 SCANNER_CMD="${SCANNER_CMD:-/server}"
 STOP_GRACE_SECONDS="${STOP_GRACE_SECONDS:-5}"
 
-CONFIG_LOG_FILE="$STARTUP_LOG"
-export CRON_CONFIG_FILE EXCLUDE_CONFIG_FILE LOG_SCRIPT CONFIG_SCRIPT
+export CRON_CONFIG_FILE EXCLUDE_CONFIG_FILE LOG_SCRIPT
 
 . "$LOG_SCRIPT"
-. "$CONFIG_SCRIPT"
 
 now_iso() {
     date '+%Y-%m-%dT%H:%M:%S%z'
@@ -52,29 +46,6 @@ usage() {
     echo "Usage: $0 [--wake]" >&2
 }
 
-write_ready_status() {
-    tmp_status="$(mktemp "${STATUS_DIR}/.status.XXXXXX")"
-
-    # Keep the base status file available before the WebUI exists. Scan jobs
-    # will update the scan section while they are running and after completion.
-    cat > "$tmp_status" <<EOF_STATUS
-{
-  "version": 1,
-  "updated_at": "$(now_iso)",
-  "clamd": {
-    "status": "ready",
-    "last_checked_at": "$(now_iso)"
-  },
-  "scan": {
-    "active_job_id": null,
-    "last_job_id": null
-  }
-}
-EOF_STATUS
-
-    mv "$tmp_status" "$STATUS_FILE"
-}
-
 wait_for_clamd() {
     startup_log "[INFO] Waiting for clamd to become ready..."
 
@@ -82,7 +53,6 @@ wait_for_clamd() {
     while [ "$i" -lt "${CLAMD_WAIT_RETRIES:-180}" ]; do
         if clamdscan --config-file=/etc/clamav/clamd.conf --ping=1 >/dev/null 2>&1; then
             startup_log "[INFO] clamd is ready."
-            write_ready_status
             return 0
         fi
 
@@ -195,9 +165,6 @@ cleanup() {
     # while the container is already shutting down.
     send_term_to_child_process "scanner web service" "${SCANNER_PID:-}"
 
-    # Stop cron before ClamAV to avoid a scheduled scan being launched during
-    # shutdown.
-    send_term_to_child_process "cron" "${CRON_PID:-}"
 
     # The official ClamAV init process owns clamd/freshclam startup. Stopping
     # it gives ClamAV a chance to exit cleanly before PID 1 returns.
@@ -208,11 +175,9 @@ cleanup() {
     sleep "$STOP_GRACE_SECONDS"
 
     force_kill_child_process "scanner web service" "${SCANNER_PID:-}"
-    force_kill_child_process "cron" "${CRON_PID:-}"
     force_kill_child_process "official ClamAV init" "${INIT_PID:-}"
 
     wait_child_process "${SCANNER_PID:-}"
-    wait_child_process "${CRON_PID:-}"
     wait_child_process "${INIT_PID:-}"
 }
 
@@ -262,12 +227,10 @@ prepare_config_files() {
 }
 
 validate_startup_inputs() {
-    validate_cron_config "$CRON_CONFIG_FILE" || fail "Config validation failed: $CRON_CONFIG_FILE"
+    # The Go scheduler validates persisted rules before accepting requests.
 
     [ -r "$EXCLUDE_CONFIG_FILE" ] || fail "Exclude config file is not readable: $EXCLUDE_CONFIG_FILE"
     [ -x "$EXCLUDE_SCRIPT" ] || fail "Exclude script is not executable: $EXCLUDE_SCRIPT"
-    [ -x "$CRON_SCRIPT" ] || fail "Cron script is not executable: $CRON_SCRIPT"
-    [ -x "$SCAN_ONCE_SCRIPT" ] || fail "Scan script is not executable: $SCAN_ONCE_SCRIPT"
     [ -x "$SCANNER_CMD" ] || fail "Scanner web service is not executable: $SCANNER_CMD"
 }
 
@@ -318,7 +281,7 @@ trap shutdown INT TERM
 if [ "$mode" = "wake" ]; then
     # The standard startup path has already prepared all persistent paths.
     # Wake mode deliberately starts only ClamAV and does not create directories,
-    # validate application configuration, reload cron, or start the WebUI.
+    # validate application configuration or start the WebUI.
     validate_wake_input
     startup_log "[INFO] startup.sh --wake started."
 
@@ -345,15 +308,6 @@ startup_log "[INFO] Config validation passed. Executing exclude script: $EXCLUDE
 
 start_clamav || fail "ClamAV startup failed."
 
-# cron.sh owns both cron file generation and cron daemon startup so WebUI can
-# reuse the same reload path later without duplicating shell logic in Go.
-startup_log "[INFO] Loading cron rules through: $CRON_SCRIPT reload"
-"$CRON_SCRIPT" reload
-
-startup_log "[INFO] Starting cron through: $CRON_SCRIPT start"
-"$CRON_SCRIPT" start &
-CRON_PID="$!"
-
 startup_log "[INFO] Starting web service: $SCANNER_CMD"
 "$SCANNER_CMD" &
 SCANNER_PID="$!"
@@ -368,13 +322,7 @@ while :; do
         wait_child_process "$exited_init_pid"
         clear_init_pid_if_current "$exited_init_pid"
         INIT_PID=""
-        startup_log "[INFO] Official ClamAV init process exited. Web service and cron remain running."
-    fi
-
-    if ! kill -0 "$CRON_PID" 2>/dev/null; then
-        startup_log "[ERROR] cron process exited. Container will stop."
-        cleanup
-        exit 1
+        startup_log "[INFO] Official ClamAV init process exited. Web service remains running."
     fi
 
     if ! kill -0 "$SCANNER_PID" 2>/dev/null; then

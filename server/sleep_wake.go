@@ -2,15 +2,12 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sync"
 	"time"
 )
@@ -103,7 +100,7 @@ func stopAndDrainTimer(timer *time.Timer) {
 	}
 }
 
-func (s *server) manualScanPendingOrActive() bool {
+func (s *server) scanPendingOrActive() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.activeBatchID != "" || len(s.queuedBatchIDs) != 0
@@ -138,11 +135,7 @@ func (s *server) runClamAVSleepTimerWithAction(ctx context.Context, unit time.Du
 			s.debug("clamav_power", "ClamAV sleep timer disabled")
 			return
 		}
-		sleeping, err := directoryLockExists(s.cfg.SleepLockDir)
-		if err != nil {
-			s.warn("clamav_power", "ClamAV sleep timer state check failed", "error", err)
-		} else if sleeping {
-			s.debug("clamav_power", "ClamAV sleep timer paused while engine is sleeping")
+		if s.isSleeping() {
 			return
 		}
 
@@ -172,7 +165,7 @@ func (s *server) runClamAVSleepTimerWithAction(ctx context.Context, unit time.Du
 				arm()
 				continue
 			}
-			if s.manualScanPendingOrActive() {
+			if s.scanPendingOrActive() {
 				s.clamavPowerMu.Unlock()
 				s.debug("clamav_power", "automatic ClamAV sleep deferred for manual scan")
 				arm()
@@ -196,28 +189,11 @@ func (s *server) runClamAVSleepTimerWithAction(ctx context.Context, unit time.Du
 
 func (s *server) sleepClamAV(ctx context.Context) (string, string, int, error) {
 	s.debug("clamav_power", "ClamAV sleep requested")
-	sleeping, err := directoryLockExists(s.cfg.SleepLockDir)
-	if err != nil {
-		return "failed", "", http.StatusInternalServerError, err
+	if s.scanPendingOrActive() {
+		return "failed", "", http.StatusConflict, errors.New("ClamAV cannot sleep while scans are queued or active")
 	}
-
-	ping, _ := s.pingClamd(ctx)
-	if sleeping && ping != "ready" {
-		s.invalidateClamdStatusCache()
-		if err := writeClamdSleepStatus(s.cfg.StatusFile); err != nil {
-			return "failed", "", http.StatusInternalServerError, fmt.Errorf("write ClamAV sleep status: %w", err)
-		}
+	if s.isSleeping() {
 		return "sleeping", "ClamAV is already sleeping.", http.StatusOK, nil
-	}
-
-	// Never stop clamd while scan_once.sh owns the cross-process scan lock.
-	scanning, err := s.scanLockActive()
-	if err != nil {
-		return "failed", "", http.StatusInternalServerError, fmt.Errorf("check active scan lock: %w", err)
-	}
-	if scanning {
-		s.warn("clamav_power", "ClamAV sleep rejected while scan is active")
-		return "failed", "", http.StatusConflict, errors.New("ClamAV cannot sleep while a scan is active")
 	}
 
 	if err := sendClamdShutdown(ctx, s.cfg.ClamdSocket, s.cfg.CommandTimout); err != nil {
@@ -226,14 +202,10 @@ func (s *server) sleepClamAV(ctx context.Context) (string, string, int, error) {
 	}
 	s.invalidateClamdStatusCache()
 
-	// mkdir is the atomic state transition. An existing lock is valid when a
-	// stale sleep marker was found next to a still-running clamd instance.
-	if err := createDirectoryLock(s.cfg.SleepLockDir); err != nil {
-		return "failed", "", http.StatusInternalServerError, fmt.Errorf("create sleep lock: %w", err)
-	}
-	if err := writeClamdSleepStatus(s.cfg.StatusFile); err != nil {
-		return "failed", "", http.StatusInternalServerError, fmt.Errorf("write ClamAV sleep status: %w", err)
-	}
+	s.mu.Lock()
+	s.engineSleeping = true
+	s.mu.Unlock()
+
 	s.info("clamav_power", "ClamAV entered sleep mode")
 	return "sleeping", "ClamAV entered sleep mode.", http.StatusOK, nil
 }
@@ -246,7 +218,7 @@ func (s *server) wakeClamAV(requestCtx context.Context) (string, string, int, er
 	// Do not bind a potentially long ClamAV database load to the HTTP client's
 	// cancellation. The server serializes power transitions and completes the
 	// requested wake even if the caller disconnects while waiting.
-	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.WakeTimeout)
+	ctx, cancel := context.WithTimeout(s.scanContext(), s.cfg.WakeTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, s.cfg.StartupScript, "--wake")
@@ -263,8 +235,11 @@ func (s *server) wakeClamAV(requestCtx context.Context) (string, string, int, er
 		return "failed", "", http.StatusInternalServerError, fmt.Errorf("wake ClamAV: %w", err)
 	}
 	s.invalidateClamdStatusCache()
+	s.mu.Lock()
+	s.engineSleeping = false
+	s.mu.Unlock()
 
-	// startup.sh owns both the final PONG check and the sleep-lock transition.
+	// startup.sh owns the final PONG check; Go owns runtime sleep state.
 	// A zero exit status is therefore the complete wake result.
 	if alreadyAwake {
 		s.info("clamav_power", "ClamAV wake completed; daemon was already awake")
@@ -274,39 +249,27 @@ func (s *server) wakeClamAV(requestCtx context.Context) (string, string, int, er
 	return "awake", "ClamAV woke successfully.", http.StatusOK, nil
 }
 
+func (s *server) isSleeping() bool { s.mu.RLock(); defer s.mu.RUnlock(); return s.engineSleeping }
+
 func sendClamdShutdown(ctx context.Context, socketPath string, timeout time.Duration) error {
-	dialer := net.Dialer{Timeout: timeout}
-	conn, err := dialer.DialContext(ctx, "unix", socketPath)
-	if err != nil {
-		return err
+	reply, err := (ClamdClient{socketPath, timeout}).command(ctx, "SHUTDOWN")
+	if err == nil && reply != "" {
+		return fmt.Errorf("unexpected SHUTDOWN response: %.256q", reply)
 	}
-	defer conn.Close()
-
-	return sendClamdShutdownCommand(ctx, conn, timeout)
+	return err
 }
-
 func sendClamdShutdownCommand(ctx context.Context, conn net.Conn, timeout time.Duration) error {
 	if err := setClamdSocketDeadline(ctx, conn, timeout); err != nil {
 		return err
 	}
-	if _, err := io.WriteString(conn, "SHUTDOWN\n"); err != nil {
-		return err
-	}
-
-	// clamd's successful SHUTDOWN command has no response. EOF with zero bytes
-	// therefore corresponds to the successful exit status of a socket client.
-	var response [1]byte
-	n, err := conn.Read(response[:])
-	if n != 0 {
-		return fmt.Errorf("clamd returned an unexpected SHUTDOWN response")
-	}
-	if errors.Is(err, io.EOF) {
-		return nil
-	}
+	reply, err := clamdCommandOnConn(conn, "SHUTDOWN")
 	if err != nil {
 		return err
 	}
-	return errors.New("clamd did not close the SHUTDOWN connection")
+	if reply != "" {
+		return errors.New("clamd returned an unexpected SHUTDOWN response")
+	}
+	return nil
 }
 
 func setClamdSocketDeadline(ctx context.Context, conn net.Conn, timeout time.Duration) error {
@@ -315,91 +278,6 @@ func setClamdSocketDeadline(ctx context.Context, conn net.Conn, timeout time.Dur
 		deadline = requestDeadline
 	}
 	return conn.SetDeadline(deadline)
-}
-
-func directoryLockExists(path string) (bool, error) {
-	info, err := os.Stat(path)
-	if err == nil {
-		if !info.IsDir() {
-			return false, fmt.Errorf("lock path is not a directory: %s", path)
-		}
-		return true, nil
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	return false, err
-}
-
-func createDirectoryLock(path string) error {
-	err := os.Mkdir(path, 0o755)
-	if errors.Is(err, os.ErrExist) {
-		exists, checkErr := directoryLockExists(path)
-		if checkErr != nil {
-			return checkErr
-		}
-		if exists {
-			return nil
-		}
-	}
-	return err
-}
-
-func writeClamdSleepStatus(path string) error {
-	root := make(map[string]any)
-	data, err := os.ReadFile(path)
-	switch {
-	case err == nil:
-		if err := json.Unmarshal(data, &root); err != nil {
-			return fmt.Errorf("decode status file: %w", err)
-		}
-		if root == nil {
-			return errors.New("decode status file: root must be an object")
-		}
-	case errors.Is(err, os.ErrNotExist):
-		root["version"] = 1
-		root["scan"] = map[string]any{
-			"active_job_id": nil,
-			"last_job_id":   nil,
-		}
-	default:
-		return err
-	}
-
-	clamd, ok := root["clamd"].(map[string]any)
-	if !ok {
-		clamd = make(map[string]any)
-		root["clamd"] = clamd
-	}
-	clamd["status"] = "sleep"
-
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".status.*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-
-	encoder := json.NewEncoder(tmp)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(root); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return err
-	}
-	cleanup = false
-	return nil
 }
 
 func powerErrorStatus(ctx context.Context, err error) int {

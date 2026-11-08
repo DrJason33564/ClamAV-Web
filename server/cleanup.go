@@ -81,8 +81,10 @@ func cleanAllRequested(r *http.Request) bool {
 func (s *server) cleanUserResults(ctx context.Context, userID string) (int, error) {
 	if s.history != nil {
 		_ = s.history.refresh(ctx)
+		s.history.mu.Lock()
+		defer s.history.mu.Unlock()
 	}
-	rows, err := s.historyDB.QueryContext(ctx, "SELECT job_id,json_file FROM history_jobs WHERE user_id=?", userID)
+	rows, err := s.historyDB.QueryContext(ctx, "SELECT job_id,json_file FROM history_jobs WHERE user_id=? AND status NOT IN ('waiting','running')", userID)
 	if err != nil {
 		return 0, err
 	}
@@ -117,7 +119,7 @@ func (s *server) cleanUserResults(ctx context.Context, userID string) (int, erro
 			}
 		}
 	}
-	if _, err := s.historyDB.ExecContext(ctx, "DELETE FROM history_jobs WHERE user_id=?", userID); err != nil {
+	if _, err := s.historyDB.ExecContext(ctx, "DELETE FROM history_jobs WHERE user_id=? AND status NOT IN ('waiting','running')", userID); err != nil {
 		return deleted, err
 	}
 	return deleted, nil
@@ -165,16 +167,7 @@ func (s *server) cleanDeleteUser(ctx context.Context, username string) error {
 			return errLastAdmin
 		}
 	}
-	if s.history != nil {
-		_ = s.history.refresh(ctx)
-		var activeJobs int
-		if err := s.historyDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM history_jobs WHERE user_id=? AND status IN ('waiting','running')", id).Scan(&activeJobs); err != nil {
-			return err
-		}
-		if activeJobs > 0 {
-			return errUserBusy
-		}
-	}
+
 	s.mu.Lock()
 	if active := s.batches[s.activeBatchID]; active != nil && active.UserID == id {
 		s.mu.Unlock()

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -20,7 +19,7 @@ func TestSendClamdShutdownAcceptsEmptyReply(t *testing.T) {
 	command := make(chan string, 1)
 	go func() {
 		defer server.Close()
-		data := make([]byte, len("SHUTDOWN\n"))
+		data := make([]byte, len("zSHUTDOWN\x00"))
 		_, readErr := io.ReadFull(server, data)
 		if readErr != nil {
 			command <- "read error: " + readErr.Error()
@@ -32,7 +31,7 @@ func TestSendClamdShutdownAcceptsEmptyReply(t *testing.T) {
 	if err := sendClamdShutdownCommand(context.Background(), client, time.Second); err != nil {
 		t.Fatalf("expected empty reply to succeed: %v", err)
 	}
-	if got := <-command; got != "SHUTDOWN\n" {
+	if got := <-command; got != "zSHUTDOWN\x00" {
 		t.Fatalf("unexpected command: %q", got)
 	}
 }
@@ -43,9 +42,9 @@ func TestSendClamdShutdownRejectsResponse(t *testing.T) {
 
 	go func() {
 		defer server.Close()
-		buffer := make([]byte, len("SHUTDOWN\n"))
+		buffer := make([]byte, len("zSHUTDOWN\x00"))
 		_, _ = io.ReadFull(server, buffer)
-		_, _ = io.WriteString(server, "unexpected\n")
+		_, _ = io.WriteString(server, "unexpected\x00")
 	}()
 
 	err := sendClamdShutdownCommand(context.Background(), client, time.Second)
@@ -61,14 +60,14 @@ func TestQueryClamdVersionCommand(t *testing.T) {
 	command := make(chan string, 1)
 	go func() {
 		defer server.Close()
-		data := make([]byte, len("VERSION\n"))
+		data := make([]byte, len("zVERSION\x00"))
 		_, readErr := io.ReadFull(server, data)
 		if readErr != nil {
 			command <- "read error: " + readErr.Error()
 			return
 		}
 		command <- string(data)
-		_, _ = io.WriteString(server, "ClamAV 1.5.4/28098/Thu Aug 14 14:24:22 2026\n")
+		_, _ = io.WriteString(server, "ClamAV 1.5.4/28098/Thu Aug 14 14:24:22 2026\x00")
 	}()
 
 	version, err := queryClamdVersionCommand(context.Background(), client, time.Second)
@@ -78,7 +77,7 @@ func TestQueryClamdVersionCommand(t *testing.T) {
 	if version.clamdVersion != "1.5.4" || version.databaseVersion != "28098" || version.databaseDate != "Thu Aug 14 14:24:22 2026" {
 		t.Fatalf("unexpected clamd VERSION result: %#v", version)
 	}
-	if got := <-command; got != "VERSION\n" {
+	if got := <-command; got != "zVERSION\x00" {
 		t.Fatalf("unexpected command: %q", got)
 	}
 }
@@ -96,26 +95,6 @@ func TestParseClamdVersionResponseRejectsMalformedValues(t *testing.T) {
 	}
 }
 
-func TestDirectoryLockLifecycle(t *testing.T) {
-	tmp := t.TempDir()
-	sleepLock := filepath.Join(tmp, "sleep.lock")
-	if err := createDirectoryLock(sleepLock); err != nil {
-		t.Fatal(err)
-	}
-	if err := createDirectoryLock(sleepLock); err != nil {
-		t.Fatalf("expected idempotent lock creation: %v", err)
-	}
-	if info, err := os.Stat(sleepLock); err != nil || !info.IsDir() {
-		t.Fatalf("expected sleep lock directory, info=%v err=%v", info, err)
-	}
-	if err := os.Remove(sleepLock); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(sleepLock); !os.IsNotExist(err) {
-		t.Fatalf("expected sleep lock removal, err=%v", err)
-	}
-}
-
 func TestSleepClamAVRejectsActiveScan(t *testing.T) {
 	tmp := t.TempDir()
 	scanLock := filepath.Join(tmp, "scan.lock")
@@ -124,9 +103,7 @@ func TestSleepClamAVRejectsActiveScan(t *testing.T) {
 	}
 	withFakeClamdscan(t, true)
 
-	s := &server{cfg: config{
-		SleepLockDir:  filepath.Join(tmp, "sleep.lock"),
-		ScanLockDir:   scanLock,
+	s := &server{activeBatchID: "active", cfg: config{
 		ClamdSocket:   filepath.Join(tmp, "missing.sock"),
 		ClamdConf:     filepath.Join(tmp, "clamd.conf"),
 		CommandTimout: time.Second,
@@ -134,64 +111,6 @@ func TestSleepClamAVRejectsActiveScan(t *testing.T) {
 	_, _, statusCode, err := s.sleepClamAV(context.Background())
 	if statusCode != http.StatusConflict || err == nil {
 		t.Fatalf("expected active scan conflict, code=%d err=%v", statusCode, err)
-	}
-}
-
-func TestSleepClamAVWritesCompleteStatusWhenAlreadySleeping(t *testing.T) {
-	tmp := t.TempDir()
-	statusFile := filepath.Join(tmp, "status.json")
-	sleepLock := filepath.Join(tmp, "sleep.lock")
-	if err := os.Mkdir(sleepLock, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(statusFile, []byte(`{
-  "version": 1,
-  "updated_at": "2026-07-29T12:00:00+0800",
-  "clamd": {
-    "status": "ready",
-    "last_checked_at": "2026-07-29T12:00:00+0800"
-  },
-  "scan": {
-    "active_job_id": null,
-    "last_job_id": "manual-20260729115900"
-  }
-}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	withFakeClamdscan(t, false)
-
-	s := &server{cfg: config{
-		StatusFile:    statusFile,
-		SleepLockDir:  sleepLock,
-		ClamdConf:     filepath.Join(tmp, "clamd.conf"),
-		CommandTimout: time.Second,
-	}}
-	status, _, statusCode, err := s.sleepClamAV(context.Background())
-	if err != nil || statusCode != http.StatusOK || status != "sleeping" {
-		t.Fatalf("unexpected sleep result: status=%q code=%d err=%v", status, statusCode, err)
-	}
-
-	data, err := os.ReadFile(statusFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
-		t.Fatal(err)
-	}
-	clamd := root["clamd"].(map[string]any)
-	if clamd["status"] != "sleep" {
-		t.Fatalf("unexpected clamd status: %#v", clamd)
-	}
-	if _, exists := clamd["message"]; exists {
-		t.Fatalf("unexpected clamd message field: %#v", clamd)
-	}
-	if clamd["last_checked_at"] != "2026-07-29T12:00:00+0800" {
-		t.Fatalf("clamd fields were not preserved: %#v", clamd)
-	}
-	scan := root["scan"].(map[string]any)
-	if scan["last_job_id"] != "manual-20260729115900" {
-		t.Fatalf("scan state was not preserved: %#v", scan)
 	}
 }
 
@@ -209,7 +128,6 @@ func TestWakeClamAVDelegatesStaleLockCleanupToStartupScript(t *testing.T) {
 	t.Setenv("SLEEP_LOCK_DIR", sleepLock)
 
 	s := &server{cfg: config{
-		SleepLockDir:  sleepLock,
 		StartupScript: startupScript,
 		ClamdConf:     filepath.Join(tmp, "clamd.conf"),
 		CommandTimout: time.Second,
@@ -237,16 +155,16 @@ func TestClamAVSleepTimerExpires(t *testing.T) {
 	app.cfg.ClamAVSleepTimer = 1
 	app.mu.Unlock()
 	s := &server{
-		cfg:              config{SleepLockDir: filepath.Join(tmp, "sleep.lock")},
+		cfg:              config{},
 		appConfig:        app,
 		clamavSleepTimer: newClamAVSleepTimerState(),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go s.runClamAVSleepTimerWithAction(ctx, time.Millisecond, func(context.Context) (string, string, int, error) {
-		if err := createDirectoryLock(s.cfg.SleepLockDir); err != nil {
-			return "failed", "", http.StatusInternalServerError, err
-		}
+		s.mu.Lock()
+		s.engineSleeping = true
+		s.mu.Unlock()
 		close(shutdownReceived)
 		return "sleeping", "ClamAV entered sleep mode.", http.StatusOK, nil
 	})
@@ -256,8 +174,8 @@ func TestClamAVSleepTimerExpires(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("sleep timer did not send ClamAV shutdown")
 	}
-	if exists, err := directoryLockExists(s.cfg.SleepLockDir); err != nil || !exists {
-		t.Fatalf("sleep timer did not create sleep lock: exists=%v err=%v", exists, err)
+	if !s.isSleeping() {
+		t.Fatal("expected in-memory sleep state")
 	}
 }
 
@@ -271,7 +189,7 @@ func TestDisabledClamAVSleepTimerDoesNotStart(t *testing.T) {
 	app.cfg.ClamAVSleepTimer = 0
 	app.mu.Unlock()
 	s := &server{
-		cfg:              config{SleepLockDir: filepath.Join(tmp, "sleep.lock")},
+		cfg:              config{},
 		appConfig:        app,
 		clamavSleepTimer: newClamAVSleepTimerState(),
 	}
@@ -279,8 +197,8 @@ func TestDisabledClamAVSleepTimerDoesNotStart(t *testing.T) {
 	go s.runClamAVSleepTimerWithUnit(ctx, time.Millisecond)
 	time.Sleep(25 * time.Millisecond)
 	cancel()
-	if exists, err := directoryLockExists(s.cfg.SleepLockDir); err != nil || exists {
-		t.Fatalf("disabled sleep timer changed power state: exists=%v err=%v", exists, err)
+	if s.isSleeping() {
+		t.Fatal("disabled timer changed sleep state")
 	}
 }
 
@@ -294,7 +212,7 @@ func TestClamAVSleepTimerResetDiscardsOldDeadline(t *testing.T) {
 	app.cfg.ClamAVSleepTimer = 1
 	app.mu.Unlock()
 	s := &server{
-		cfg:              config{SleepLockDir: filepath.Join(tmp, "sleep.lock")},
+		cfg:              config{},
 		appConfig:        app,
 		clamavSleepTimer: newClamAVSleepTimerState(),
 	}
@@ -330,7 +248,7 @@ func TestClamAVSleepTimerDefersForQueuedManualScan(t *testing.T) {
 	app.cfg.ClamAVSleepTimer = 1
 	app.mu.Unlock()
 	s := &server{
-		cfg:              config{SleepLockDir: filepath.Join(tmp, "sleep.lock")},
+		cfg:              config{},
 		appConfig:        app,
 		clamavSleepTimer: newClamAVSleepTimerState(),
 		queuedBatchIDs:   []string{"web-pending"},

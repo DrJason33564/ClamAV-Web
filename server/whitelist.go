@@ -60,20 +60,8 @@ func (s *server) updateWhitelist(w http.ResponseWriter, r *http.Request, add boo
 	defer s.configFileMu.Unlock()
 	who, _ := actorFromRequest(r)
 
-	sleeping, err := directoryLockExists(s.cfg.SleepLockDir)
-	if err != nil {
-		writeWhitelistStatus(w, http.StatusInternalServerError, "failed", "", fmt.Errorf("check ClamAV sleep lock: %w", err))
-		return
-	}
-	if sleeping {
-		s.warn("whitelist", "whitelist update rejected while ClamAV is sleeping", "user", who.Username)
-		// Use an explicit object so message is JSON null. whitelistResponse uses
-		// an omitempty string and would otherwise omit the field.
-		writeJSON(w, http.StatusConflict, map[string]any{
-			"status":  "failed",
-			"message": nil,
-			"error":   "ClamAV is sleeping",
-		})
+	if s.isSleeping() {
+		writeJSON(w, http.StatusConflict, map[string]any{"status": "failed", "message": nil, "error": "ClamAV is sleeping"})
 		return
 	}
 
@@ -87,11 +75,8 @@ func (s *server) updateWhitelist(w http.ResponseWriter, r *http.Request, add boo
 		writeWhitelistStatus(w, http.StatusBadRequest, "failed", "", err)
 		return
 	}
-	if busy, err := s.scanLockActive(); err != nil {
-		writeWhitelistStatus(w, http.StatusInternalServerError, "failed", "", err)
-		return
-	} else if busy {
-		s.warn("whitelist", "whitelist update rejected while scan is active", "user", who.Username)
+	if s.scanPendingOrActive() {
+		s.warn("whitelist", "whitelist update rejected while scan is queued or active", "user", who.Username)
 		writeWhitelistStatus(w, http.StatusConflict, "busy", "clamav is running", nil)
 		return
 	}
@@ -203,17 +188,6 @@ func (s *server) prepareWhitelistPath(input string, actors ...actor) (string, er
 		return "", errors.New("path must not contain double quote")
 	}
 	return target, nil
-}
-
-func (s *server) scanLockActive() (bool, error) {
-	info, err := os.Stat(s.cfg.ScanLockDir)
-	if err == nil {
-		return info.IsDir(), nil
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	return false, err
 }
 
 func (s *server) addWhitelistEntry(target string, userIDs ...string) error {
@@ -340,6 +314,9 @@ func (s *server) removeWhitelistForUser(userID string) error {
 	if !changed {
 		return nil
 	}
+	if s.scanPendingOrActive() {
+		return errUserBusy
+	}
 	if err := s.writeWhitelistLines(kept); err != nil {
 		return err
 	}
@@ -377,23 +354,16 @@ func (s *server) reloadClamdDatabase() (string, error) {
 	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "clamdscan", "--config-file="+s.cfg.ClamdConf, "--reload")
-	out, err := cmd.CombinedOutput()
-	message := strings.TrimSpace(string(out))
-	if ctx.Err() == context.DeadlineExceeded {
-		return message, errors.New("clamd reload timed out")
-	}
+	message, err := (ClamdClient{s.cfg.ClamdSocket, 30 * time.Second}).command(ctx, "RELOAD")
 	if err != nil {
-		if message == "" {
-			message = err.Error()
-		}
-		return message, errors.New(message)
+		return message, err
 	}
-	if message == "" {
-		message = "ClamAV database reloaded."
+	if message != "RELOADING" {
+		return message, fmt.Errorf("unexpected RELOAD response: %.256q", message)
 	}
-	s.debug("whitelist", "ClamAV database reload completed", "duration_ms", time.Since(started).Milliseconds())
-	return message, nil
+	s.invalidateClamdStatusCache()
+	s.debug("whitelist", "ClamAV database reload requested", "duration_ms", time.Since(started).Milliseconds())
+	return "ClamAV database reload requested.", nil
 }
 
 func writeWhitelistStatus(w http.ResponseWriter, statusCode int, status string, message string, err error) {

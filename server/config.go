@@ -12,16 +12,13 @@ import (
 
 type config struct {
 	ListenAddrs         []string
-	StatusFile          string
+	ScanTimeout         time.Duration
+	ScanWaitMax         time.Duration
 	JobsDir             string
-	ScanLockDir         string
-	SleepLockDir        string
 	LogDir              string
 	QuarantineDir       string
-	ScanScript          string
 	StartupScript       string
 	CronConfigFile      string
-	CronScript          string
 	ExcludeConfig       string
 	ExcludeScript       string
 	ClamdConf           string
@@ -51,16 +48,13 @@ func loadConfig() (config, error) {
 	}
 	return config{
 		ListenAddrs:    addrs,
-		StatusFile:     env("STATUS_FILE", filepath.Join(statusDir, "status.json")),
+		ScanTimeout:    15 * time.Minute,
+		ScanWaitMax:    scanWaitMax(),
 		JobsDir:        env("JOBS_DIR", filepath.Join(statusDir, "jobs")),
-		ScanLockDir:    env("SCAN_LOCK_DIR", filepath.Join(statusDir, "scan.lock")),
-		SleepLockDir:   env("SLEEP_LOCK_DIR", filepath.Join(statusDir, "sleep.lock")),
 		LogDir:         env("SCAN_LOG_DIR", "/log"),
 		QuarantineDir:  env("QUARANTINE_DIR", "/quarantine"),
-		ScanScript:     env("SCAN_ONCE_SCRIPT", "/scan_once.sh"),
 		StartupScript:  env("STARTUP_SCRIPT", "/startup.sh"),
 		CronConfigFile: env("CRON_CONFIG_FILE", "/config/cron_scan.conf"),
-		CronScript:     env("CRON_SCRIPT", "/cron.sh"),
 		ExcludeConfig:  env("EXCLUDE_CONFIG_FILE", "/config/exclude.conf"),
 		ExcludeScript:  env("EXCLUDE_SCRIPT", "/exclude.sh"),
 		ClamdConf:      env("CLAMD_CONF", "/etc/clamav/clamd.conf"),
@@ -123,4 +117,13 @@ func parseListenAddresses(value, port string) ([]string, error) {
 		}
 	}
 	return addrs, nil
+}
+
+// Zero retains the legacy unlimited scheduled-queue wait.
+func scanWaitMax() time.Duration {
+	value, err := time.ParseDuration(env("SCAN_WAIT_MAX_SECONDS", "0") + "s")
+	if err != nil || value < 0 {
+		return 0
+	}
+	return value
 }

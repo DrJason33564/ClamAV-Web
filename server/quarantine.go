@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -146,6 +147,8 @@ func (s *server) runQuarantineLookup(ctx context.Context, id string) {
 }
 
 func (s *server) readQuarantineSubjects(ctx context.Context, userID string) ([]quarantineSubject, error) {
+	s.quarantineFilesMu.Lock()
+	defer s.quarantineFilesMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -266,6 +269,8 @@ func quarantineNameFromPath(path string, prefix string) (string, error) {
 }
 
 func (s *server) deleteQuarantineSubject(name string, userID string) error {
+	s.quarantineFilesMu.Lock()
+	defer s.quarantineFilesMu.Unlock()
 	if !validUserID(userID) {
 		return os.ErrNotExist
 	}
@@ -285,6 +290,8 @@ func (s *server) deleteQuarantineSubject(name string, userID string) error {
 }
 
 func (s *server) recoverQuarantineSubject(name string, who actor) error {
+	s.quarantineFilesMu.Lock()
+	defer s.quarantineFilesMu.Unlock()
 	userID := who.ID
 	if !validUserID(userID) {
 		return os.ErrNotExist
@@ -362,6 +369,9 @@ func copyRegularFile(src string, dst string) error {
 	}
 
 	_, copyErr := io.Copy(out, in)
+	if copyErr == nil {
+		copyErr = out.Sync()
+	}
 	closeErr := out.Close()
 	if copyErr != nil {
 		_ = os.Remove(dst)
@@ -390,6 +400,20 @@ func readQuarantineRecord(path string) (string, string, error) {
 }
 
 func parseQuotedRecord(value string) (string, string, error) {
+	if strings.HasPrefix(strings.TrimSpace(value), "{") {
+		var record struct {
+			Source string `json:"source_file"`
+			Owner  string `json:"user_id"`
+		}
+		if err := json.Unmarshal([]byte(value), &record); err != nil {
+			return "", "", err
+		}
+		if record.Source == "" || !validUserID(record.Owner) {
+			return "", "", errors.New("invalid quarantine record")
+		}
+		return record.Source, record.Owner, nil
+	}
+
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return "", "", errors.New("quarantine record is empty")

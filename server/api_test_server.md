@@ -294,6 +294,6 @@ go test ./...
 - `/config/cron_scan.conf`
 - `/config/exclude.conf`
 - `/quarantine`
-- `scan_once.sh`、`cron.sh` 或 `exclude.sh`
+- 扫描引擎或 `exclude.sh`
 
 因此任何新增、编辑、删除、恢复、清空或扫描请求都只会生成模板化 HTTP 响应。

@@ -341,9 +341,9 @@ WEB_FIRSTRUN_COMPLETED=2
 }
 ```
 
-`status.json` 是全局文件，但 API 会过滤 `active_job_id`，并从 SQLite 查询当前用户自己的最近任务。不会返回其他用户任务。
+运行状态由 Go 内存生成，API 会过滤 `active_job_id`，并从 SQLite 查询当前用户自己的最近任务。不会返回其他用户任务。
 
-`ping` 与 `ping_message` 来自 `clamdscan --ping`。clamd ready 时，后端通过 Unix socket 发送 `VERSION`，将响应解析为 `clamd_version`、`database_version` 和 `database_date`；查询或解析失败时这三个字段为空字符串。
+`ping` 与 `ping_message` 来自 Unix socket `PING`。clamd ready 时，后端通过 Unix socket 发送 `VERSION`，将响应解析为 `clamd_version`、`database_version` 和 `database_date`；查询或解析失败时这三个字段为空字符串。
 
 上述实时状态由后端缓存 5 秒；`checked_at` 是当前缓存结果的探测完成时间。缓存期内的并发状态请求不会重复执行 ping 或 VERSION 查询，ClamAV 休眠或唤醒成功后缓存立即失效。
 
@@ -449,12 +449,14 @@ sleep/wake 均为幂等操作。
 {
   "targets": ["/scan/docs", "/scan/example.dat"],
   "action": "warn",
-  "wait": false
+  "wait": false,
+  "LOCK_FILE": false
 }
 ```
 
 - `action`：`warn`、`move` 或 `remove`，默认 `warn`；
 - `wait` 只为兼容旧请求保留；
+- `LOCK_FILE` 为可选 JSON 布尔值，默认 false；true 时按目录层级、每批最多 128 个普通文件尝试非阻塞 flock，锁在 FILDES 提交完成后释放。加锁失败记录 warn 后继续；null、字符串和数字返回 400。
 - owner ID 从登录 Cookie 对应的用户记录获得，客户端不能指定。
 
 TimeDock 模式下，每个 `targets` 路径都必须位于当前用户匹配到的账户目录内；直接构造请求不能绕过文件浏览器的目录限制。
@@ -514,14 +516,14 @@ ClamAV 扫描全局串行。每次选择下一任务时：
 
 只能取消当前用户尚未开始的任务。
 
-### 任务文件 version 3
+### 任务文件 version 4
 
-`scan_once.sh` 生成：
+由 Go HistoryStore 生成；旧 version 3 文件仍可读取和重建：
 
 ```json
 {
-  "version": 3,
-  "job_id": "manual-1783433000",
+  "version": 4,
+  "job_id": "manual-1783433000000000000",
   "type": "manual",
   "user_id": "a1b2c3d4",
   "status": "finished",
@@ -533,9 +535,13 @@ ClamAV 扫描全局串行。每次选择下一任务时：
 }
 ```
 
-任务 ID 使用 `manual-<Unix秒>` 或 `cron-<Unix秒>`。同一秒冲突时追加 `-001`、`-002`。运行中 `finished_at` 为 `null`。
+新任务 ID 使用 `manual-<Unix纳秒>` 或 `cron-<Unix纳秒>`，由 Go 保证进程内唯一；旧 Unix 秒 ID 及三位后缀继续支持。运行中 finished_at 为 null，重启后未完成任务记为中断失败。
+
+version 4 另含 LOCK_FILE、detections、summary（scanned、scan_errors、action_succeeded、action_failed、detections、errors）。汇总优先级为 found > error > clean：有检出同时有扫描或处置错误仍为 finished/found；无检出但有错误为 failed/error；单文件错误不终止目录中的后续扫描。完整错误和处置结果单独记录。
 
 ## 8. 定时扫描
+
+调度由 Go 内部 robfig/cron/v3 执行，使用容器 TZ。所有触发进入同一内存队列；停机期间不补跑，规则重载按实际分钟去重。日期与星期均受限时按 OR 匹配，星期日同时支持 0/7。
 
 cron 配置实际结构：
 
@@ -550,7 +556,7 @@ cron 配置实际结构：
 0 */6 * * * "/scan/Team A" move a1b2c3d4 Y
 ```
 
-`wake` 只能为 `Y` 或 `N`。`Y` 表示执行该规则时向 `scan_once.sh` 附加 `--wake`，在扫描前唤醒睡眠状态的 ClamAV；`N` 表示不主动唤醒。
+`wake` 只能为 `Y` 或 `N`。`Y` 表示由 Go 队列在扫描前通过 startup.sh --wake 唤醒睡眠状态的 ClamAV；`N` 表示不主动唤醒。
 
 ### `GET /api/cron/rules`
 
@@ -592,7 +598,7 @@ TimeDock 模式下，新增、完整更新和重新启用规则时都会校验 `
 
 ### `POST /api/cron/reload`
 
-校验完整配置并重建系统 cron 文件。响应只返回当前用户规则。cron 文件的读写和 reload 使用进程锁，避免多用户并发保存导致丢失更新。
+校验完整配置并热更新 robfig/cron/v3 调度器。响应只返回当前用户规则。规则文件的读写和 reload 使用进程内互斥，避免多用户并发保存导致丢失更新。
 
 ## 9. 白名单
 
@@ -670,7 +676,7 @@ TimeDock 模式下，新增和删除请求中的路径都必须位于当前用�
 | `lookup_id` | string | 创建查询时生成的 `result-<随机ID>`；在该 lookup 生命周期内不变。 |
 | `status` | string | `pending`：查询尚未完成；`success`：查询成功；`failed`：查询失败。 |
 | `results` | array | `success` 时为本次分页范围内的任务数组；无匹配任务时为空数组。`pending` 或 `failed` 时可能省略。 |
-| `results[].id` | string | 任务 ID，形式为 `manual-<Unix秒>` 或 `cron-<Unix秒>`，冲突时可能带三位序号后缀。 |
+| `results[].id` | string | 任务 ID，新任务形式为 `manual-<Unix纳秒>` 或 `cron-<Unix纳秒>`；兼容旧 Unix 秒和三位序号后缀。 |
 | `results[].type` | string | `manual`：手动扫描；`cron`：定时扫描。 |
 | `results[].date` | string | 任务开始时间，格式为 `YYYYMMDDHHMMSS`，使用服务端时区。 |
 | `results[].result` | string | `unknown`：等待中或运行中；`clean`：未检出威胁；`found`：检出威胁；`error`：扫描失败。 |
@@ -766,6 +772,16 @@ lookup。
 }
 ```
 
+### `POST /api/results/index`
+
+仅 admin 可调用，无必填请求体。读取所有用户的任务文件，忽略 mtime，强制重建任务和检出索引；不返回其他用户任务内容。
+
+```json
+{"status":"success","checked":120,"updated":120,"failed":0}
+```
+
+成功返回 200。存在损坏文件时返回 200、status=partial，failed 计数增加并保留这些文件上次有效索引；完整枚举后才清理确实缺失的索引。重复重建返回 409；普通用户返回 403；数据库错误或请求取消会回滚事务。索引重建与即时索引、周期刷新及清理串行，扫描可继续执行。
+
 ### `POST /api/results/clean`
 
 请求 query 或 JSON 中必须包含 `clean_all=Y`：
@@ -830,7 +846,7 @@ lookup。
 | `/log/*.log` | 扫描和检出日志 |
 | `/quarantine/*` | 隔离文件及 owner 元数据 |
 
-`/data`、`/config`、`/state`、`/log` 和 `/quarantine` 都应持久化。`USER_DATABASE_FILE` 和 `HISTORY_DATABASE_FILE` 可分别覆盖两个数据库路径。历史索引库可以从 version 3 JSON 重建，但用户和 session 只能从用户库恢复。用户 ID 是其他资产的所有权依据，因此重建 `users.db` 时必须同时清理 cron、白名单、任务状态和隔离区资产。
+`/data`、`/config`、`/state`、`/log` 和 `/quarantine` 都应持久化。`USER_DATABASE_FILE` 和 `HISTORY_DATABASE_FILE` 可分别覆盖两个数据库路径。历史索引库可以从 version 3/4 JSON 重建，但用户和 session 只能从用户库恢复。用户 ID 是其他资产的所有权依据，因此重建 `users.db` 时必须同时清理 cron、白名单、任务状态和隔离区资产。
 
 当前用户 ID 与资产格式不兼容早期的“用户名 owner / version 2 任务”开发数据。检测到旧 `users.db` 或 `history.db` schema 时服务会拒绝启动并提示重建；升级开发环境时应同时清理旧用户库、历史库、cron 规则、白名单、任务 JSON 和隔离区数据，不进行自动归属迁移。
 

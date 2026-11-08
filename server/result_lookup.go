@@ -247,6 +247,10 @@ func applyResultScope(files []resultJobFile, scope resultScope) []resultJobFile 
 }
 
 func (s *server) readJobResult(jobID string) (any, error) {
+	if s.history != nil {
+		s.history.mu.Lock()
+		defer s.history.mu.Unlock()
+	}
 	path := filepath.Join(s.cfg.JobsDir, jobID+".json")
 	data, err := os.ReadFile(path)
 	if err != nil {

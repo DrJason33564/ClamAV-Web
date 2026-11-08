@@ -8,7 +8,7 @@ type detectionItem struct {
 }
 
 // parse_detection_log converts the stable, human-readable detection blocks
-// emitted by scan_once.sh into ordered records suitable for history.db.
+// emitted by legacy scan scripts into ordered records suitable for history.db.
 func parse_detection_log(content string) []detectionItem {
 	detections := make([]detectionItem, 0)
 	current := detectionItem{}

@@ -19,7 +19,7 @@
 
 </div>
 
-ClamAV-Web 将 ClamAV 的扫描能力、定时任务和结果处理整合为一个浏览器可用的管理界面。它以单个 Docker 镜像运行：内含 ClamAV、Go 后端、React 前端和 cron 调度服务，适合家庭服务器、小型团队与NAS场景。
+ClamAV-Web 将 ClamAV 的扫描能力、定时任务和结果处理整合为一个浏览器可用的管理界面。它以单个 Docker 镜像运行：内含 ClamAV、Go 后端、React 前端和 Go 定时调度器，适合家庭服务器、小型团队与NAS场景。
 
 > 本项目负责管理、编排与展示；病毒检测和病毒库更新仍由上游 `clamav/clamav` 完成。
 
@@ -60,13 +60,13 @@ ClamAV-Web 将 ClamAV 的扫描能力、定时任务和结果处理整合为一�
   │ React + Vite 构建的单页界面
   ▼
 Go HTTP 服务（认证、权限、队列、API、SQLite 索引）
-  ├── /scan_once.sh ──► clamd / ClamAV
-  ├── /cron.sh ───────► Debian cron
+  ├── ScanExecutor ──► Unix socket / FILDES ──► clamd
+  ├── robfig/cron ───► 统一内存扫描队列
   ├── /config         ──► 规则、白名单、服务配置
   └── /data /state /log /quarantine ──► 持久化数据与运行产物
 ```
 
-生产构建会先编译 `ClamAV-Web/`，再将静态文件嵌入 Go 可执行程序；容器启动后由 `startup.sh` 协调 ClamAV、cron 和 Web 服务。扫描全局串行执行，防止多个任务同时挤占扫描引擎。
+生产构建会先编译 `ClamAV-Web/`，再将静态文件嵌入 Go 可执行程序；容器启动后由 `startup.sh` 协调 ClamAV 和 Go 服务；Go 内部负责定时调度。扫描全局串行执行，防止多个任务同时挤占扫描引擎。
 
 ## 🚀 快速开始
 
@@ -116,7 +116,7 @@ docker run -d \
 | `/quarantine` | 隔离文件与其原始路径记录 |
 | `/config` | 定时规则、信任区、服务配置 |
 | `/data` | 用户、会话、历史任务及结构化检出详情的 SQLite 数据库 |
-| `/state` | 扫描任务 JSON、状态文件和锁 |
+| `/state` | 可重建索引的任务 JSON、上游 init PID 记录 |
 | `/log` | Go 后端、启动、cron、扫描与检出日志 |
 
 ## 🔐 安全与权限
@@ -139,8 +139,7 @@ docker run -d \
 | `SCANNER_COOKIE_SECURE` | `false` | HTTPS 反向代理后设为 `true`。 |
 | `IS_TIMEDOCK` | `N` | `Y` 时启用 TimeDock 模式。 |
 | `TZ` | 镜像默认值 | 页面时间与 cron 时区。 |
-| `SCAN_WAIT_INTERVAL` | `30` | 定时任务等待扫描锁的重试间隔（秒）。 |
-| `SCAN_WAIT_MAX_SECONDS` | `0` | 定时任务最大等待时间；`0` 为不限制。 |
+| `SCAN_WAIT_MAX_SECONDS` | `0` | 定时任务在 Go 队列中的最大等待时间；`0` 为不限制。 |
 | `USER_DATABASE_FILE` | `/data/users.db` | 用户与 session 数据库。 |
 | `HISTORY_DATABASE_FILE` | `/data/history.db` | 历史任务索引数据库。 |
 | `CLAMAV_SLEEP_TIMER` | `3600` | ClamAV 自动休眠间隔（秒）；配置文件或 API 设为 `0` 可关闭。 |
@@ -155,7 +154,9 @@ docker run -d \
 - **处理方式**：`warn` 只记录威胁；`move` 移至隔离区并可恢复；`remove` 直接删除，不能恢复。
 - **定时规则**：使用五段 cron（分 时 日 月 周），支持范围、步长与逗号列表；保存后会校验并重载。
 - **信任区**：白名单按内容 SHA-256 生效。文件变更后需重新添加；扫描执行时不能修改信任区。
-- **队列**：等待任务可调整顺序或取消；容器重启后，内存中尚未开始的手动任务不会恢复。
+- **队列**：等待任务可调整顺序或取消；容器重启后，内存中尚未开始的任务不会恢复；未完成的任务记录会标记为中断失败。
+- **扫描文件锁**：`POST /api/scans` 可选 `LOCK_FILE: true`，默认关闭。尝试非阻塞协作式文件锁，失败记录警告并继续；锁在文件描述符提交给引擎后释放。
+- **索引重建**：管理员可调用 `POST /api/results/index`，从任务文件强制重建所有用户的历史索引。
 - **隔离恢复**：若原路径已有同名文件，恢复会拒绝覆盖；恢复出的文件仍可能有风险。
 
 ## 🛠️ 开发与接口

@@ -163,7 +163,6 @@ func TestTimeDockPathProtectionAcrossAPIs(t *testing.T) {
 		t.Fatal("expected another account path to be rejected")
 	}
 	s.batches = make(map[string]*scanBatch)
-	s.cfg.SleepLockDir = filepath.Join(root, "missing-sleep-lock")
 	request := httptest.NewRequest(http.MethodPost, "/api/scans", strings.NewReader(`{"targets":["`+denied+`"],"action":"warn"}`))
 	request = request.WithContext(context.WithValue(request.Context(), actorContextKey{}, who))
 	response := httptest.NewRecorder()

@@ -1,16 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
-	"os"
-	"os/exec"
 	"strings"
 	"time"
 )
@@ -47,19 +42,25 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var source any = map[string]any{"message": "status file is not available yet"}
-	if data, err := os.ReadFile(s.cfg.StatusFile); err == nil {
-		var decoded any
-		if json.Unmarshal(data, &decoded) == nil {
-			source = decoded
-			who, _ := actorFromRequest(r)
-			s.enrichStatusSource(source, who.ID)
-		} else {
-			source = string(data)
+	s.mu.RLock()
+	state := "ready"
+	if s.engineSleeping {
+		state = "sleep"
+	}
+	var active any
+	who, _ := actorFromRequest(r)
+	if batch := s.batches[s.activeBatchID]; batch != nil {
+		state = "running"
+		if batch.UserID == who.ID && len(batch.JobIDs) > 0 {
+			active = batch.JobIDs[len(batch.JobIDs)-1]
 		}
 	}
+	s.mu.RUnlock()
+	source := map[string]any{"version": 1, "updated_at": time.Now().Format(time.RFC3339), "clamd": map[string]any{"status": state}, "scan": map[string]any{"active_job_id": active, "last_job_id": nil}}
+	s.enrichStatusSource(source, who.ID)
 
 	clamdStatus := s.cachedClamdStatus(r.Context())
+	source["clamd"].(map[string]any)["last_checked_at"] = clamdStatus.checkedAt.Format(time.RFC3339)
 	firstRun := "not_completed"
 	if s.appConfig != nil && s.appConfig.get().WebFirstRunCompleted == 2 {
 		firstRun = "completed"
@@ -124,33 +125,21 @@ type clamdVersionInfo struct {
 }
 
 func queryClamdVersion(ctx context.Context, socketPath string, timeout time.Duration) (clamdVersionInfo, error) {
-	dialer := net.Dialer{Timeout: timeout}
-	conn, err := dialer.DialContext(ctx, "unix", socketPath)
+	reply, err := (ClamdClient{socketPath, timeout}).command(ctx, "VERSION")
 	if err != nil {
 		return clamdVersionInfo{}, err
 	}
-	defer conn.Close()
-
-	return queryClamdVersionCommand(ctx, conn, timeout)
+	return parseClamdVersionResponse(reply)
 }
-
 func queryClamdVersionCommand(ctx context.Context, conn net.Conn, timeout time.Duration) (clamdVersionInfo, error) {
 	if err := setClamdSocketDeadline(ctx, conn, timeout); err != nil {
 		return clamdVersionInfo{}, err
 	}
-	if _, err := io.WriteString(conn, "VERSION\n"); err != nil {
+	reply, err := clamdCommandOnConn(conn, "VERSION")
+	if err != nil {
 		return clamdVersionInfo{}, err
 	}
-
-	reader := bufio.NewReader(io.LimitReader(conn, maxClamdVersionResponseBytes+1))
-	response, err := reader.ReadString('\n')
-	if len(response) > maxClamdVersionResponseBytes {
-		return clamdVersionInfo{}, fmt.Errorf("clamd VERSION response exceeds %d bytes", maxClamdVersionResponseBytes)
-	}
-	if err != nil && !errors.Is(err, io.EOF) {
-		return clamdVersionInfo{}, err
-	}
-	return parseClamdVersionResponse(response)
+	return parseClamdVersionResponse(reply)
 }
 
 func parseClamdVersionResponse(response string) (clamdVersionInfo, error) {
@@ -188,13 +177,6 @@ func (s *server) enrichStatusSource(source any, userIDs ...string) {
 	if !ok {
 		return
 	}
-	if activeID, _ := scan["active_job_id"].(string); activeID != "" && userID != "" {
-		state, _ := s.jobState(activeID)
-		job, _ := state.(map[string]any)
-		if owner, _ := job["user_id"].(string); owner != userID {
-			scan["active_job_id"] = nil
-		}
-	}
 	jobID, _ := scan["last_job_id"].(string)
 	if s.historyDB != nil && userID != "" {
 		var status, result string
@@ -210,22 +192,6 @@ func (s *server) enrichStatusSource(source any, userIDs ...string) {
 		scan["last_job_result"] = result
 		return
 	}
-	if jobID == "" {
-		return
-	}
-	scan["last_job_status"] = nil
-	scan["last_job_result"] = nil
-	state, _ := s.jobState(jobID)
-	job, ok := state.(map[string]any)
-	if !ok {
-		return
-	}
-	if status, ok := job["status"].(string); ok && (status == "running" || status == "finished" || status == "failed") {
-		scan["last_job_status"] = status
-	}
-	if result, ok := job["result"].(string); ok {
-		scan["last_job_result"] = result
-	}
 }
 
 func (s *server) pingClamd(ctx context.Context) (string, string) {
@@ -233,23 +199,18 @@ func (s *server) pingClamd(ctx context.Context) (string, string) {
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.CommandTimout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "clamdscan", "--config-file="+s.cfg.ClamdConf, "--ping=1")
-	out, err := cmd.CombinedOutput()
-	msg := strings.TrimSpace(string(out))
-	if ctx.Err() == context.DeadlineExceeded {
-		s.warn("status", "clamd ping timed out", "duration_ms", time.Since(started).Milliseconds())
-		return "timeout", "clamd ping timed out"
-	}
+	msg, err := (ClamdClient{s.cfg.ClamdSocket, s.cfg.CommandTimout}).command(ctx, "PING")
 	if err != nil {
-		if msg == "" {
-			msg = err.Error()
+		status := "error"
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			status = "timeout"
 		}
 		s.warn("status", "clamd ping failed", "duration_ms", time.Since(started).Milliseconds(), "error", err)
-		return "error", msg
+		return status, err.Error()
 	}
-	if msg == "" {
-		msg = "clamd is ready"
+	if msg != "PONG" {
+		return "error", fmt.Sprintf("unexpected PING response: %.256q", msg)
 	}
-	s.debug("status", "clamd ping succeeded", "duration_ms", time.Since(started).Milliseconds())
 	return "ready", msg
 }
